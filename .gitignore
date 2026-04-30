@@ -18,6 +18,7 @@ TestResults/
 
 # Native CMake build artifacts
 RW.Toolpaths/native/build/
+RW.Toolpaths/native/boost_headers/
 RW.Toolpaths/native/build-*/
 RW.Toolpaths/native/CMakeFiles/
 RW.Toolpaths/native/CMakeCache.txt
