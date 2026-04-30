@@ -1,0 +1,73 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>10</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>RW.Toolpaths</AssemblyName>
+    <RootNamespace>RW.Toolpaths</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Clipper2 by Angus Johnson - the .NET port of Clipper2 -->
+    <PackageReference Include="Clipper2" Version="1.4.0" />
+    <PackageReference Include="MIConvexHull" Version="1.1.19.1019" />
+  </ItemGroup>
+
+  <!-- Native Boost Voronoi library - copy whichever RID was built. -->
+  <ItemGroup>
+    <Content Include="runtimes/win-x64/native/boostvoronoi.dll"
+             Condition="Exists('$(MSBuildThisFileDirectory)runtimes/win-x64/native/boostvoronoi.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="runtimes/linux-x64/native/libboostvoronoi.so"
+             Condition="Exists('$(MSBuildThisFileDirectory)runtimes/linux-x64/native/libboostvoronoi.so')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="runtimes/osx-x64/native/libboostvoronoi.dylib"
+             Condition="Exists('$(MSBuildThisFileDirectory)runtimes/osx-x64/native/libboostvoronoi.dylib')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <!--
+    BuildBoostVoronoi: opt-in target that compiles the native wrapper via CMake.
+
+    Usage (from RW.Toolpaths directory):
+      Windows:  dotnet msbuild -t:BuildBoostVoronoi
+      Linux:    dotnet msbuild -t:BuildBoostVoronoi
+
+    Prerequisites:
+      - CMake >= 3.16 on PATH
+      - Boost headers installed (apt install libboost-dev  /  choco install boost-msvc-14.3)
+      - A C++17 compiler (MSVC on Windows, g++/clang++ on Linux)
+  -->
+  <!--
+    BuildBoostVoronoi: calls setup-native.ps1 (Windows) or setup-native.sh (Linux/macOS).
+    The script handles Boost header discovery/download then runs cmake.
+
+    Usage:
+      dotnet msbuild -t:BuildBoostVoronoi
+      dotnet msbuild -t:BuildBoostVoronoi -p:BoostIncludeDir=C:\local\boost_1_87_0
+  -->
+  <Target Name="BuildBoostVoronoi">
+    <PropertyGroup>
+      <_NativeDir>$(MSBuildThisFileDirectory)native</_NativeDir>
+      <_BoostFlag Condition="'$(BoostIncludeDir)' != ''">-BoostIncludeDir &quot;$(BoostIncludeDir)&quot;</_BoostFlag>
+      <_BoostFlag Condition="'$(BoostIncludeDir)' == ''"></_BoostFlag>
+    </PropertyGroup>
+
+    <!-- Windows -->
+    <Exec Condition="'$(OS)' == 'Windows_NT'"
+          Command="powershell -ExecutionPolicy Bypass -File &quot;$(_NativeDir)\setup-native.ps1&quot; $(_BoostFlag)"
+          WorkingDirectory="$(_NativeDir)" />
+
+    <!-- Linux / macOS -->
+    <Exec Condition="'$(OS)' != 'Windows_NT'"
+          Command="bash &quot;$(_NativeDir)/setup-native.sh&quot; $(BoostIncludeDir != '' ? '--boost-dir $(BoostIncludeDir)' : '')"
+          WorkingDirectory="$(_NativeDir)" />
+  </Target>
+
+</Project>
+

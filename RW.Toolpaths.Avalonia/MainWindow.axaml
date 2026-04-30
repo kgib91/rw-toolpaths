@@ -1,0 +1,87 @@
+﻿<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:RW.Toolpaths.Avalonia"
+        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="450"
+        x:Class="RW.Toolpaths.Avalonia.MainWindow"
+        Title="RW Toolpaths Studio"
+        Width="1280"
+        Height="860"
+        MinWidth="960"
+        MinHeight="640">
+    <DockPanel>
+        <Border DockPanel.Dock="Top" BorderBrush="#DDD" BorderThickness="0,0,0,1" Padding="10">
+            <Grid ColumnDefinitions="*,*,*,*,*,*,*,*,*,*" RowDefinitions="Auto,Auto" ColumnSpacing="8" RowSpacing="8">
+                <StackPanel Grid.Row="0" Grid.Column="0" Spacing="4">
+                    <TextBlock Text="Text" FontWeight="SemiBold" />
+                    <TextBox x:Name="InputTextBox" Text="Reliefwood" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="0" Grid.Column="1" Spacing="4">
+                    <TextBlock Text="Font" FontWeight="SemiBold" />
+                    <ComboBox x:Name="FontCombo" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="0" Grid.Column="2" Spacing="4">
+                    <TextBlock Text="Font Size" FontWeight="SemiBold" />
+                    <NumericUpDown x:Name="FontSizeInput" Value="180" Minimum="24" Maximum="2000" Increment="2" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="0" Grid.Column="3" Spacing="4">
+                    <TextBlock Text="Derived V-Bit Angle (deg)" FontWeight="SemiBold" />
+                    <TextBox x:Name="DerivedVBitAngleText" Text="60.0" IsReadOnly="True" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="0" Grid.Column="4" Spacing="4">
+                    <TextBlock Text="End Depth (mm)" FontWeight="SemiBold" />
+                    <NumericUpDown x:Name="EndDepthInput" Value="9" Minimum="0.01" Maximum="50" Increment="0.5" FormatString="0.##" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="0" Grid.Column="5" Spacing="4">
+                    <TextBlock Text="Depth/Pass (mm)" FontWeight="SemiBold" />
+                    <NumericUpDown x:Name="DepthPerPassInput" Value="3" Minimum="0.01" Maximum="25" Increment="0.5" FormatString="0.##" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="0" Grid.Column="6" Spacing="4">
+                    <TextBlock Text="Start Depth (mm)" FontWeight="SemiBold" />
+                    <NumericUpDown x:Name="StartDepthInput" Value="0" Minimum="0" Maximum="50" Increment="0.5" FormatString="0.##" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="0" Grid.Column="7" Spacing="4">
+                    <TextBlock Text="Tolerance (mm)" FontWeight="SemiBold" />
+                    <NumericUpDown x:Name="ToleranceInput" Value="0.79375" Minimum="0.79375" Maximum="12.7" Increment="0.01" FormatString="0.000" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="1" Grid.Column="0" Spacing="4">
+                    <TextBlock Text="Step-Over" FontWeight="SemiBold" />
+                    <NumericUpDown x:Name="StepOverInput" Value="0.4" Minimum="0.05" Maximum="1" Increment="0.05" FormatString="0.00" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="1" Grid.Column="1" Spacing="4">
+                    <TextBlock Text="Bottom Radius (mm)" FontWeight="SemiBold" />
+                    <NumericUpDown x:Name="BottomRadiusInput" Value="0.79" Minimum="0" Maximum="25.4" Increment="0.1" FormatString="0.###" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="1" Grid.Column="2" Spacing="4">
+                    <TextBlock Text="Top Radius (mm)" FontWeight="SemiBold" />
+                    <NumericUpDown x:Name="TopRadiusInput" Value="6.35" Minimum="0" Maximum="50.8" Increment="0.1" FormatString="0.###" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="1" Grid.Column="6" Spacing="4">
+                    <TextBlock Text="Cone Length (mm)" FontWeight="SemiBold" />
+                    <NumericUpDown x:Name="ConeLengthInput" Value="12.7" Minimum="0.01" Maximum="200" Increment="0.1" FormatString="0.###" />
+                </StackPanel>
+
+                <Button Grid.Row="1" Grid.Column="3" x:Name="GenerateButton" Content="Generate" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+                <CheckBox Grid.Row="1" Grid.Column="4" x:Name="PerspectiveToggle" Content="Perspective Orbit (3D)" VerticalAlignment="Center" />
+                <Button Grid.Row="1" Grid.Column="5" x:Name="ResetViewButton" Content="Reset View" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+
+                <TextBlock Grid.Row="1" Grid.Column="7" Grid.ColumnSpan="3" x:Name="StatusText" VerticalAlignment="Center" Text="Ready" TextWrapping="Wrap" />
+            </Grid>
+        </Border>
+
+        <local:GeometryPreviewControl x:Name="PreviewControl" ClipToBounds="True" />
+    </DockPanel>
+</Window>
+

@@ -1,0 +1,35 @@
+# .NET build outputs
+**/bin/
+**/obj/
+
+# Test and coverage artifacts
+TestResults/
+*.coverage
+*.coveragexml
+
+# Visual Studio / Rider / VS Code user state
+.vs/
+.idea/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Native CMake build artifacts
+RW.Toolpaths/native/build/
+RW.Toolpaths/native/build-*/
+RW.Toolpaths/native/CMakeFiles/
+RW.Toolpaths/native/CMakeCache.txt
+RW.Toolpaths/native/cmake_install.cmake
+RW.Toolpaths/native/compile_commands.json
+RW.Toolpaths/native/Makefile
+RW.Toolpaths/native/.cmake/
+
+# Local Avalonia profiling payloads
+RW.Toolpaths.Avalonia/perf_dump.json
+RW.Toolpaths.Avalonia/perf_payload.json
+
+# OS-generated files
+Thumbs.db
+Desktop.ini
