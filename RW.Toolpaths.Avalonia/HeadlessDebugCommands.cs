@@ -28,7 +28,10 @@ internal static class HeadlessDebugCommands
 
         if (HasFlag(args, "--dump-glyph-payload"))
         {
-            DumpGlyphPayload(args);
+            if (OperatingSystem.IsWindows())
+            {
+                DumpGlyphPayload(args);
+            }
             return true;
         }
 
@@ -525,6 +528,7 @@ internal static class HeadlessDebugCommands
         }
     }
 
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     private static void DumpGlyphPayload(string[] args)
     {
         string text = GetRequiredValue(args, "--text");

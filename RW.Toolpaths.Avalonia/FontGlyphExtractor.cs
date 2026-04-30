@@ -6,6 +6,7 @@ namespace RW.Toolpaths.Avalonia;
 
 internal static class FontGlyphExtractor
 {
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     public static List<List<PointF>> ExtractContours(string text, string fontFamily, float emSize, float flatness = 0.5f)
     {
         long t0 = PerfLog.Start();

@@ -428,7 +428,7 @@ public class GenerateSimplifiedLayerTests
     {
         var result = MedialAxisToolpaths.GenerateSimplifiedLayer(MakeRect(), 8192);
         Assert.NotNull(result);
-        Assert.True(result!.Any(ring => ring.Count >= 3));
+        Assert.Contains(result, ring => ring.Count >= 3);
     }
 
     // -- Tiny degenerate input (smaller than OFFSET_DISTANCE) -> null or empty

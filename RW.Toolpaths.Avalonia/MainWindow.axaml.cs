@@ -67,7 +67,10 @@ public partial class MainWindow : Window
         _statusText = FindRequired<TextBlock>("StatusText");
         _preview = FindRequired<GeometryPreviewControl>("PreviewControl");
 
-        PopulateFonts();
+        if (OperatingSystem.IsWindows())
+        {
+            PopulateFonts();
+        }
 
         _debounceTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(220) };
         _debounceTimer.Tick += (_, _) =>
@@ -145,8 +148,7 @@ public partial class MainWindow : Window
         double angleDeg = 2.0 * Math.Atan(slope) * 180.0 / Math.PI;
         _derivedVBitAngleText.Text = angleDeg.ToString("0.###", CultureInfo.InvariantCulture);
     }
-
-    private void PopulateFonts()
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]    private void PopulateFonts()
     {
         List<string> fonts;
         if (OperatingSystem.IsWindows())
@@ -185,6 +187,14 @@ public partial class MainWindow : Window
 
     private async Task GenerateAsync(int generationVersion, CancellationToken cancellationToken)
     {
+        if (!OperatingSystem.IsWindows())
+        {
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                _statusText.Text = "Font glyph extraction is only supported on Windows.";
+            });
+            return;
+        }
         var swTotal = Stopwatch.StartNew();
 
         try
@@ -232,7 +242,9 @@ public partial class MainWindow : Window
                 var swContours = Stopwatch.StartNew();
                 cancellationToken.ThrowIfCancellationRequested();
 
+#pragma warning disable CA1416
                 var rawContours = FontGlyphExtractor.ExtractContours(text, font, emSize);
+#pragma warning restore CA1416
                 var rawContoursInches = rawContours
                     .Select(c => c.Select(p => new Point(p.X * PxToInch, p.Y * PxToInch)).ToList())
                     .Where(c => c.Count >= 3)
