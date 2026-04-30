@@ -28,6 +28,7 @@ public partial class MainWindow : Window
     private readonly NumericUpDown _topRadiusInput;
     private readonly NumericUpDown _coneLengthInput;
     private readonly CheckBox _perspectiveToggle;
+    private readonly CheckBox _segmentDebugToggle;
     private readonly Button _resetViewButton;
     private readonly Button _generateButton;
     private readonly TextBlock _statusText;
@@ -60,6 +61,7 @@ public partial class MainWindow : Window
         _topRadiusInput = FindRequired<NumericUpDown>("TopRadiusInput");
         _coneLengthInput = FindRequired<NumericUpDown>("ConeLengthInput");
         _perspectiveToggle = FindRequired<CheckBox>("PerspectiveToggle");
+        _segmentDebugToggle = FindRequired<CheckBox>("SegmentDebugToggle");
         _resetViewButton = FindRequired<Button>("ResetViewButton");
         _generateButton = FindRequired<Button>("GenerateButton");
         _statusText = FindRequired<TextBlock>("StatusText");
@@ -81,6 +83,13 @@ public partial class MainWindow : Window
         _perspectiveToggle.IsCheckedChanged += (_, _) =>
         {
             _preview.PerspectiveEnabled = _perspectiveToggle.IsChecked == true;
+            _preview.InvalidateVisual();
+        };
+
+        _segmentDebugToggle.IsChecked = false;
+        _segmentDebugToggle.IsCheckedChanged += (_, _) =>
+        {
+            _preview.SegmentDebugColors = _segmentDebugToggle.IsChecked == true;
             _preview.InvalidateVisual();
         };
 
@@ -369,7 +378,7 @@ public partial class MainWindow : Window
 
                 // Stream partial results periodically to avoid repeated large snapshots.
                 var clearingSnap = new List<List<Point3D>>(allClearing);
-                var vcarveSnap = new List<List<Point3D>>(allVCarve);
+                var vcarveSnap   = new List<List<Point3D>>(allVCarve);
 
                 await Dispatcher.UIThread.InvokeAsync(() =>
                 {

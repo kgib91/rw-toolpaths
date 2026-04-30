@@ -39,6 +39,7 @@ public sealed class GeometryPreviewControl : Control
     private int _renderCounter;
 
     public bool PerspectiveEnabled { get; set; }
+    public bool SegmentDebugColors { get; set; }
     public string DebugInfo { get; set; } = string.Empty;
 
     public GeometryPreviewControl()
@@ -243,17 +244,20 @@ public sealed class GeometryPreviewControl : Control
         }
 
         var minVZ = MinVCarveZ();
+        int moveIdx = 0;
         foreach (var path in _vcarve)
         {
-            if (path.Count < 2)
-                continue;
-
+            if (path.Count < 2) continue;
             for (int i = 1; i < path.Count; i++)
             {
                 var a2d = Tx(new Point(path[i - 1].X, path[i - 1].Y));
                 var b2d = Tx(new Point(path[i].X, path[i].Y));
                 var segZ = (path[i - 1].Z + path[i].Z) * 0.5;
-                context.DrawLine(GetVCarvePen(segZ, minVZ, 1.7), a2d, b2d);
+                var pen = SegmentDebugColors
+                    ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.7)
+                    : GetVCarvePen(segZ, minVZ, 1.7);
+                context.DrawLine(pen, a2d, b2d);
+                moveIdx++;
             }
         }
 
@@ -369,6 +373,7 @@ public sealed class GeometryPreviewControl : Control
         }
 
         double minZ = MinVCarveZ();
+        int moveIdx = 0;
         foreach (var path in _vcarve)
         {
             for (int i = 1; i < path.Count; i++)
@@ -379,9 +384,12 @@ public sealed class GeometryPreviewControl : Control
                 var b = ToWorld((float)b0.X, (float)b0.Y, (float)b0.Z);
                 if (!TryProjectSegment(a, b, cameraPos, forward, right, up, focal, aspect, paddedViewport, out var a2d, out var b2d))
                     continue;
-
                 var segZ = (a0.Z + b0.Z) * 0.5;
-                context.DrawLine(GetVCarvePen(segZ, minZ, 1.8), a2d, b2d);
+                var pen = SegmentDebugColors
+                    ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.8)
+                    : GetVCarvePen(segZ, minZ, 1.8);
+                context.DrawLine(pen, a2d, b2d);
+                moveIdx++;
             }
         }
 
@@ -397,6 +405,9 @@ public sealed class GeometryPreviewControl : Control
 
     private static Vector3 ToWorld(float x, float y, float z) => new(x, -y, z);
 
+    private const float NearClip = 0.02f;
+    private const float MaxProjectionRadiusFactor = 8.0f;
+
     private static bool TryProjectPoint(
         Vector3 point,
         Vector3 cameraPos,
@@ -410,7 +421,7 @@ public sealed class GeometryPreviewControl : Control
     {
         var local = point - cameraPos;
         var z = Vector3.Dot(local, forward);
-        if (z <= 1e-4f)
+        if (z <= NearClip)
         {
             projected = default;
             return false;
@@ -418,6 +429,13 @@ public sealed class GeometryPreviewControl : Control
 
         var x = Vector3.Dot(local, right) * (focal / z);
         var y = Vector3.Dot(local, up) * (focal / z);
+
+        // Reject points that project absurdly far due to near-plane grazing.
+        if (Math.Abs(x) > MaxProjectionRadiusFactor * aspect || Math.Abs(y) > MaxProjectionRadiusFactor)
+        {
+            projected = default;
+            return false;
+        }
 
         projected = new Point(
             viewport.X + viewport.Width * 0.5 + (x / aspect) * viewport.Width * 0.5,
@@ -445,9 +463,58 @@ public sealed class GeometryPreviewControl : Control
         out Point aProjected,
         out Point bProjected)
     {
+        var aLocal = a - cameraPos;
+        var bLocal = b - cameraPos;
+        float za = Vector3.Dot(aLocal, forward);
+        float zb = Vector3.Dot(bLocal, forward);
+
+        if (za <= NearClip && zb <= NearClip)
+        {
+            aProjected = default;
+            bProjected = default;
+            return false;
+        }
+
+        // Clip segment against near plane to avoid projection spikes.
+        if (za <= NearClip || zb <= NearClip)
+        {
+            float denom = zb - za;
+            if (Math.Abs(denom) < 1e-9f)
+            {
+                aProjected = default;
+                bProjected = default;
+                return false;
+            }
+
+            float t = (NearClip - za) / denom;
+            t = Math.Clamp(t, 0f, 1f);
+            var clipped = a + (b - a) * t;
+
+            if (za <= NearClip)
+            {
+                a = clipped;
+                za = NearClip;
+            }
+            else
+            {
+                b = clipped;
+                zb = NearClip;
+            }
+        }
+
         bool aOk = TryProjectPoint(a, cameraPos, forward, right, up, focal, aspect, viewport, out aProjected);
         bool bOk = TryProjectPoint(b, cameraPos, forward, right, up, focal, aspect, viewport, out bProjected);
-        return aOk && bOk;
+        if (!aOk || !bOk)
+            return false;
+
+        // Final guard for extremely long screen-space segments.
+        double dx = bProjected.X - aProjected.X;
+        double dy = bProjected.Y - aProjected.Y;
+        double maxLen = Math.Max(viewport.Width, viewport.Height) * 5.0;
+        if ((dx * dx + dy * dy) > (maxLen * maxLen))
+            return false;
+
+        return true;
     }
 
     private void OnPointerPressed(object? sender, PointerPressedEventArgs e)
@@ -644,6 +711,22 @@ public sealed class GeometryPreviewControl : Control
         byte green = (byte)(25 + 25 * (1.0 - t));
         byte blue = (byte)(25 + 25 * (1.0 - t));
         return Color.FromArgb(alpha, red, green, blue);
+    }
+
+    private static Color DebugSegmentColor(int idx)
+    {
+        double h = (idx * 137.508) % 360.0;
+        const double c = 0.85, v = 0.90;
+        double x = c * (1.0 - Math.Abs((h / 60.0) % 2.0 - 1.0));
+        double m = v - c;
+        double r, g, b;
+        if      (h <  60) { r = c; g = x; b = 0; }
+        else if (h < 120) { r = x; g = c; b = 0; }
+        else if (h < 180) { r = 0; g = c; b = x; }
+        else if (h < 240) { r = 0; g = x; b = c; }
+        else if (h < 300) { r = x; g = 0; b = c; }
+        else              { r = c; g = 0; b = x; }
+        return Color.FromArgb(220, (byte)((r + m) * 255), (byte)((g + m) * 255), (byte)((b + m) * 255));
     }
 }
 

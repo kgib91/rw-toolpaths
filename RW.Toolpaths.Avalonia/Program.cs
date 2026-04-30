@@ -1,4 +1,5 @@
 ﻿using Avalonia;
+using Avalonia.Win32;
 using System;
 
 namespace RW.Toolpaths.Avalonia;
@@ -19,9 +20,25 @@ public class Program
 
     // Avalonia configuration, don't remove; also used by visual designer.
     public static AppBuilder BuildAvaloniaApp()
-        => AppBuilder.Configure<App>()
+    {
+        var builder = AppBuilder.Configure<App>()
             .UsePlatformDetect()
             .WithInterFont()
             .LogToTrace();
+
+        if (OperatingSystem.IsWindows())
+        {
+            builder = builder.With(new Win32PlatformOptions
+            {
+                RenderingMode = new[]
+                {
+                    Win32RenderingMode.Wgl,
+                    Win32RenderingMode.Software,
+                }
+            });
+        }
+
+        return builder;
+    }
 }
 

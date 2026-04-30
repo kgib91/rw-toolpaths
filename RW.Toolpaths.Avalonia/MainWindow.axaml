@@ -77,6 +77,11 @@
                 <CheckBox Grid.Row="1" Grid.Column="4" x:Name="PerspectiveToggle" Content="Perspective Orbit (3D)" VerticalAlignment="Center" />
                 <Button Grid.Row="1" Grid.Column="5" x:Name="ResetViewButton" Content="Reset View" HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
 
+                <StackPanel Grid.Row="0" Grid.Column="8" Spacing="4">
+                    <TextBlock Text="Seg Debug Colors" FontWeight="SemiBold" />
+                    <CheckBox x:Name="SegmentDebugToggle" Content="Random Colors" VerticalAlignment="Center" />
+                </StackPanel>
+
                 <TextBlock Grid.Row="1" Grid.Column="7" Grid.ColumnSpan="3" x:Name="StatusText" VerticalAlignment="Center" Text="Ready" TextWrapping="Wrap" />
             </Grid>
         </Border>

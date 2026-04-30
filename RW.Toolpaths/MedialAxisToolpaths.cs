@@ -264,13 +264,14 @@ public static class MedialAxisToolpaths
         var polylines = JoinIntoPolylines(trimmed);
         if (polylines is null) return null;
 
-        // Simplify (opt-in RDP only). Keep collinear pass disabled by default
-        // to preserve all valid spokes/corner details.
+        // Simplify parabolic-arc approximations with RDP.
+        // Auto-tolerance: 1/10 of the arc-discretisation tolerance so that
+        // truly redundant collinear/near-collinear arc samples are removed
+        // without touching genuine curve geometry.  Callers may still pass an
+        // explicit rdpTolerance to override.
+        double effectiveRdp = rdpTolerance > 0 ? rdpTolerance : tolerance * 0.1;
         for (int i = 0; i < polylines.Count; i++)
-        {
-            if (rdpTolerance > 0)
-                polylines[i] = RdpSimplify3D(polylines[i], rdpTolerance);
-        }
+            polylines[i] = RdpSimplify3D(polylines[i], effectiveRdp);
         return polylines;
     }
 
@@ -441,7 +442,7 @@ public static class MedialAxisToolpaths
             var paths = OffsetFill.Generate(rings, z, zTop, stepOverDist);
             foreach (var path in paths)
             {
-                result.Add(new TaggedToolpath(path, regionIndex, "clearing", depthPassIndex));
+                result.Add(new TaggedToolpath(SimplifyCollinearRuns(path), regionIndex, "clearing", depthPassIndex));
             }
 
             depthPassIndex++;
