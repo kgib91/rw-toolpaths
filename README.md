@@ -1,8 +1,14 @@
 # RW.Toolpaths
 
+<p align="center">
+    <img src="docs/images/reliefwood-logo-preview.png" alt="rw-toolpaths preview logo" width="100%" />
+</p>
+
 Geometry, medial axis, and CNC toolpath generation for .NET 8.
 
 RW.Toolpaths is a .NET 8 geometry and CNC toolpath library for pocket clearing, V-carve planning, and medial-axis driven path generation. It is built for modern .NET and .NET Core workflows, with a companion Avalonia desktop app for previewing and debugging output.
+
+Project website: [reliefwood.com](https://reliefwood.com)
 
 At the core of the project is a pipeline that combines Clipper-based polygon processing with an optional native Boost.Polygon Voronoi provider. If you are looking for a C# or .NET library related to medial axis computation, Voronoi-based toolpath planning, Boost Voronoi interop, or V-carve path generation, this repository is the relevant entry point.
 
@@ -24,6 +30,18 @@ RW.Toolpaths is aimed at problems that show up in CAM, computational geometry, a
 - Ramp entry helpers for helical and zig-zag lead-ins.
 - Native Boost.Polygon Voronoi interop for higher-quality medial-axis generation.
 - Desktop preview app for inspecting geometry and generated paths.
+
+## Preview Screenshots
+
+These previews come from the companion Avalonia frontend and show the geometry outline, medial-axis driven carving structure, and generated path behavior.
+
+![Letter preview close-up](docs/images/preview-letters-closeup.png)
+
+![Side profile preview](docs/images/preview-side-profile.png)
+
+![Reliefwood preview](docs/images/preview-reliefwood-word.png)
+
+![nu-toolpath preview](docs/images/preview-nu-toolpath-word.png)
 
 ## Project Structure
 
@@ -185,3 +203,11 @@ This repository should also be useful if you are exploring .NET medial axis gene
 ## Status
 
 This repository is structured as a working engineering codebase rather than a packaged SDK. Expect APIs and build steps around the native provider to evolve as the toolpath pipeline is refined.
+
+## License
+
+RW.Toolpaths is licensed under the Apache License, Version 2.0. See `LICENSE`.
+
+That choice is permissive and works cleanly with the project's Boost.Polygon integration. Third-party components keep their own licenses, including Boost under the Boost Software License, Version 1.0, when it is used, downloaded, or redistributed.
+
+The Reliefwood name, website, logos, and other branding are not granted for reuse except as allowed by the Apache 2.0 license and the repository's notice text.
