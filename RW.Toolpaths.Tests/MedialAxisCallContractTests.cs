@@ -68,6 +68,59 @@ public class MedialAxisCallContractTests
             return Array.Empty<MedialSegment>();
         }
     }
+
+    [Fact]
+    public void Generate_DefaultRdpTolerance_PreservesProviderBends()
+    {
+        var provider = new ShallowBendProvider();
+        var region = new List<IReadOnlyList<PointD>>
+        {
+            new List<PointD>
+            {
+                new(0, 0), new(1, 0), new(1, 1), new(0, 1), new(0, 0)
+            }
+        };
+
+        var result = MedialAxisToolpaths.Generate(
+            provider,
+            region,
+            startDepth: 0.0,
+            endDepth: 1.0,
+            radianTipAngle: Math.PI / 2.0,
+            depthPerPass: 1.0,
+            tolerance: 0.03);
+
+        Assert.NotNull(result);
+        var path = Assert.Single(result!);
+        Assert.Equal(3, path.Count);
+        Assert.Equal(0.10, path[1].X, 6);
+        Assert.Equal(0.001, path[1].Y, 6);
+    }
+
+    private sealed class ShallowBendProvider : IMedialAxisProvider
+    {
+        public IReadOnlyList<MedialSegment> ConstructMedialAxis(
+            IReadOnlyList<PointD> boundary,
+            IReadOnlyList<IReadOnlyList<PointD>> holes,
+            double tolerance,
+            double maxRadius,
+            double filteringAngle = 3 * Math.PI / 4,
+            bool useBigIntegers = true)
+        {
+            const double scale = 4096.0;
+            const double radius = 0.1 * scale;
+
+            return new[]
+            {
+                new MedialSegment(
+                    new MedialPoint(0.00 * scale, 0.000 * scale, radius),
+                    new MedialPoint(0.10 * scale, 0.001 * scale, radius)),
+                new MedialSegment(
+                    new MedialPoint(0.10 * scale, 0.001 * scale, radius),
+                    new MedialPoint(0.20 * scale, 0.000 * scale, radius)),
+            };
+        }
+    }
 }
 
 // --- RdpSimplify3D -----------------------------------------------------------

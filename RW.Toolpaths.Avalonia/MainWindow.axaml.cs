@@ -375,8 +375,8 @@ public partial class MainWindow : Window
 
                 allClearing.AddRange(regionClearing);
                 allVCarve.AddRange(regionVCarve);
-                for (int p = 0; p < regionVCarve.Count; p++)
-                    allVCarveSegmentCount += Math.Max(0, regionVCarve[p].Count - 1);
+                allVCarveSegmentCount += CountPathSegments(regionVCarve, closeRings: false);
+                allVCarveSegmentCount += CountPathSegments(regionClearing, closeRings: true);
 
                 if (generationVersion != _generationVersion) return;
 
@@ -427,6 +427,24 @@ public partial class MainWindow : Window
                 _preview.SetGeometry(new(), new(), new(), new(), "generation-error");
             });
         }
+    }
+
+    private static int CountPathSegments(List<List<Point3D>> paths, bool closeRings)
+    {
+        int total = 0;
+        foreach (var path in paths)
+        {
+            total += Math.Max(0, path.Count - 1);
+            if (!closeRings || path.Count <= 2)
+                continue;
+
+            var first = path[0];
+            var last = path[^1];
+            if (first.X != last.X || first.Y != last.Y || first.Z != last.Z)
+                total += 1;
+        }
+
+        return total;
     }
 
     private static List<List<Point>> BuildDebugFallbackContours(string text, float emSize)

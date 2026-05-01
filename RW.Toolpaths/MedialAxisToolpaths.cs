@@ -264,14 +264,11 @@ public static class MedialAxisToolpaths
         var polylines = JoinIntoPolylines(trimmed);
         if (polylines is null) return null;
 
-        // Simplify parabolic-arc approximations with RDP.
-        // Auto-tolerance: 1/10 of the arc-discretisation tolerance so that
-        // truly redundant collinear/near-collinear arc samples are removed
-        // without touching genuine curve geometry.  Callers may still pass an
-        // explicit rdpTolerance to override.
-        double effectiveRdp = rdpTolerance > 0 ? rdpTolerance : tolerance * 0.1;
-        for (int i = 0; i < polylines.Count; i++)
-            polylines[i] = RdpSimplify3D(polylines[i], effectiveRdp);
+        if (rdpTolerance > 0)
+        {
+            for (int i = 0; i < polylines.Count; i++)
+                polylines[i] = RdpSimplify3D(polylines[i], rdpTolerance);
+        }
         return polylines;
     }
 

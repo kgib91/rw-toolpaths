@@ -179,8 +179,21 @@ public sealed class GeometryPreviewControl : Control
             }
         }
 
+        foreach (var path in _clearing)
+        {
+            _vcarveSegmentCount += Math.Max(0, path.Count - 1);
+            if (path.Count <= 2)
+                continue;
+
+            var first = path[0];
+            var last = path[^1];
+            if (first.X != last.X || first.Y != last.Y || first.Z != last.Z)
+                _vcarveSegmentCount += 1;
+        }
+
         foreach (var seg in _medial)
         {
+            _vcarveSegmentCount += 1;
             Acc(seg.A.X, seg.A.Y);
             Acc(seg.B.X, seg.B.Y);
         }
@@ -221,12 +234,11 @@ public sealed class GeometryPreviewControl : Control
             }
         }
 
+        int moveIdx = 0;
         for (int pathIndex = 0; pathIndex < _clearing.Count; pathIndex++)
         {
             var path = _clearing[pathIndex];
             double avgDepth = pathIndex < _clearingAverageDepths.Count ? _clearingAverageDepths[pathIndex] : 0.0;
-            var color = ClearingColorForDepth(avgDepth);
-            var pen = new Pen(new SolidColorBrush(color), 1.3);
             if (path.Count < 2)
                 continue;
 
@@ -235,16 +247,25 @@ public sealed class GeometryPreviewControl : Control
             for (int i = 1; i < path.Count; i++)
             {
                 var next = Tx(new Point(path[i].X, path[i].Y));
+                var pen = SegmentDebugColors
+                    ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.3)
+                    : new Pen(new SolidColorBrush(ClearingColorForDepth(avgDepth)), 1.3);
                 context.DrawLine(pen, prev, next);
                 prev = next;
+                moveIdx++;
             }
 
             if (path.Count > 2)
+            {
+                var pen = SegmentDebugColors
+                    ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.3)
+                    : new Pen(new SolidColorBrush(ClearingColorForDepth(avgDepth)), 1.3);
                 context.DrawLine(pen, prev, first);
+                moveIdx++;
+            }
         }
 
         var minVZ = MinVCarveZ();
-        int moveIdx = 0;
         foreach (var path in _vcarve)
         {
             if (path.Count < 2) continue;
@@ -344,17 +365,23 @@ public sealed class GeometryPreviewControl : Control
             }
         }
 
+        int moveIdx = 0;
         for (int pathIndex = 0; pathIndex < _clearing.Count; pathIndex++)
         {
             var path = _clearing[pathIndex];
             double avgDepth = pathIndex < _clearingAverageDepths.Count ? _clearingAverageDepths[pathIndex] : 0.0;
-            var pen = new Pen(new SolidColorBrush(ClearingColorForDepth(avgDepth)), 1.4);
             for (int i = 1; i < path.Count; i++)
             {
                 var a = ToWorld((float)path[i - 1].X, (float)path[i - 1].Y, (float)path[i - 1].Z);
                 var b = ToWorld((float)path[i].X, (float)path[i].Y, (float)path[i].Z);
                 if (TryProjectSegment(a, b, cameraPos, forward, right, up, focal, aspect, paddedViewport, out var a2d, out var b2d))
+                {
+                    var pen = SegmentDebugColors
+                        ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.4)
+                        : new Pen(new SolidColorBrush(ClearingColorForDepth(avgDepth)), 1.4);
                     context.DrawLine(pen, a2d, b2d);
+                }
+                moveIdx++;
             }
 
             // Clearing paths are concentric rings; close them in 3D just like 2D preview.
@@ -367,13 +394,18 @@ public sealed class GeometryPreviewControl : Control
                     var a = ToWorld((float)last.X, (float)last.Y, (float)last.Z);
                     var b = ToWorld((float)first.X, (float)first.Y, (float)first.Z);
                     if (TryProjectSegment(a, b, cameraPos, forward, right, up, focal, aspect, paddedViewport, out var a2d, out var b2d))
+                    {
+                        var pen = SegmentDebugColors
+                            ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.4)
+                            : new Pen(new SolidColorBrush(ClearingColorForDepth(avgDepth)), 1.4);
                         context.DrawLine(pen, a2d, b2d);
+                    }
+                    moveIdx++;
                 }
             }
         }
 
         double minZ = MinVCarveZ();
-        int moveIdx = 0;
         foreach (var path in _vcarve)
         {
             for (int i = 1; i < path.Count; i++)
@@ -382,13 +414,14 @@ public sealed class GeometryPreviewControl : Control
                 var b0 = path[i];
                 var a = ToWorld((float)a0.X, (float)a0.Y, (float)a0.Z);
                 var b = ToWorld((float)b0.X, (float)b0.Y, (float)b0.Z);
-                if (!TryProjectSegment(a, b, cameraPos, forward, right, up, focal, aspect, paddedViewport, out var a2d, out var b2d))
-                    continue;
                 var segZ = (a0.Z + b0.Z) * 0.5;
-                var pen = SegmentDebugColors
-                    ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.8)
-                    : GetVCarvePen(segZ, minZ, 1.8);
-                context.DrawLine(pen, a2d, b2d);
+                if (TryProjectSegment(a, b, cameraPos, forward, right, up, focal, aspect, paddedViewport, out var a2d, out var b2d))
+                {
+                    var pen = SegmentDebugColors
+                        ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.8)
+                        : GetVCarvePen(segZ, minZ, 1.8);
+                    context.DrawLine(pen, a2d, b2d);
+                }
                 moveIdx++;
             }
         }
