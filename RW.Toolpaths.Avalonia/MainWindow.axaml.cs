@@ -29,9 +29,10 @@ public partial class MainWindow : Window
     private readonly NumericUpDown _coneLengthInput;
     private readonly CheckBox _perspectiveToggle;
     private readonly CheckBox _segmentDebugToggle;
+    private readonly CheckBox _rawOverlayToggle;
     private readonly Button _resetViewButton;
     private readonly Button _generateButton;
-    private readonly TextBlock _statusText;
+    private readonly TextBlock? _statusText;
     private readonly GeometryPreviewControl _preview;
 
     private readonly DispatcherTimer _debounceTimer;
@@ -62,9 +63,10 @@ public partial class MainWindow : Window
         _coneLengthInput = FindRequired<NumericUpDown>("ConeLengthInput");
         _perspectiveToggle = FindRequired<CheckBox>("PerspectiveToggle");
         _segmentDebugToggle = FindRequired<CheckBox>("SegmentDebugToggle");
+        _rawOverlayToggle = FindRequired<CheckBox>("RawOverlayToggle");
         _resetViewButton = FindRequired<Button>("ResetViewButton");
         _generateButton = FindRequired<Button>("GenerateButton");
-        _statusText = FindRequired<TextBlock>("StatusText");
+        _statusText = this.FindControl<TextBlock>("StatusText");
         _preview = FindRequired<GeometryPreviewControl>("PreviewControl");
 
         if (OperatingSystem.IsWindows())
@@ -93,6 +95,13 @@ public partial class MainWindow : Window
         _segmentDebugToggle.IsCheckedChanged += (_, _) =>
         {
             _preview.SegmentDebugColors = _segmentDebugToggle.IsChecked == true;
+            _preview.InvalidateVisual();
+        };
+
+        _rawOverlayToggle.IsChecked = false;
+        _rawOverlayToggle.IsCheckedChanged += (_, _) =>
+        {
+            _preview.ShowRawOverlay = _rawOverlayToggle.IsChecked == true;
             _preview.InvalidateVisual();
         };
 
@@ -191,7 +200,8 @@ public partial class MainWindow : Window
         {
             await Dispatcher.UIThread.InvokeAsync(() =>
             {
-                _statusText.Text = "Font glyph extraction is only supported on Windows.";
+                if (_statusText is not null)
+                    _statusText.Text = "Font glyph extraction is only supported on Windows.";
             });
             return;
         }
@@ -200,7 +210,11 @@ public partial class MainWindow : Window
         try
         {
             Console.Error.WriteLine($"[ui] gen#{generationVersion} start");
-            await Dispatcher.UIThread.InvokeAsync(() => _statusText.Text = "Generating...");
+            await Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                if (_statusText is not null)
+                    _statusText.Text = "Generating...";
+            });
 
             var text = _textInput.Text ?? string.Empty;
             if (string.IsNullOrWhiteSpace(text))
@@ -208,7 +222,8 @@ public partial class MainWindow : Window
                 await Dispatcher.UIThread.InvokeAsync(() =>
                 {
                     _preview.SetGeometry(new(), new(), new(), new(), "empty");
-                    _statusText.Text = "Enter text to generate.";
+                    if (_statusText is not null)
+                        _statusText.Text = "Enter text to generate.";
                 });
                 return;
             }
@@ -290,9 +305,12 @@ public partial class MainWindow : Window
             {
                 string contourDebug = contourResult.usedFallbackContours ? "contours-only|fallback-contours" : "contours-only";
                 _preview.SetGeometry(contourResult.contoursInches, new(), new(), new(), contourDebug);
-                _statusText.Text = string.Create(
-                    CultureInfo.InvariantCulture,
-                    $"Contours: {contourResult.contoursInches.Count} | Generating toolpaths...");
+                if (_statusText is not null)
+                {
+                    _statusText.Text = string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Contours: {contourResult.contoursInches.Count} | Generating toolpaths...");
+                }
             });
 
             // Build the region tree on a thread-pool thread (fast but not trivial).
@@ -309,7 +327,6 @@ public partial class MainWindow : Window
 
             var allClearing = new List<List<Point3D>>();
             var allVCarve   = new List<List<Point3D>>();
-            int allVCarveSegmentCount = 0;
             var swToolpaths = Stopwatch.StartNew();
 
             for (int i = 0; i < regions.Count; i++)
@@ -375,8 +392,6 @@ public partial class MainWindow : Window
 
                 allClearing.AddRange(regionClearing);
                 allVCarve.AddRange(regionVCarve);
-                allVCarveSegmentCount += CountPathSegments(regionVCarve, closeRings: false);
-                allVCarveSegmentCount += CountPathSegments(regionClearing, closeRings: true);
 
                 if (generationVersion != _generationVersion) return;
 
@@ -399,11 +414,15 @@ public partial class MainWindow : Window
                     string partialDebug = $"regions={regionsDone}/{regionsTotal}"
                         + (contourResult.usedFallbackContours ? "|fallback-contours" : "");
                     _preview.SetGeometry(contourResult.contoursInches, clearingSnap, vcarveSnap, new(), partialDebug);
+                    int previewSegmentCount = _preview.VCarveSegmentCount;
 
                     string suffix = isFinal ? string.Empty : $" | Island {regionsDone}/{regionsTotal}...";
-                    _statusText.Text = string.Create(
-                        CultureInfo.InvariantCulture,
-                        $"Contours: {contourResult.contoursInches.Count} | Clearing: {clearingSnap.Count} | VCarve Paths: {vcarveSnap.Count} | VCarve Segs: {allVCarveSegmentCount} | {partialDebug}{suffix}");
+                    if (_statusText is not null)
+                    {
+                        _statusText.Text = string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Contours: {contourResult.contoursInches.Count} | Clearing: {clearingSnap.Count} | VCarve Paths: {vcarveSnap.Count} | VCarve Segs: {previewSegmentCount} | {partialDebug}{suffix}");
+                    }
                 });
             }
 
@@ -423,28 +442,11 @@ public partial class MainWindow : Window
 
             await Dispatcher.UIThread.InvokeAsync(() =>
             {
-                _statusText.Text = "Error: " + ex.Message;
+                if (_statusText is not null)
+                    _statusText.Text = "Error: " + ex.Message;
                 _preview.SetGeometry(new(), new(), new(), new(), "generation-error");
             });
         }
-    }
-
-    private static int CountPathSegments(List<List<Point3D>> paths, bool closeRings)
-    {
-        int total = 0;
-        foreach (var path in paths)
-        {
-            total += Math.Max(0, path.Count - 1);
-            if (!closeRings || path.Count <= 2)
-                continue;
-
-            var first = path[0];
-            var last = path[^1];
-            if (first.X != last.X || first.Y != last.Y || first.Z != last.Z)
-                total += 1;
-        }
-
-        return total;
     }
 
     private static List<List<Point>> BuildDebugFallbackContours(string text, float emSize)

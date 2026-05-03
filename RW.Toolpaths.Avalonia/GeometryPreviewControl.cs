@@ -14,6 +14,8 @@ public sealed class GeometryPreviewControl : Control
     private readonly List<List<Point>> _contours = new();
     private readonly List<List<Point3D>> _clearing = new();
     private readonly List<List<Point3D>> _vcarve = new();
+    private readonly List<IReadOnlyList<ToolMove>> _clearingMoves = new();
+    private readonly List<IReadOnlyList<ToolMove>> _vcarveMoves = new();
     private readonly List<(Point A, Point B)> _medial = new();
     private readonly Dictionary<int, Pen> _vcarvePenCache = new();
     private readonly List<double> _clearingAverageDepths = new();
@@ -40,7 +42,9 @@ public sealed class GeometryPreviewControl : Control
 
     public bool PerspectiveEnabled { get; set; }
     public bool SegmentDebugColors { get; set; }
+    public bool ShowRawOverlay { get; set; }
     public string DebugInfo { get; set; } = string.Empty;
+    public int VCarveSegmentCount => _vcarveSegmentCount;
 
     public GeometryPreviewControl()
     {
@@ -74,11 +78,17 @@ public sealed class GeometryPreviewControl : Control
         _contours.Clear();
         _clearing.Clear();
         _vcarve.Clear();
+        _clearingMoves.Clear();
+        _vcarveMoves.Clear();
         _medial.Clear();
 
         _contours.AddRange(contours);
         _clearing.AddRange(clearing);
         _vcarve.AddRange(vcarve);
+        foreach (var path in _clearing)
+            _clearingMoves.Add(ToolpathCurveDetector.DetectMoves(path, closePath: true));
+        foreach (var path in _vcarve)
+            _vcarveMoves.Add(ToolpathCurveDetector.DetectMoves(path));
         _medial.AddRange(medial);
         RecomputeCaches();
 
@@ -168,9 +178,12 @@ public sealed class GeometryPreviewControl : Control
             _clearingAverageDepths.Add(zCount == 0 ? 0.0 : zSum / zCount);
         }
 
-        foreach (var path in _vcarve)
+        for (int pathIndex = 0; pathIndex < _vcarve.Count; pathIndex++)
         {
-            _vcarveSegmentCount += Math.Max(0, path.Count - 1);
+            var path = _vcarve[pathIndex];
+            _vcarveSegmentCount += pathIndex < _vcarveMoves.Count
+                ? _vcarveMoves[pathIndex].Count
+                : Math.Max(0, path.Count - 1);
             foreach (var p in path)
             {
                 Acc(p.X, p.Y);
@@ -179,16 +192,12 @@ public sealed class GeometryPreviewControl : Control
             }
         }
 
-        foreach (var path in _clearing)
+        for (int pathIndex = 0; pathIndex < _clearing.Count; pathIndex++)
         {
-            _vcarveSegmentCount += Math.Max(0, path.Count - 1);
-            if (path.Count <= 2)
-                continue;
-
-            var first = path[0];
-            var last = path[^1];
-            if (first.X != last.X || first.Y != last.Y || first.Z != last.Z)
-                _vcarveSegmentCount += 1;
+            var path = _clearing[pathIndex];
+            _vcarveSegmentCount += pathIndex < _clearingMoves.Count
+                ? _clearingMoves[pathIndex].Count
+                : CountDisplayedPathSegments(path, closePath: true);
         }
 
         foreach (var seg in _medial)
@@ -242,42 +251,39 @@ public sealed class GeometryPreviewControl : Control
             if (path.Count < 2)
                 continue;
 
-            var first = Tx(new Point(path[0].X, path[0].Y));
-            var prev = first;
-            for (int i = 1; i < path.Count; i++)
-            {
-                var next = Tx(new Point(path[i].X, path[i].Y));
-                var pen = SegmentDebugColors
-                    ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.3)
-                    : new Pen(new SolidColorBrush(ClearingColorForDepth(avgDepth)), 1.3);
-                context.DrawLine(pen, prev, next);
-                prev = next;
-                moveIdx++;
-            }
-
-            if (path.Count > 2)
+            var moves = pathIndex < _clearingMoves.Count
+                ? _clearingMoves[pathIndex]
+                : ToolpathCurveDetector.DetectMoves(path, closePath: true);
+            foreach (var move in moves)
             {
                 var pen = SegmentDebugColors
                     ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.3)
                     : new Pen(new SolidColorBrush(ClearingColorForDepth(avgDepth)), 1.3);
-                context.DrawLine(pen, prev, first);
+                DrawMove2D(context, move, pen, p => Tx(new Point(p.X, p.Y)));
                 moveIdx++;
             }
         }
 
-        var minVZ = MinVCarveZ();
-        foreach (var path in _vcarve)
+        if (ShowRawOverlay)
         {
+            DrawRawOverlayTopDown(context, Tx);
+        }
+
+        var minVZ = MinVCarveZ();
+        for (int pathIndex = 0; pathIndex < _vcarve.Count; pathIndex++)
+        {
+            var path = _vcarve[pathIndex];
             if (path.Count < 2) continue;
-            for (int i = 1; i < path.Count; i++)
+            var moves = pathIndex < _vcarveMoves.Count
+                ? _vcarveMoves[pathIndex]
+                : ToolpathCurveDetector.DetectMoves(path);
+            foreach (var move in moves)
             {
-                var a2d = Tx(new Point(path[i - 1].X, path[i - 1].Y));
-                var b2d = Tx(new Point(path[i].X, path[i].Y));
-                var segZ = (path[i - 1].Z + path[i].Z) * 0.5;
+                var segZ = (move.Start.Z + move.End.Z) * 0.5;
                 var pen = SegmentDebugColors
                     ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.7)
                     : GetVCarvePen(segZ, minVZ, 1.7);
-                context.DrawLine(pen, a2d, b2d);
+                DrawMove2D(context, move, pen, p => Tx(new Point(p.X, p.Y)));
                 moveIdx++;
             }
         }
@@ -370,58 +376,38 @@ public sealed class GeometryPreviewControl : Control
         {
             var path = _clearing[pathIndex];
             double avgDepth = pathIndex < _clearingAverageDepths.Count ? _clearingAverageDepths[pathIndex] : 0.0;
-            for (int i = 1; i < path.Count; i++)
+            var moves = pathIndex < _clearingMoves.Count
+                ? _clearingMoves[pathIndex]
+                : ToolpathCurveDetector.DetectMoves(path, closePath: true);
+            foreach (var move in moves)
             {
-                var a = ToWorld((float)path[i - 1].X, (float)path[i - 1].Y, (float)path[i - 1].Z);
-                var b = ToWorld((float)path[i].X, (float)path[i].Y, (float)path[i].Z);
-                if (TryProjectSegment(a, b, cameraPos, forward, right, up, focal, aspect, paddedViewport, out var a2d, out var b2d))
-                {
-                    var pen = SegmentDebugColors
-                        ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.4)
-                        : new Pen(new SolidColorBrush(ClearingColorForDepth(avgDepth)), 1.4);
-                    context.DrawLine(pen, a2d, b2d);
-                }
+                var pen = SegmentDebugColors
+                    ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.4)
+                    : new Pen(new SolidColorBrush(ClearingColorForDepth(avgDepth)), 1.4);
+                DrawMovePerspective(context, move, pen, cameraPos, forward, right, up, focal, aspect, paddedViewport);
                 moveIdx++;
-            }
-
-            // Clearing paths are concentric rings; close them in 3D just like 2D preview.
-            if (path.Count > 2)
-            {
-                var first = path[0];
-                var last = path[^1];
-                if (first.X != last.X || first.Y != last.Y || first.Z != last.Z)
-                {
-                    var a = ToWorld((float)last.X, (float)last.Y, (float)last.Z);
-                    var b = ToWorld((float)first.X, (float)first.Y, (float)first.Z);
-                    if (TryProjectSegment(a, b, cameraPos, forward, right, up, focal, aspect, paddedViewport, out var a2d, out var b2d))
-                    {
-                        var pen = SegmentDebugColors
-                            ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.4)
-                            : new Pen(new SolidColorBrush(ClearingColorForDepth(avgDepth)), 1.4);
-                        context.DrawLine(pen, a2d, b2d);
-                    }
-                    moveIdx++;
-                }
             }
         }
 
-        double minZ = MinVCarveZ();
-        foreach (var path in _vcarve)
+        if (ShowRawOverlay)
         {
-            for (int i = 1; i < path.Count; i++)
+            DrawRawOverlayPerspective(context, cameraPos, forward, right, up, focal, aspect, paddedViewport);
+        }
+
+        double minZ = MinVCarveZ();
+        for (int pathIndex = 0; pathIndex < _vcarve.Count; pathIndex++)
+        {
+            var path = _vcarve[pathIndex];
+            var moves = pathIndex < _vcarveMoves.Count
+                ? _vcarveMoves[pathIndex]
+                : ToolpathCurveDetector.DetectMoves(path);
+            foreach (var move in moves)
             {
-                var a0 = path[i - 1];
-                var b0 = path[i];
-                var a = ToWorld((float)a0.X, (float)a0.Y, (float)a0.Z);
-                var b = ToWorld((float)b0.X, (float)b0.Y, (float)b0.Z);
-                var segZ = (a0.Z + b0.Z) * 0.5;
-                if (TryProjectSegment(a, b, cameraPos, forward, right, up, focal, aspect, paddedViewport, out var a2d, out var b2d))
-                {
-                    var pen = SegmentDebugColors
-                        ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.8)
-                        : GetVCarvePen(segZ, minZ, 1.8);
-                    context.DrawLine(pen, a2d, b2d);
-                }
+                var segZ = (move.Start.Z + move.End.Z) * 0.5;
+                var pen = SegmentDebugColors
+                    ? new Pen(new SolidColorBrush(DebugSegmentColor(moveIdx)), 1.8)
+                    : GetVCarvePen(segZ, minZ, 1.8);
+                DrawMovePerspective(context, move, pen, cameraPos, forward, right, up, focal, aspect, paddedViewport);
                 moveIdx++;
             }
         }
@@ -437,6 +423,159 @@ public sealed class GeometryPreviewControl : Control
     }
 
     private static Vector3 ToWorld(float x, float y, float z) => new(x, -y, z);
+
+    private static void DrawMove2D(
+        DrawingContext context,
+        ToolMove move,
+        Pen pen,
+        Func<Point3D, Point> transform)
+    {
+        var samples = ToolpathCurveDetector.SampleMove(move);
+        if (samples.Count < 2)
+            return;
+
+        var prev = transform(samples[0]);
+        for (int i = 1; i < samples.Count; i++)
+        {
+            var next = transform(samples[i]);
+            context.DrawLine(pen, prev, next);
+            prev = next;
+        }
+    }
+
+    private static void DrawMovePerspective(
+        DrawingContext context,
+        ToolMove move,
+        Pen pen,
+        Vector3 cameraPos,
+        Vector3 forward,
+        Vector3 right,
+        Vector3 up,
+        float focal,
+        float aspect,
+        Rect paddedViewport)
+    {
+        var samples = ToolpathCurveDetector.SampleMove(move);
+        if (samples.Count < 2)
+            return;
+
+        var previous = samples[0];
+        for (int i = 1; i < samples.Count; i++)
+        {
+            var current = samples[i];
+            var a = ToWorld((float)previous.X, (float)previous.Y, (float)previous.Z);
+            var b = ToWorld((float)current.X, (float)current.Y, (float)current.Z);
+            if (TryProjectSegment(a, b, cameraPos, forward, right, up, focal, aspect, paddedViewport, out var a2d, out var b2d))
+                context.DrawLine(pen, a2d, b2d);
+            previous = current;
+        }
+    }
+
+    private void DrawRawOverlayTopDown(DrawingContext context, Func<Point, Point> transform)
+    {
+        var rawBrush = new SolidColorBrush(Color.FromArgb(200, 45, 45, 45));
+        var rawPen = new Pen(rawBrush, 1.0, dashStyle: DashStyle.Dash);
+
+        foreach (var path in _clearing)
+            DrawRawPathTopDown(context, path, rawPen, closePath: true, transform);
+        foreach (var path in _vcarve)
+            DrawRawPathTopDown(context, path, rawPen, closePath: false, transform);
+    }
+
+    private static void DrawRawPathTopDown(
+        DrawingContext context,
+        IReadOnlyList<Point3D> path,
+        Pen pen,
+        bool closePath,
+        Func<Point, Point> transform)
+    {
+        if (path.Count < 2)
+            return;
+
+        var first = transform(new Point(path[0].X, path[0].Y));
+        var previous = first;
+        for (int i = 1; i < path.Count; i++)
+        {
+            var next = transform(new Point(path[i].X, path[i].Y));
+            context.DrawLine(pen, previous, next);
+            previous = next;
+        }
+
+        if (closePath && ShouldClosePath(path))
+            context.DrawLine(pen, previous, first);
+    }
+
+    private void DrawRawOverlayPerspective(
+        DrawingContext context,
+        Vector3 cameraPos,
+        Vector3 forward,
+        Vector3 right,
+        Vector3 up,
+        float focal,
+        float aspect,
+        Rect viewport)
+    {
+        var rawBrush = new SolidColorBrush(Color.FromArgb(200, 45, 45, 45));
+        var rawPen = new Pen(rawBrush, 1.0, dashStyle: DashStyle.Dash);
+
+        foreach (var path in _clearing)
+            DrawRawPathPerspective(context, path, rawPen, closePath: true, cameraPos, forward, right, up, focal, aspect, viewport);
+        foreach (var path in _vcarve)
+            DrawRawPathPerspective(context, path, rawPen, closePath: false, cameraPos, forward, right, up, focal, aspect, viewport);
+    }
+
+    private static void DrawRawPathPerspective(
+        DrawingContext context,
+        IReadOnlyList<Point3D> path,
+        Pen pen,
+        bool closePath,
+        Vector3 cameraPos,
+        Vector3 forward,
+        Vector3 right,
+        Vector3 up,
+        float focal,
+        float aspect,
+        Rect viewport)
+    {
+        if (path.Count < 2)
+            return;
+
+        for (int i = 1; i < path.Count; i++)
+        {
+            var a = ToWorld((float)path[i - 1].X, (float)path[i - 1].Y, (float)path[i - 1].Z);
+            var b = ToWorld((float)path[i].X, (float)path[i].Y, (float)path[i].Z);
+            if (TryProjectSegment(a, b, cameraPos, forward, right, up, focal, aspect, viewport, out var a2d, out var b2d))
+                context.DrawLine(pen, a2d, b2d);
+        }
+
+        if (closePath && ShouldClosePath(path))
+        {
+            var first = path[0];
+            var last = path[^1];
+            var a = ToWorld((float)last.X, (float)last.Y, (float)last.Z);
+            var b = ToWorld((float)first.X, (float)first.Y, (float)first.Z);
+            if (TryProjectSegment(a, b, cameraPos, forward, right, up, focal, aspect, viewport, out var a2d, out var b2d))
+                context.DrawLine(pen, a2d, b2d);
+        }
+    }
+
+    private static int CountDisplayedPathSegments(IReadOnlyList<Point3D> path, bool closePath)
+    {
+        int count = Math.Max(0, path.Count - 1);
+        if (closePath && ShouldClosePath(path))
+            count++;
+        return count;
+    }
+
+    private static bool ShouldClosePath(IReadOnlyList<Point3D> path)
+    {
+        if (path.Count <= 2)
+            return false;
+
+        var first = path[0];
+        var last = path[^1];
+        return first.X != last.X || first.Y != last.Y || first.Z != last.Z;
+    }
 
     private const float NearClip = 0.02f;
     private const float MaxProjectionRadiusFactor = 8.0f;

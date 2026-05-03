@@ -82,7 +82,8 @@
                     <CheckBox x:Name="SegmentDebugToggle" Content="Random Colors" VerticalAlignment="Center" />
                 </StackPanel>
 
-                <TextBlock Grid.Row="1" Grid.Column="7" Grid.ColumnSpan="3" x:Name="StatusText" VerticalAlignment="Center" Text="Ready" TextWrapping="Wrap" />
+                <CheckBox Grid.Row="1" Grid.Column="8" x:Name="RawOverlayToggle" Content="Show Raw Overlay" VerticalAlignment="Center" />
+
             </Grid>
         </Border>
 

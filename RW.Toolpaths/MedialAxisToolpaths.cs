@@ -35,11 +35,49 @@ public readonly record struct MedialPoint(double X, double Y, double Radius);
 ///   Zero-based depth-layer index for clearing passes; <c>null</c> for non-layered
 ///   passes (e.g. final carve).
 /// </param>
-public readonly record struct TaggedToolpath(
-    IReadOnlyList<Point3D> Points,
-    int RegionIndex,
-    string Category,
-    int? DepthPassIndex);
+public readonly record struct TaggedToolpath
+{
+    public TaggedToolpath(
+        IReadOnlyList<Point3D> points,
+        int regionIndex,
+        string category,
+        int? depthPassIndex)
+        : this(
+            points,
+            ToolpathCurveDetector.DetectMoves(points),
+            regionIndex,
+            category,
+            depthPassIndex)
+    {
+    }
+
+    public TaggedToolpath(
+        IReadOnlyList<Point3D> points,
+        IReadOnlyList<ToolMove> moves,
+        int regionIndex,
+        string category,
+        int? depthPassIndex)
+    {
+        Points = points;
+        Moves = moves;
+        RegionIndex = regionIndex;
+        Category = category;
+        DepthPassIndex = depthPassIndex;
+    }
+
+    public IReadOnlyList<Point3D> Points { get; init; }
+
+    /// <summary>
+    /// Curve-aware moves derived from <see cref="Points"/>.  Lines, arcs, and
+    /// cubic Beziers are emitted only when their measured fit error is within
+    /// <see cref="ToolpathCurveDetector.DefaultTolerance"/>.
+    /// </summary>
+    public IReadOnlyList<ToolMove> Moves { get; init; }
+
+    public int RegionIndex { get; init; }
+    public string Category { get; init; }
+    public int? DepthPassIndex { get; init; }
+}
 
 /// <summary>
 /// Provides a straight-skeleton / medial axis for a polygon.
@@ -311,19 +349,18 @@ public static class MedialAxisToolpaths
         double? topRadiusOverride = null,
         double? coneLengthOverride = null)
     {
-        var tagged = GenerateClearingPassesTagged(
+        return GenerateClearingPassGeometries(
             boundary,
             startDepth,
             endDepth,
             radianTipAngle,
             depthPerPass,
             stepOver,
-            regionIndex: 0,
             bottomRadiusOverride,
             topRadiusOverride,
-            coneLengthOverride);
-
-        return tagged.Select(t => t.Points.ToList()).ToList();
+            coneLengthOverride)
+            .Select(pass => pass.Points)
+            .ToList();
     }
 
     /// <summary>
@@ -341,6 +378,42 @@ public static class MedialAxisToolpaths
         double? bottomRadiusOverride = null,
         double? topRadiusOverride = null,
         double? coneLengthOverride = null)
+    {
+        var geometries = GenerateClearingPassGeometries(
+            boundary,
+            startDepth,
+            endDepth,
+            radianTipAngle,
+            depthPerPass,
+            stepOver,
+            bottomRadiusOverride,
+            topRadiusOverride,
+            coneLengthOverride);
+
+        var result = new List<TaggedToolpath>(geometries.Count);
+        foreach (var (points, depthPassIndex) in geometries)
+        {
+            result.Add(new TaggedToolpath(
+                points,
+                ToolpathCurveDetector.DetectMoves(points, closePath: true),
+                regionIndex,
+                "clearing",
+                depthPassIndex));
+        }
+
+        return result;
+    }
+
+    private static List<(List<Point3D> Points, int DepthPassIndex)> GenerateClearingPassGeometries(
+        IReadOnlyList<IReadOnlyList<PointD>> boundary,
+        double startDepth,
+        double endDepth,
+        double radianTipAngle,
+        double depthPerPass,
+        double stepOver,
+        double? bottomRadiusOverride,
+        double? topRadiusOverride,
+        double? coneLengthOverride)
     {
         if (endDepth <= startDepth) return new();
 
@@ -422,7 +495,7 @@ public static class MedialAxisToolpaths
         }
 
         // Generate OffsetFill toolpaths for each layer
-        var result = new List<TaggedToolpath>();
+        var result = new List<(List<Point3D> Points, int DepthPassIndex)>();
         int depthPassIndex = 0;
         foreach (var (z, zTop, rings, isBottom, layerRadius) in layers)
         {
@@ -439,7 +512,8 @@ public static class MedialAxisToolpaths
             var paths = OffsetFill.Generate(rings, z, zTop, stepOverDist);
             foreach (var path in paths)
             {
-                result.Add(new TaggedToolpath(SimplifyCollinearRuns(path), regionIndex, "clearing", depthPassIndex));
+                var simplified = SimplifyCollinearRuns(path);
+                result.Add((simplified, depthPassIndex));
             }
 
             depthPassIndex++;
@@ -480,7 +554,7 @@ public static class MedialAxisToolpaths
         double? topRadiusOverride = null,
         double? coneLengthOverride = null)
     {
-        var tagged = GenerateVCarveTagged(
+        var components = GenerateVCarveComponents(
             provider,
             boundary,
             startDepth,
@@ -489,12 +563,14 @@ public static class MedialAxisToolpaths
             depthPerPass,
             stepOver,
             tolerance,
-            regionIndex: 0,
-            bottomRadiusOverride,
-            topRadiusOverride,
-            coneLengthOverride);
+            bottomRadiusOverride: bottomRadiusOverride,
+            topRadiusOverride: topRadiusOverride,
+            coneLengthOverride: coneLengthOverride);
 
-        return tagged.Select(t => t.Points.ToList()).ToList();
+        var result = new List<List<Point3D>>(components.ClearingPasses.Count + components.FinalPass.Count);
+        result.AddRange(components.ClearingPasses);
+        result.AddRange(components.FinalPass);
+        return result;
     }
 
     /// <summary>
@@ -578,24 +654,37 @@ public static class MedialAxisToolpaths
             double? topRadiusOverride = null,
             double? coneLengthOverride = null)
     {
-        var tagged = GenerateVCarveComponentsTagged(
-            provider,
+        long t0 = PerfLog.Start();
+        var clearing = GenerateClearingPasses(
             boundary,
             startDepth,
             endDepth,
             radianTipAngle,
             depthPerPass,
             stepOver,
-            tolerance,
-            rdpTolerance,
-            regionIndex: 0,
             bottomRadiusOverride,
             topRadiusOverride,
             coneLengthOverride);
+        var final = Generate(
+            provider,
+            boundary,
+            startDepth,
+            endDepth,
+            radianTipAngle,
+            depthPerPass,
+            tolerance,
+            rdpTolerance,
+            bottomRadiusOverride,
+            topRadiusOverride,
+            coneLengthOverride)
+            ?? new List<List<Point3D>>();
 
-        return (
-            tagged.ClearingPasses.Select(t => t.Points.ToList()).ToList(),
-            tagged.FinalPass.Select(t => t.Points.ToList()).ToList());
+        PerfLog.Stop(
+            "MedialAxisToolpaths.GenerateVCarveComponents",
+            t0,
+            $"rings={boundary.Count} clearing={clearing.Count} final={final.Count}");
+
+        return (clearing, final);
     }
 
     /// <summary>
