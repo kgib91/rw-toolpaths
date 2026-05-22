@@ -334,6 +334,24 @@ public class JoinIntoPolylinesTests
         Assert.Single(result!); // joined
     }
 
+    // -- Reversed but contiguous segments should still connect physically
+    [Fact]
+    public void ReverseOrientedSegment_StillConnects()
+    {
+        var result = MedialAxisToolpaths.JoinIntoPolylines(new[]
+        {
+            Seg(0, 0, -0.1, 1, 0, -0.2),
+            Seg(2, 0, -0.3, 1, 0, -0.2),
+        });
+
+        Assert.NotNull(result);
+        Assert.Single(result!);
+        Assert.Equal(3, result![0].Count);
+        Tol.Equal(0.0, result[0][0].X);
+        Tol.Equal(1.0, result[0][1].X);
+        Tol.Equal(2.0, result[0][2].X);
+    }
+
     // -- Point values preserved
     [Fact]
     public void PointValuesPreserved()

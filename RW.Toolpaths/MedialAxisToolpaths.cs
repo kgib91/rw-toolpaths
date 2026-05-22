@@ -307,6 +307,28 @@ public static class MedialAxisToolpaths
             for (int i = 0; i < polylines.Count; i++)
                 polylines[i] = RdpSimplify3D(polylines[i], rdpTolerance);
         }
+
+        // Re-derive Z analytically along the (possibly simplified) XY paths so the
+        // V-cone touches the original boundary at every point — not just at the
+        // surviving vertices.  Recomputes Z at vertices and bisects any chord
+        // whose linear-Z interpolation drifts from the analytical depth curve
+        // by more than zTolerance.  See EnsureZFidelityFromBoundary.
+        var zProfile = ResolveToolProfile(
+            startDepth, endDepth, radianTipAngle, depthPerPass,
+            bottomRadiusOverride, topRadiusOverride, coneLengthOverride);
+        var boundarySegs = BuildBoundarySegments(NormalizeBoundaryRings(boundary));
+        double zTolerance = Math.Max(tolerance * 0.1, 1e-6);
+        for (int i = 0; i < polylines.Count; i++)
+        {
+            polylines[i] = EnsureZFidelityFromBoundary(
+                polylines[i],
+                boundarySegs,
+                startDepth,
+                zProfile.BottomRadius,
+                Math.Max(1e-9, zProfile.RadiusSlope),
+                endZ,
+                zTolerance);
+        }
         return polylines;
     }
 
@@ -421,10 +443,10 @@ public static class MedialAxisToolpaths
         if (normalizedBoundary.Count == 0)
             return new();
 
-        // Keep clearing offsets in the same geometric domain family used by
-        // medial-axis planning to avoid tiny red/blue seam mismatches.
-        var clearingBoundary = GenerateSimplifiedLayer(normalizedBoundary, InitialScale)
-            ?? normalizedBoundary;
+        // Clearing passes should use the canonical boundary directly; the
+        // contour simplification step is for medial-axis stability, not pocket
+        // offset fidelity.
+        var clearingBoundary = normalizedBoundary;
 
         var profile = ResolveToolProfile(
             startDepth,
@@ -464,6 +486,7 @@ public static class MedialAxisToolpaths
             var layer = Contract(clearingBoundary, contractAmount);
             if (layer.Count > 0)
                 layers.Add((-k, -N, layer, false, contractAmount));
+
             N = k;
             k += depthPerPass;
         }
@@ -827,7 +850,7 @@ public static class MedialAxisToolpaths
             topRadiusOverride,
             coneLengthOverride);
 
-        double maxRadius = profile.PassRadius;
+        double maxRadius = profile.FinalRadius;
         double invSlope = 1.0 / profile.RadiusSlope;
 
         double scale    = InitialScale;
@@ -887,7 +910,11 @@ public static class MedialAxisToolpaths
             Console.Error.WriteLine($"medial-axis: failed after scale increases; {lastErr}");
 
         // Flat bottom region: contract by cutter radius at final depth.
-        var flatArea = Contract(simplifiedLayer!, profile.FinalRadius);
+        // Use the raw normalized boundary (not the morph-opened simplifiedLayer) so this region
+        // matches exactly the area the clearing passes fill at endZ; otherwise the Difference
+        // clip in GenerateFlatAreaFill removes medial-axis flat strokes from sub-regions that
+        // are not covered by clearing rings, producing a visible toolpath gap.
+        var flatArea = Contract(normalizedBoundary, profile.FinalRadius);
 
         PerfLog.Stop(
             "MedialAxisToolpaths.GenerateMedialAxisToolpaths",
@@ -1353,6 +1380,24 @@ public static class MedialAxisToolpaths
                 && Close(prevEnd.Value.X, p0.X)
                 && Close(prevEnd.Value.Y, p0.Y)
                 && Close(prevEnd.Value.Z, p0.Z);
+            bool reverseConnects = prevEnd is not null
+                && Close(prevEnd.Value.X, p1.X)
+                && Close(prevEnd.Value.Y, p1.Y)
+                && Close(prevEnd.Value.Z, p1.Z);
+
+            if (connects)
+            {
+                currentLine.Add(p1);
+                prevEnd = p1;
+                continue;
+            }
+
+            if (reverseConnects)
+            {
+                currentLine.Add(p0);
+                prevEnd = p0;
+                continue;
+            }
 
             if (!connects)
             {
@@ -1483,6 +1528,243 @@ public static class MedialAxisToolpaths
             if (p.y > maxY) maxY = p.y;
         }
         return (minX, minY, maxX, maxY);
+    }
+
+    // --- Z-fidelity (analytical V-carve depth) -------------------------------------
+
+    /// <summary>
+    /// Builds a delegate <c>(x,y) =&gt; analytical V-carve Z</c> for the given
+    /// pocket boundary and V-bit profile.  Use with
+    /// <see cref="ToolpathCurveDetector.SampleMove(ToolMove, double, Func{double,double,double}?)"/>
+    /// to render fitted arcs/Beziers while keeping Z analytically correct
+    /// (<c>Z = max(endZ, -startDepth - (dist - bottomRadius) / radiusSlope)</c>).
+    /// </summary>
+    public static Func<double, double, double> CreateAnalyticalZFunction(
+        IReadOnlyList<IReadOnlyList<PointD>> boundary,
+        double startDepth,
+        double endDepth,
+        double radianTipAngle,
+        double depthPerPass,
+        double? bottomRadiusOverride = null,
+        double? topRadiusOverride = null,
+        double? coneLengthOverride = null)
+    {
+        var profile = ResolveToolProfile(
+            startDepth, endDepth, radianTipAngle, depthPerPass,
+            bottomRadiusOverride, topRadiusOverride, coneLengthOverride);
+        var segments = BuildBoundarySegments(NormalizeBoundaryRings(boundary));
+        double startZ = -startDepth;
+        double endZ   = -endDepth;
+        double invSlope = 1.0 / Math.Max(1e-9, profile.RadiusSlope);
+        double bottomR  = profile.BottomRadius;
+        return (x, y) => AnalyticalZ(x, y, segments, startZ, bottomR, invSlope, endZ);
+    }
+
+    /// <summary>
+    /// Re-derives Z along a (possibly XY-simplified) toolpath from the analytical
+    /// V-carve depth function:
+    /// <code>
+    ///   Z(x,y) = max(endZ, -startDepth - (dist((x,y), boundary) - bottomRadius) / radiusSlope)
+    /// </code>
+    /// Each retained vertex's Z is replaced with the analytical value, then every
+    /// chord is recursively bisected wherever its linear-Z interpolation deviates
+    /// from the analytical Z curve by more than <paramref name="zTolerance"/>.
+    /// XY topology is preserved exactly; only Z waypoints are added back where
+    /// the depth profile curves significantly.
+    /// </summary>
+    internal static List<Point3D> EnsureZFidelityFromBoundary(
+        List<Point3D> path,
+        IReadOnlyList<(PointD A, PointD B)> boundarySegments,
+        double startDepth,
+        double bottomRadius,
+        double radiusSlope,
+        double endZ,
+        double zTolerance)
+    {
+        if (path.Count < 2 || zTolerance <= 0 || boundarySegments.Count == 0)
+            return path;
+
+        double startZ = -startDepth;
+        double invSlope = 1.0 / radiusSlope;
+
+        // Snap every retained vertex's Z to its analytical value first.
+        var snapped = new List<Point3D>(path.Count);
+        foreach (var p in path)
+        {
+            double z = AnalyticalZ(p.X, p.Y, boundarySegments, startZ, bottomRadius, invSlope, endZ);
+            snapped.Add(new Point3D(p.X, p.Y, z));
+        }
+
+        var output = new List<Point3D>(snapped.Count * 2);
+        output.Add(snapped[0]);
+        for (int i = 0; i < snapped.Count - 1; i++)
+        {
+            BisectChordForZ(
+                snapped[i], snapped[i + 1], boundarySegments,
+                startZ, bottomRadius, invSlope, endZ, zTolerance,
+                output, depth: 0);
+        }
+        return output;
+    }
+
+    private const int MaxZFidelityBisectDepth = 14;
+
+    /// <summary>
+    /// Splits any path segment whose |dz| exceeds the given cap, inserting
+    /// midpoints with analytical Z. This bounds the error of the GPU swept-
+    /// volume renderer, which projects the tool tip along the segment's XZ
+    /// footprint only and otherwise leaves pillar-shaped gaps on V-carve ramps
+    /// where dz is large. Flat (constant-Z) chords are left untouched because
+    /// XZ projection is exact for them.
+    /// </summary>
+    internal static List<Point3D> EnforceMaxChordLength(
+        List<Point3D> path,
+        IReadOnlyList<(PointD A, PointD B)> boundarySegments,
+        double startDepth,
+        double bottomRadius,
+        double radiusSlope,
+        double endZ,
+        double maxChordDz)
+    {
+        if (path.Count < 2 || boundarySegments.Count == 0 || maxChordDz <= 0)
+            return path;
+
+        double startZ = -startDepth;
+        double invSlope = 1.0 / radiusSlope;
+
+        var output = new List<Point3D>(path.Count * 2);
+        output.Add(path[0]);
+        for (int i = 1; i < path.Count; i++)
+        {
+            SubdivideChord(path[i - 1], path[i], boundarySegments,
+                startZ, bottomRadius, invSlope, endZ,
+                maxChordDz, output, depth: 0);
+        }
+        return output;
+    }
+
+    private const int MaxChordSubdivideDepth = 14;
+
+    private static void SubdivideChord(
+        Point3D a, Point3D b,
+        IReadOnlyList<(PointD A, PointD B)> segments,
+        double startZ, double bottomRadius, double invSlope, double endZ,
+        double maxChordDz,
+        List<Point3D> output, int depth)
+    {
+        double dz = b.Z - a.Z;
+        if (Math.Abs(dz) <= maxChordDz || depth >= MaxChordSubdivideDepth)
+        {
+            output.Add(b);
+            return;
+        }
+
+        double mx = 0.5 * (a.X + b.X);
+        double my = 0.5 * (a.Y + b.Y);
+        double mz = AnalyticalZ(mx, my, segments, startZ, bottomRadius, invSlope, endZ);
+        var mid = new Point3D(mx, my, mz);
+        SubdivideChord(a, mid, segments, startZ, bottomRadius, invSlope, endZ,
+            maxChordDz, output, depth + 1);
+        SubdivideChord(mid, b, segments, startZ, bottomRadius, invSlope, endZ,
+            maxChordDz, output, depth + 1);
+    }
+
+    private static void BisectChordForZ(
+        Point3D a,
+        Point3D b,
+        IReadOnlyList<(PointD A, PointD B)> segments,
+        double startZ,
+        double bottomRadius,
+        double invSlope,
+        double endZ,
+        double zTolerance,
+        List<Point3D> output,
+        int depth)
+    {
+        double dx = b.X - a.X;
+        double dy = b.Y - a.Y;
+        if (depth >= MaxZFidelityBisectDepth || (dx * dx + dy * dy) < 1e-18)
+        {
+            output.Add(b);
+            return;
+        }
+
+        double mx = 0.5 * (a.X + b.X);
+        double my = 0.5 * (a.Y + b.Y);
+        double zChord = 0.5 * (a.Z + b.Z);
+        double zAnalytical = AnalyticalZ(mx, my, segments, startZ, bottomRadius, invSlope, endZ);
+
+        if (Math.Abs(zChord - zAnalytical) <= zTolerance)
+        {
+            output.Add(b);
+            return;
+        }
+
+        var mid = new Point3D(mx, my, zAnalytical);
+        BisectChordForZ(a, mid, segments, startZ, bottomRadius, invSlope, endZ, zTolerance, output, depth + 1);
+        BisectChordForZ(mid, b, segments, startZ, bottomRadius, invSlope, endZ, zTolerance, output, depth + 1);
+    }
+
+    private static double AnalyticalZ(
+        double x,
+        double y,
+        IReadOnlyList<(PointD A, PointD B)> segments,
+        double startZ,
+        double bottomRadius,
+        double invSlope,
+        double endZ)
+    {
+        double r = DistanceToBoundary(x, y, segments);
+        double depthBelowStart = Math.Max(0.0, r - bottomRadius) * invSlope;
+        double z = startZ - depthBelowStart;
+        if (z < endZ) z = endZ;
+        return z;
+    }
+
+    private static double DistanceToBoundary(
+        double x, double y, IReadOnlyList<(PointD A, PointD B)> segments)
+    {
+        double bestSq = double.PositiveInfinity;
+        for (int i = 0; i < segments.Count; i++)
+        {
+            var (a, b) = segments[i];
+            double abx = b.x - a.x;
+            double aby = b.y - a.y;
+            double apx = x - a.x;
+            double apy = y - a.y;
+            double ab2 = abx * abx + aby * aby;
+            double t = ab2 <= 1e-18 ? 0.0 : (apx * abx + apy * aby) / ab2;
+            if (t < 0.0) t = 0.0;
+            else if (t > 1.0) t = 1.0;
+            double cx = a.x + abx * t;
+            double cy = a.y + aby * t;
+            double dx = x - cx;
+            double dy = y - cy;
+            double d2 = dx * dx + dy * dy;
+            if (d2 < bestSq) bestSq = d2;
+        }
+        return bestSq < double.PositiveInfinity ? Math.Sqrt(bestSq) : 0.0;
+    }
+
+    private static List<(PointD A, PointD B)> BuildBoundarySegments(
+        IReadOnlyList<IReadOnlyList<PointD>> rings)
+    {
+        var segs = new List<(PointD A, PointD B)>();
+        foreach (var ring in rings)
+        {
+            if (ring.Count < 2) continue;
+            // Rings from CanonicalizeRings are closed (first == last).  Iterate
+            // pairwise and skip a degenerate closing segment if present.
+            for (int i = 0; i < ring.Count - 1; i++)
+            {
+                var a = ring[i];
+                var b = ring[i + 1];
+                if (Math.Abs(a.x - b.x) < 1e-15 && Math.Abs(a.y - b.y) < 1e-15)
+                    continue;
+                segs.Add((a, b));
+            }
+        }
+        return segs;
     }
 
     /// <summary>

@@ -107,11 +107,31 @@ public static class ToolpathCurveDetector
     }
 
     public static IReadOnlyList<Point3D> SampleMove(ToolMove move, double chordTolerance = DefaultTolerance)
+        => SampleMove(move, chordTolerance, zOverride: null);
+
+    /// <summary>
+    /// Samples a tool move into a polyline.  When <paramref name="zOverride"/>
+    /// is provided, each sample's Z is replaced by the callback's value at the
+    /// sample's (X,Y).  Use this to keep XY of fitted arcs/Beziers while making
+    /// Z follow an analytical curve (e.g. V-carve depth from boundary distance).
+    /// </summary>
+    public static IReadOnlyList<Point3D> SampleMove(
+        ToolMove move,
+        double chordTolerance,
+        Func<double, double, double>? zOverride)
     {
         if (chordTolerance <= 0) chordTolerance = DefaultTolerance;
 
         if (move.Kind == ToolMoveKind.Line)
-            return new[] { move.Start, move.End };
+        {
+            if (zOverride is null)
+                return new[] { move.Start, move.End };
+            return new[]
+            {
+                new Point3D(move.Start.X, move.Start.Y, zOverride(move.Start.X, move.Start.Y)),
+                new Point3D(move.End.X,   move.End.Y,   zOverride(move.End.X,   move.End.Y)),
+            };
+        }
 
         int segments = move.Kind is ToolMoveKind.ArcCw or ToolMoveKind.ArcCcw
             ? ArcSampleCount(move, chordTolerance)
@@ -121,12 +141,15 @@ public static class ToolpathCurveDetector
         for (int i = 0; i <= segments; i++)
         {
             double t = i / (double)segments;
-            points.Add(move.Kind switch
+            var p = move.Kind switch
             {
                 ToolMoveKind.ArcCw or ToolMoveKind.ArcCcw => EvaluateArc(move, t),
                 ToolMoveKind.CubicBezier => EvaluateCubic(move.Start, move.Control1, move.Control2, move.End, t),
                 _ => t == 0 ? move.Start : move.End,
-            });
+            };
+            if (zOverride is not null)
+                p = new Point3D(p.X, p.Y, zOverride(p.X, p.Y));
+            points.Add(p);
         }
 
         return points;
