@@ -1,3 +1,4 @@
+using Clipper2Lib;
 using RW.Toolpaths;
 
 namespace RW.Toolpaths.Tests;
@@ -55,4 +56,56 @@ public class MedialAxisSegmentEmitterTests
         Assert.Equal(0.0, segment.Point1.Y, 10);
         Assert.Equal(1.0, segment.Point1.Radius, 10);
     }
+}
+
+public class MedialAxisEdgeClassifierTests
+{
+    [Fact]
+    public void ClassifyEdges_RejectsCandidatesInsideAnAnnulusHole()
+    {
+        var boundary = Ring(-10, -10, 10, 10);
+        var hole = Ring(-4, -4, 4, 4);
+        var materialCandidate = Candidate(0, 7, 0);
+        var holeCandidate = Candidate(1, 0, 0);
+
+        MedialAxisEdgeClassifier.ClassifyEdges(
+            [materialCandidate, holeCandidate],
+            boundary,
+            [hole]);
+
+        Assert.Equal(MedialAxisEdgeClassifier.Colors.InnerPrimary, materialCandidate.Color);
+        Assert.NotEqual(MedialAxisEdgeClassifier.Colors.InnerPrimary, holeCandidate.Color);
+    }
+
+    private static MedialAxisEdgeClassifier.EdgeData Candidate(int index, double x, double y)
+    {
+        var vertex = new MedialAxisEdgeClassifier.EdgePoint(x, y);
+        return new MedialAxisEdgeClassifier.EdgeData(
+            Index: index,
+            TwinIndex: -1,
+            IsPrimary: true,
+            IsSecondary: false,
+            IsInfinite: false,
+            PrevIndex: -1,
+            NextIndex: -1,
+            Vertex0: vertex,
+            Vertex1: new MedialAxisEdgeClassifier.EdgePoint(x, y + 1),
+            Cell: new MedialAxisEdgeClassifier.CellSite(
+                ContainsPoint: true,
+                Point: new MedialAxisEdgeClassifier.EdgePoint(x + 100, y + 100),
+                Segment: null),
+            TwinCell: new MedialAxisEdgeClassifier.CellSite(
+                ContainsPoint: true,
+                Point: new MedialAxisEdgeClassifier.EdgePoint(x + 101, y + 100),
+                Segment: null));
+    }
+
+    private static List<PointD> Ring(double minX, double minY, double maxX, double maxY) =>
+    [
+        new PointD(minX, minY),
+        new PointD(maxX, minY),
+        new PointD(maxX, maxY),
+        new PointD(minX, maxY),
+        new PointD(minX, minY)
+    ];
 }

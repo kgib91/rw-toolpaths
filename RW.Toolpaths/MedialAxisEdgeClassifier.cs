@@ -66,7 +66,9 @@ internal static class MedialAxisEdgeClassifier
             }
         }
 
-        var stitchedPolygon = BuildPolygonWithSentinels(boundary, holes);
+        int insideCount = 0;
+        int outsideBoundaryCount = 0;
+        int insideHoleCount = 0;
 
         foreach (var edge in candidates)
         {
@@ -76,8 +78,9 @@ internal static class MedialAxisEdgeClassifier
             }
 
             var nonBorderPoint = GetNonBorderPoint(edge);
-            if (PointInPoly(nonBorderPoint, stitchedPolygon))
+            if (IsInsideRegion(nonBorderPoint, boundary, holes, out bool isInsideHole))
             {
+                insideCount++;
                 edge.Color = Colors.InnerPrimary;
 
                 if (edge.TwinIndex >= 0 && edge.TwinIndex < edges.Count)
@@ -85,6 +88,21 @@ internal static class MedialAxisEdgeClassifier
                     edges[edge.TwinIndex].Color = Colors.InnerPrimary;
                 }
             }
+            else if (isInsideHole)
+            {
+                insideHoleCount++;
+            }
+            else
+            {
+                outsideBoundaryCount++;
+            }
+        }
+
+        if (IsMedialDebugEnabled())
+        {
+            Console.Error.WriteLine(
+                $"[medial-axis][classify] candidates={candidates.Count} inside={insideCount} " +
+                $"outsideBoundary={outsideBoundaryCount} insideHole={insideHoleCount} holes={holes.Count}");
         }
     }
 
@@ -147,42 +165,46 @@ internal static class MedialAxisEdgeClassifier
             .ToList();
     }
 
-    private static List<EdgePoint> BuildPolygonWithSentinels(
+    private static bool IsInsideRegion(
+        EdgePoint point,
         IReadOnlyList<PointD> boundary,
-        IReadOnlyList<IReadOnlyList<PointD>> holes)
+        IReadOnlyList<IReadOnlyList<PointD>> holes,
+        out bool isInsideHole)
     {
-        var sentinel = new EdgePoint(0, 0);
-        var stitched = new List<EdgePoint> { sentinel };
+        isInsideHole = false;
+        if (!PointInRing(point, boundary))
+            return false;
 
-        AppendRing(stitched, boundary, sentinel);
         foreach (var hole in holes)
         {
-            AppendRing(stitched, hole, sentinel);
+            if (!PointInRing(point, hole))
+                continue;
+
+            isInsideHole = true;
+            return false;
         }
 
-        return stitched;
+        return true;
     }
 
-    private static void AppendRing(List<EdgePoint> stitched, IReadOnlyList<PointD> ring, EdgePoint sentinel)
+    private static bool PointInRing(EdgePoint point, IReadOnlyList<PointD> ring)
     {
-        if (ring.Count == 0)
+        bool inside = false;
+        for (int index = 0, previous = ring.Count - 1; index < ring.Count; previous = index++)
         {
-            return;
+            var current = ring[index];
+            var prior = ring[previous];
+            bool crosses = (current.y > point.Y) != (prior.y > point.Y);
+            if (!crosses)
+                continue;
+
+            double xAtY = (prior.x - current.x) * (point.Y - current.y) /
+                          (prior.y - current.y) + current.x;
+            if (xAtY > point.X)
+                inside = !inside;
         }
 
-        foreach (var point in ring)
-        {
-            stitched.Add(new EdgePoint(point.x, point.y));
-        }
-
-        if (!EqualPoints(
-                new EdgePoint(ring[0].x, ring[0].y),
-                new EdgePoint(ring[^1].x, ring[^1].y)))
-        {
-            stitched.Add(new EdgePoint(ring[0].x, ring[0].y));
-        }
-
-        stitched.Add(sentinel);
+        return inside;
     }
 
     private static EdgePoint GetNonBorderPoint(EdgeData edge)
@@ -284,35 +306,14 @@ internal static class MedialAxisEdgeClassifier
         return Math.Acos(Math.Clamp(dot / denom, -1.0, 1.0));
     }
 
-    private static bool PointInPoly(EdgePoint point, IReadOnlyList<EdgePoint> polygon)
-    {
-        bool inside = false;
-        int current = 0;
-        int previous = polygon.Count - 1;
-
-        while (current < polygon.Count)
-        {
-            var a = polygon[current];
-            var b = polygon[previous];
-
-            bool crosses = (a.Y - point.Y > Epsilon) != (b.Y - point.Y > Epsilon);
-            if (crosses)
-            {
-                double x = (b.X - a.X) * (point.Y - a.Y) / (b.Y - a.Y) + a.X - point.X;
-                if (x > Epsilon)
-                {
-                    inside = !inside;
-                }
-            }
-
-            previous = current++;
-        }
-
-        return inside;
-    }
-
     internal static bool EqualPoints(EdgePoint a, EdgePoint b) =>
         Math.Abs(a.X - b.X) < Epsilon && Math.Abs(a.Y - b.Y) < Epsilon;
+
+    private static bool IsMedialDebugEnabled() =>
+        string.Equals(
+            Environment.GetEnvironmentVariable("RW_TOOLPATHS_MEDIAL_DEBUG"),
+            "1",
+            StringComparison.Ordinal);
 
     private static EdgeData? GetEdge(IReadOnlyList<EdgeData> edges, int index) =>
         index >= 0 && index < edges.Count ? edges[index] : null;

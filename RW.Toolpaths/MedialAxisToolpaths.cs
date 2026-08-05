@@ -197,7 +197,13 @@ public static class MedialAxisToolpaths
             if (simplifiedLayer is null || simplifiedLayer.Count == 0)
                 return Array.Empty<MedialSegment>();
 
-            raw = GenerateMedialAxis(provider, simplifiedLayer, maxRadius, scale, tolerance);
+            raw = GenerateMedialAxis(
+                provider,
+                simplifiedLayer,
+                maxRadius,
+                scale,
+                tolerance,
+                CancellationToken.None);
 
             // For preview mode with explicit override, skip bbox-breakout filtering
             // and return what the kernel produced.
@@ -265,8 +271,11 @@ public static class MedialAxisToolpaths
         double rdpTolerance = DefaultRdpTolerance,
         double? bottomRadiusOverride = null,
         double? topRadiusOverride = null,
-        double? coneLengthOverride = null)
+        double? coneLengthOverride = null,
+        CancellationToken cancellationToken = default,
+        bool includeInteriorFill = true)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         double endZ   = -endDepth;
         var    result = GenerateMedialAxisToolpaths(
             provider,
@@ -278,7 +287,8 @@ public static class MedialAxisToolpaths
             tolerance,
             bottomRadiusOverride,
             topRadiusOverride,
-            coneLengthOverride);
+            coneLengthOverride,
+            cancellationToken);
 
         if (result is null) return null;
         var (medialAxis, flatAreaRegion) = result.Value;
@@ -291,12 +301,13 @@ public static class MedialAxisToolpaths
             .Select(s => s!.Value)
             .ToList();
 
-        // Join adjacent flat-area segments
-        var joinedFlat = JoinSegments(flatStrokes);
-
-        // Generate concentric fill for the flat bottom area
-        var flatFill = GenerateFlatAreaFill(joinedFlat, flatAreaRegion, endZ);
-        trimmed.AddRange(flatFill);
+        if (includeInteriorFill)
+        {
+            // Join adjacent flat-area segments and fill the flat bottom area.
+            var joinedFlat = JoinSegments(flatStrokes);
+            var flatFill = GenerateFlatAreaFill(joinedFlat, flatAreaRegion, endZ);
+            trimmed.AddRange(flatFill);
+        }
 
         // Connect segments into continuous polylines.
         var polylines = JoinIntoPolylines(trimmed);
@@ -318,11 +329,13 @@ public static class MedialAxisToolpaths
             bottomRadiusOverride, topRadiusOverride, coneLengthOverride);
         var boundarySegs = BuildBoundarySegments(NormalizeBoundaryRings(boundary));
         double zTolerance = Math.Max(tolerance * 0.1, 1e-6);
+        var spatialIndex = new SpatialSegmentIndex(boundarySegs);
         for (int i = 0; i < polylines.Count; i++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             polylines[i] = EnsureZFidelityFromBoundary(
                 polylines[i],
-                boundarySegs,
+                spatialIndex,
                 startDepth,
                 zProfile.BottomRadius,
                 Math.Max(1e-9, zProfile.RadiusSlope),
@@ -360,6 +373,9 @@ public static class MedialAxisToolpaths
     /// <param name="stepOver">
     ///   Step-over fraction of effective bit diameter. Default 0.4.
     /// </param>
+    /// <param name="includeInteriorFill">
+    ///   When <c>false</c>, emits only the outer ring of each depth layer.
+    /// </param>
     public static List<List<Point3D>> GenerateClearingPasses(
         IReadOnlyList<IReadOnlyList<PointD>> boundary,
         double startDepth,
@@ -369,7 +385,8 @@ public static class MedialAxisToolpaths
         double stepOver = 0.4,
         double? bottomRadiusOverride = null,
         double? topRadiusOverride = null,
-        double? coneLengthOverride = null)
+        double? coneLengthOverride = null,
+        bool includeInteriorFill = true)
     {
         return GenerateClearingPassGeometries(
             boundary,
@@ -380,7 +397,8 @@ public static class MedialAxisToolpaths
             stepOver,
             bottomRadiusOverride,
             topRadiusOverride,
-            coneLengthOverride)
+            coneLengthOverride,
+            includeInteriorFill)
             .Select(pass => pass.Points)
             .ToList();
     }
@@ -399,7 +417,8 @@ public static class MedialAxisToolpaths
         int regionIndex = 0,
         double? bottomRadiusOverride = null,
         double? topRadiusOverride = null,
-        double? coneLengthOverride = null)
+        double? coneLengthOverride = null,
+        bool includeInteriorFill = true)
     {
         var geometries = GenerateClearingPassGeometries(
             boundary,
@@ -410,7 +429,8 @@ public static class MedialAxisToolpaths
             stepOver,
             bottomRadiusOverride,
             topRadiusOverride,
-            coneLengthOverride);
+            coneLengthOverride,
+            includeInteriorFill);
 
         var result = new List<TaggedToolpath>(geometries.Count);
         foreach (var (points, depthPassIndex) in geometries)
@@ -435,7 +455,8 @@ public static class MedialAxisToolpaths
         double stepOver,
         double? bottomRadiusOverride,
         double? topRadiusOverride,
-        double? coneLengthOverride)
+        double? coneLengthOverride,
+        bool includeInteriorFill)
     {
         if (endDepth <= startDepth) return new();
 
@@ -532,7 +553,12 @@ public static class MedialAxisToolpaths
             if (stepOverDist <= 0)
                 stepOverDist = T;
 
-            var paths = OffsetFill.Generate(rings, z, zTop, stepOverDist);
+            var paths = OffsetFill.Generate(
+                rings,
+                z,
+                zTop,
+                stepOverDist,
+                maxIterations: includeInteriorFill ? 1_000 : 0);
             foreach (var path in paths)
             {
                 var simplified = SimplifyCollinearRuns(path);
@@ -561,6 +587,10 @@ public static class MedialAxisToolpaths
     /// <param name="depthPerPass">Maximum depth per pass.</param>
     /// <param name="stepOver">Step-over fraction of effective bit diameter (default 0.4).</param>
     /// <param name="tolerance">Medial-axis parabola discretisation tolerance (default 0.03).</param>
+    /// <param name="includeInteriorFill">
+    ///   Whether to clear broad areas with inward V-bit rings. Set to <c>false</c>
+    ///   after roughing to retain perimeter and corner-detail paths only.
+    /// </param>
     /// <returns>
     ///   All toolpath polylines: clearing passes first, then the final V-carve pass.
     /// </returns>
@@ -575,7 +605,8 @@ public static class MedialAxisToolpaths
         double tolerance   = 0.03,
         double? bottomRadiusOverride = null,
         double? topRadiusOverride = null,
-        double? coneLengthOverride = null)
+        double? coneLengthOverride = null,
+        bool includeInteriorFill = true)
     {
         var components = GenerateVCarveComponents(
             provider,
@@ -588,7 +619,8 @@ public static class MedialAxisToolpaths
             tolerance,
             bottomRadiusOverride: bottomRadiusOverride,
             topRadiusOverride: topRadiusOverride,
-            coneLengthOverride: coneLengthOverride);
+            coneLengthOverride: coneLengthOverride,
+            includeInteriorFill: includeInteriorFill);
 
         var result = new List<List<Point3D>>(components.ClearingPasses.Count + components.FinalPass.Count);
         result.AddRange(components.ClearingPasses);
@@ -612,8 +644,11 @@ public static class MedialAxisToolpaths
         int regionIndex = 0,
         double? bottomRadiusOverride = null,
         double? topRadiusOverride = null,
-        double? coneLengthOverride = null)
+        double? coneLengthOverride = null,
+        CancellationToken cancellationToken = default,
+        bool includeInteriorFill = true)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         long t0 = PerfLog.Start();
         var result = new List<TaggedToolpath>();
 
@@ -628,7 +663,8 @@ public static class MedialAxisToolpaths
             regionIndex,
             bottomRadiusOverride,
             topRadiusOverride,
-            coneLengthOverride);
+            coneLengthOverride,
+            includeInteriorFill);
         result.AddRange(clearing);
 
         // Final V-carve pass (carve-main)
@@ -643,7 +679,10 @@ public static class MedialAxisToolpaths
             rdpTolerance: DefaultRdpTolerance,
             bottomRadiusOverride,
             topRadiusOverride,
-            coneLengthOverride);
+            coneLengthOverride,
+            cancellationToken,
+            includeInteriorFill);
+        cancellationToken.ThrowIfCancellationRequested();
         if (finalPass is not null)
         {
             foreach (var path in finalPass)
@@ -653,7 +692,7 @@ public static class MedialAxisToolpaths
         PerfLog.Stop(
             "MedialAxisToolpaths.GenerateVCarve",
             t0,
-            $"rings={boundary.Count} clearing={clearing.Count} final={(finalPass?.Count ?? 0)}");
+            $"rings={boundary.Count} interiorFill={includeInteriorFill} clearing={clearing.Count} final={(finalPass?.Count ?? 0)}");
 
         return result;
     }
@@ -675,7 +714,8 @@ public static class MedialAxisToolpaths
             double rdpTolerance = DefaultRdpTolerance,
             double? bottomRadiusOverride = null,
             double? topRadiusOverride = null,
-            double? coneLengthOverride = null)
+            double? coneLengthOverride = null,
+            bool includeInteriorFill = true)
     {
         long t0 = PerfLog.Start();
         var clearing = GenerateClearingPasses(
@@ -687,7 +727,8 @@ public static class MedialAxisToolpaths
             stepOver,
             bottomRadiusOverride,
             topRadiusOverride,
-            coneLengthOverride);
+            coneLengthOverride,
+            includeInteriorFill);
         var final = Generate(
             provider,
             boundary,
@@ -699,13 +740,14 @@ public static class MedialAxisToolpaths
             rdpTolerance,
             bottomRadiusOverride,
             topRadiusOverride,
-            coneLengthOverride)
+            coneLengthOverride,
+            includeInteriorFill: includeInteriorFill)
             ?? new List<List<Point3D>>();
 
         PerfLog.Stop(
             "MedialAxisToolpaths.GenerateVCarveComponents",
             t0,
-            $"rings={boundary.Count} clearing={clearing.Count} final={final.Count}");
+            $"rings={boundary.Count} interiorFill={includeInteriorFill} clearing={clearing.Count} final={final.Count}");
 
         return (clearing, final);
     }
@@ -727,7 +769,8 @@ public static class MedialAxisToolpaths
             int regionIndex = 0,
             double? bottomRadiusOverride = null,
             double? topRadiusOverride = null,
-            double? coneLengthOverride = null)
+            double? coneLengthOverride = null,
+            bool includeInteriorFill = true)
     {
         long t0 = PerfLog.Start();
         var clearing = GenerateClearingPassesTagged(
@@ -740,7 +783,8 @@ public static class MedialAxisToolpaths
             regionIndex,
             bottomRadiusOverride,
             topRadiusOverride,
-            coneLengthOverride);
+            coneLengthOverride,
+            includeInteriorFill);
         var finalGeometry = Generate(
             provider,
             boundary,
@@ -752,7 +796,8 @@ public static class MedialAxisToolpaths
             rdpTolerance,
             bottomRadiusOverride,
             topRadiusOverride,
-            coneLengthOverride)
+            coneLengthOverride,
+            includeInteriorFill: includeInteriorFill)
             ?? new List<List<Point3D>>();
         var final = finalGeometry
             .Select(path => new TaggedToolpath(path, regionIndex, "final-carve", null))
@@ -761,7 +806,7 @@ public static class MedialAxisToolpaths
         PerfLog.Stop(
             "MedialAxisToolpaths.GenerateVCarveComponents",
             t0,
-            $"rings={boundary.Count} clearing={clearing.Count} final={final.Count}");
+            $"rings={boundary.Count} interiorFill={includeInteriorFill} clearing={clearing.Count} final={final.Count}");
 
         return (clearing, final);
     }
@@ -781,7 +826,8 @@ public static class MedialAxisToolpaths
         double tolerance   = 0.03,
         double? bottomRadiusOverride = null,
         double? topRadiusOverride = null,
-        double? coneLengthOverride = null)
+        double? coneLengthOverride = null,
+        bool includeInteriorFill = true)
     {
         if (provider is null) throw new ArgumentNullException(nameof(provider));
         if (regions is null) throw new ArgumentNullException(nameof(regions));
@@ -803,7 +849,8 @@ public static class MedialAxisToolpaths
                 regionIndex,
                 bottomRadiusOverride,
                 topRadiusOverride,
-                coneLengthOverride);
+                coneLengthOverride,
+                includeInteriorFill: includeInteriorFill);
 
             result.AddRange(tagged);
             regionIndex++;
@@ -831,8 +878,10 @@ public static class MedialAxisToolpaths
             double tolerance,
             double? bottomRadiusOverride,
             double? topRadiusOverride,
-            double? coneLengthOverride)
+            double? coneLengthOverride,
+            CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         long t0 = PerfLog.Start();
         var normalizedBoundary = NormalizeBoundaryRings(boundary);
         if (normalizedBoundary.Count == 0)
@@ -861,6 +910,7 @@ public static class MedialAxisToolpaths
 
         for (int attempt = 0; attempt < 4; attempt++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             long tAttempt = PerfLog.Start();
             // Simplify/scale the polygon layer
             simplifiedLayer = GenerateSimplifiedLayer(normalizedBoundary, scale);
@@ -872,12 +922,19 @@ public static class MedialAxisToolpaths
             }
 
             // Compute medial axis via Voronoi-of-segments
-            var rawSegments = GenerateMedialAxis(provider, simplifiedLayer, maxRadius, scale, tolerance);
+            var rawSegments = GenerateMedialAxis(
+                provider,
+                simplifiedLayer,
+                maxRadius,
+                scale,
+                tolerance,
+                cancellationToken);
 
             double maxR    = 0;
             medialAxis.Clear();
             foreach (var seg in rawSegments)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 double r = Math.Max(seg.Point0.Radius, seg.Point1.Radius);
                 if (r > maxR) maxR = r;
 
@@ -1082,8 +1139,10 @@ public static class MedialAxisToolpaths
         IReadOnlyList<List<PointD>> simplifiedLayer,
         double maxRadius,
         double scale,
-        double tolerance)
+        double tolerance,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         long t0 = PerfLog.Start();
         // Group into boundary + holes via NonIntersectingPathGroups
         var groups = NonIntersectingPathGroups(simplifiedLayer);
@@ -1093,6 +1152,7 @@ public static class MedialAxisToolpaths
 
         foreach (var (outerBoundary, holes) in groups)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             groupCount++;
             long tGroup = PerfLog.Start();
             var scaledBoundary = new List<PointD>(outerBoundary.Count);
@@ -1136,6 +1196,7 @@ public static class MedialAxisToolpaths
                 maxRadius:      providerMaxRadius,
                 filteringAngle: 3.0 * Math.PI / 4.0,
                 useBigIntegers: true);
+            cancellationToken.ThrowIfCancellationRequested();
 
             if (segments.Count > 0)
                 result.Capacity = Math.Max(result.Capacity, result.Count + segments.Count);
@@ -1557,7 +1618,8 @@ public static class MedialAxisToolpaths
         double endZ   = -endDepth;
         double invSlope = 1.0 / Math.Max(1e-9, profile.RadiusSlope);
         double bottomR  = profile.BottomRadius;
-        return (x, y) => AnalyticalZ(x, y, segments, startZ, bottomR, invSlope, endZ);
+        var spatialIndex = new SpatialSegmentIndex(segments);
+        return (x, y) => AnalyticalZ(x, y, spatialIndex, startZ, bottomR, invSlope, endZ);
     }
 
     /// <summary>
@@ -1574,14 +1636,14 @@ public static class MedialAxisToolpaths
     /// </summary>
     internal static List<Point3D> EnsureZFidelityFromBoundary(
         List<Point3D> path,
-        IReadOnlyList<(PointD A, PointD B)> boundarySegments,
+        SpatialSegmentIndex spatialIndex,
         double startDepth,
         double bottomRadius,
         double radiusSlope,
         double endZ,
         double zTolerance)
     {
-        if (path.Count < 2 || zTolerance <= 0 || boundarySegments.Count == 0)
+        if (path.Count < 2 || zTolerance <= 0)
             return path;
 
         double startZ = -startDepth;
@@ -1591,7 +1653,7 @@ public static class MedialAxisToolpaths
         var snapped = new List<Point3D>(path.Count);
         foreach (var p in path)
         {
-            double z = AnalyticalZ(p.X, p.Y, boundarySegments, startZ, bottomRadius, invSlope, endZ);
+            double z = AnalyticalZ(p.X, p.Y, spatialIndex, startZ, bottomRadius, invSlope, endZ);
             snapped.Add(new Point3D(p.X, p.Y, z));
         }
 
@@ -1600,7 +1662,7 @@ public static class MedialAxisToolpaths
         for (int i = 0; i < snapped.Count - 1; i++)
         {
             BisectChordForZ(
-                snapped[i], snapped[i + 1], boundarySegments,
+                snapped[i], snapped[i + 1], spatialIndex,
                 startZ, bottomRadius, invSlope, endZ, zTolerance,
                 output, depth: 0);
         }
@@ -1632,11 +1694,13 @@ public static class MedialAxisToolpaths
         double startZ = -startDepth;
         double invSlope = 1.0 / radiusSlope;
 
+        var spatialIndex = new SpatialSegmentIndex(boundarySegments);
+
         var output = new List<Point3D>(path.Count * 2);
         output.Add(path[0]);
         for (int i = 1; i < path.Count; i++)
         {
-            SubdivideChord(path[i - 1], path[i], boundarySegments,
+            SubdivideChord(path[i - 1], path[i], spatialIndex,
                 startZ, bottomRadius, invSlope, endZ,
                 maxChordDz, output, depth: 0);
         }
@@ -1647,7 +1711,7 @@ public static class MedialAxisToolpaths
 
     private static void SubdivideChord(
         Point3D a, Point3D b,
-        IReadOnlyList<(PointD A, PointD B)> segments,
+        SpatialSegmentIndex spatialIndex,
         double startZ, double bottomRadius, double invSlope, double endZ,
         double maxChordDz,
         List<Point3D> output, int depth)
@@ -1661,18 +1725,18 @@ public static class MedialAxisToolpaths
 
         double mx = 0.5 * (a.X + b.X);
         double my = 0.5 * (a.Y + b.Y);
-        double mz = AnalyticalZ(mx, my, segments, startZ, bottomRadius, invSlope, endZ);
+        double mz = AnalyticalZ(mx, my, spatialIndex, startZ, bottomRadius, invSlope, endZ);
         var mid = new Point3D(mx, my, mz);
-        SubdivideChord(a, mid, segments, startZ, bottomRadius, invSlope, endZ,
+        SubdivideChord(a, mid, spatialIndex, startZ, bottomRadius, invSlope, endZ,
             maxChordDz, output, depth + 1);
-        SubdivideChord(mid, b, segments, startZ, bottomRadius, invSlope, endZ,
+        SubdivideChord(mid, b, spatialIndex, startZ, bottomRadius, invSlope, endZ,
             maxChordDz, output, depth + 1);
     }
 
     private static void BisectChordForZ(
         Point3D a,
         Point3D b,
-        IReadOnlyList<(PointD A, PointD B)> segments,
+        SpatialSegmentIndex spatialIndex,
         double startZ,
         double bottomRadius,
         double invSlope,
@@ -1692,7 +1756,7 @@ public static class MedialAxisToolpaths
         double mx = 0.5 * (a.X + b.X);
         double my = 0.5 * (a.Y + b.Y);
         double zChord = 0.5 * (a.Z + b.Z);
-        double zAnalytical = AnalyticalZ(mx, my, segments, startZ, bottomRadius, invSlope, endZ);
+        double zAnalytical = AnalyticalZ(mx, my, spatialIndex, startZ, bottomRadius, invSlope, endZ);
 
         if (Math.Abs(zChord - zAnalytical) <= zTolerance)
         {
@@ -1701,20 +1765,20 @@ public static class MedialAxisToolpaths
         }
 
         var mid = new Point3D(mx, my, zAnalytical);
-        BisectChordForZ(a, mid, segments, startZ, bottomRadius, invSlope, endZ, zTolerance, output, depth + 1);
-        BisectChordForZ(mid, b, segments, startZ, bottomRadius, invSlope, endZ, zTolerance, output, depth + 1);
+        BisectChordForZ(a, mid, spatialIndex, startZ, bottomRadius, invSlope, endZ, zTolerance, output, depth + 1);
+        BisectChordForZ(mid, b, spatialIndex, startZ, bottomRadius, invSlope, endZ, zTolerance, output, depth + 1);
     }
 
     private static double AnalyticalZ(
         double x,
         double y,
-        IReadOnlyList<(PointD A, PointD B)> segments,
+        SpatialSegmentIndex spatialIndex,
         double startZ,
         double bottomRadius,
         double invSlope,
         double endZ)
     {
-        double r = DistanceToBoundary(x, y, segments);
+        double r = spatialIndex.QueryDistance(x, y);
         double depthBelowStart = Math.Max(0.0, r - bottomRadius) * invSlope;
         double z = startZ - depthBelowStart;
         if (z < endZ) z = endZ;
@@ -1744,6 +1808,178 @@ public static class MedialAxisToolpaths
             if (d2 < bestSq) bestSq = d2;
         }
         return bestSq < double.PositiveInfinity ? Math.Sqrt(bestSq) : 0.0;
+    }
+
+    internal class SpatialSegmentIndex
+    {
+        private readonly IReadOnlyList<(PointD A, PointD B)> _segments;
+        private readonly double _minX, _minY;
+        private readonly double _cellSizeX, _cellSizeY;
+        private readonly int _cols, _rows;
+        private readonly List<int>[,] _grid;
+
+        public SpatialSegmentIndex(IReadOnlyList<(PointD A, PointD B)> segments)
+        {
+            _segments = segments;
+            if (segments.Count == 0)
+            {
+                _grid = new List<int>[0, 0];
+                return;
+            }
+
+            double minX = double.MaxValue, minY = double.MaxValue;
+            double maxX = -double.MaxValue, maxY = -double.MaxValue;
+            foreach (var seg in segments)
+            {
+                minX = Math.Min(minX, Math.Min(seg.A.x, seg.B.x));
+                maxX = Math.Max(maxX, Math.Max(seg.A.x, seg.B.x));
+                minY = Math.Min(minY, Math.Min(seg.A.y, seg.B.y));
+                maxY = Math.Max(maxY, Math.Max(seg.A.y, seg.B.y));
+            }
+
+            _minX = minX;
+            _minY = minY;
+
+            int n = segments.Count;
+            int dims = Math.Clamp((int)Math.Sqrt(n), 8, 64);
+            _cols = dims;
+            _rows = dims;
+
+            double width = Math.Max(1e-9, maxX - minX);
+            double height = Math.Max(1e-9, maxY - minY);
+
+            _cellSizeX = width / _cols;
+            _cellSizeY = height / _rows;
+
+            _grid = new List<int>[_cols, _rows];
+
+            for (int i = 0; i < segments.Count; i++)
+            {
+                var seg = segments[i];
+                double segMinX = Math.Min(seg.A.x, seg.B.x);
+                double segMaxX = Math.Max(seg.A.x, seg.B.x);
+                double segMinY = Math.Min(seg.A.y, seg.B.y);
+                double segMaxY = Math.Max(seg.A.y, seg.B.y);
+
+                int c1 = Math.Clamp((int)((segMinX - _minX) / _cellSizeX), 0, _cols - 1);
+                int c2 = Math.Clamp((int)((segMaxX - _minX) / _cellSizeX), 0, _cols - 1);
+                int r1 = Math.Clamp((int)((segMinY - _minY) / _cellSizeY), 0, _rows - 1);
+                int r2 = Math.Clamp((int)((segMaxY - _minY) / _cellSizeY), 0, _rows - 1);
+
+                for (int c = c1; c <= c2; c++)
+                {
+                    for (int r = r1; r <= r2; r++)
+                    {
+                        _grid[c, r] ??= new List<int>();
+                        _grid[c, r].Add(i);
+                    }
+                }
+            }
+        }
+
+        public double QueryDistance(double x, double y)
+        {
+            if (_segments.Count == 0) return 0.0;
+
+            int targetC = Math.Clamp((int)((x - _minX) / _cellSizeX), 0, _cols - 1);
+            int targetR = Math.Clamp((int)((y - _minY) / _cellSizeY), 0, _rows - 1);
+
+            double bestSq = double.PositiveInfinity;
+
+            // 1. First, check the target cell and its immediate 8 neighbors to get a good initial upper bound.
+            for (int dc = -1; dc <= 1; dc++)
+            {
+                int c = targetC + dc;
+                if (c < 0 || c >= _cols) continue;
+                for (int dr = -1; dr <= 1; dr++)
+                {
+                    int r = targetR + dr;
+                    if (r < 0 || r >= _rows) continue;
+                    CheckCell(c, r, x, y, ref bestSq);
+                }
+            }
+
+            // Expanding ring search
+            int maxR = Math.Max(_cols, _rows);
+            for (int ring = 2; ring <= maxR; ring++)
+            {
+                double minCellSize = Math.Min(_cellSizeX, _cellSizeY);
+                double minDistToRing = (ring - 1) * minCellSize;
+                if (minDistToRing * minDistToRing >= bestSq)
+                {
+                    break;
+                }
+
+                int cMin = targetC - ring;
+                int cMax = targetC + ring;
+                int rMin = targetR - ring;
+                int rMax = targetR + ring;
+
+                // Check cells on the boundary of the ring
+                // Top & Bottom rows
+                for (int c = cMin; c <= cMax; c++)
+                {
+                    if (c >= 0 && c < _cols)
+                    {
+                        if (rMin >= 0 && rMin < _rows) CheckCell(c, rMin, x, y, ref bestSq);
+                        if (rMax >= 0 && rMax < _rows) CheckCell(c, rMax, x, y, ref bestSq);
+                    }
+                }
+                // Left & Right columns
+                for (int r = rMin + 1; r < rMax; r++)
+                {
+                    if (r >= 0 && r < _rows)
+                    {
+                        if (cMin >= 0 && cMin < _cols) CheckCell(cMin, r, x, y, ref bestSq);
+                        if (cMax >= 0 && cMax < _cols) CheckCell(cMax, r, x, y, ref bestSq);
+                    }
+                }
+            }
+
+            // Fallback
+            if (bestSq == double.PositiveInfinity)
+            {
+                for (int i = 0; i < _segments.Count; i++)
+                {
+                    double d2 = DistanceToSegmentSq(x, y, _segments[i]);
+                    if (d2 < bestSq) bestSq = d2;
+                }
+            }
+
+            return bestSq < double.PositiveInfinity ? Math.Sqrt(bestSq) : 0.0;
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        private void CheckCell(int c, int r, double x, double y, ref double bestSq)
+        {
+            var cellSegs = _grid[c, r];
+            if (cellSegs == null) return;
+            int count = cellSegs.Count;
+            for (int i = 0; i < count; i++)
+            {
+                double d2 = DistanceToSegmentSq(x, y, _segments[cellSegs[i]]);
+                if (d2 < bestSq) bestSq = d2;
+            }
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        private static double DistanceToSegmentSq(double x, double y, (PointD A, PointD B) seg)
+        {
+            var (a, b) = seg;
+            double abx = b.x - a.x;
+            double aby = b.y - a.y;
+            double apx = x - a.x;
+            double apy = y - a.y;
+            double ab2 = abx * abx + aby * aby;
+            double t = ab2 <= 1e-18 ? 0.0 : (apx * abx + apy * aby) / ab2;
+            if (t < 0.0) t = 0.0;
+            else if (t > 1.0) t = 1.0;
+            double cx = a.x + abx * t;
+            double cy = a.y + aby * t;
+            double dx = x - cx;
+            double dy = y - cy;
+            return dx * dx + dy * dy;
+        }
     }
 
     private static List<(PointD A, PointD B)> BuildBoundarySegments(

@@ -100,6 +100,79 @@ public class ToolpathTaggingTests
     }
 
     [Fact]
+    public void GenerateClearingPasses_WithoutInteriorFill_EmitsOnlyDepthLayerPerimeters()
+    {
+        var region = new List<IReadOnlyList<PointD>>
+        {
+            new List<PointD>
+            {
+                new(0, 0),
+                new(2, 0),
+                new(2, 1),
+                new(0, 1),
+                new(0, 0),
+            }
+        };
+
+        var fullFill = MedialAxisToolpaths.GenerateClearingPasses(
+            boundary: region,
+            startDepth: 0.0,
+            endDepth: 0.2,
+            radianTipAngle: Math.PI / 3.0,
+            depthPerPass: 0.1,
+            stepOver: 0.4);
+
+        var edgeOnly = MedialAxisToolpaths.GenerateClearingPasses(
+            boundary: region,
+            startDepth: 0.0,
+            endDepth: 0.2,
+            radianTipAngle: Math.PI / 3.0,
+            depthPerPass: 0.1,
+            stepOver: 0.4,
+            includeInteriorFill: false);
+
+        Assert.Equal(2, edgeOnly.Count);
+        Assert.All(edgeOnly, path => Assert.True(path.Count >= 4));
+        Assert.True(fullFill.Count > edgeOnly.Count);
+    }
+
+    [Fact]
+    public void GenerateClearingPasses_WithoutInteriorFill_DoesNotExceedNearestEdgeDepth()
+    {
+        var region = new List<IReadOnlyList<PointD>>
+        {
+            new List<PointD>
+            {
+                new(0, 0),
+                new(10, 0),
+                new(10, 10),
+                new(0, 10),
+                new(0, 0),
+            }
+        };
+
+        var paths = MedialAxisToolpaths.GenerateClearingPasses(
+            boundary: region,
+            startDepth: 0.0,
+            endDepth: 2.0,
+            radianTipAngle: Math.PI / 2.0,
+            depthPerPass: 1.0,
+            stepOver: 0.4,
+            includeInteriorFill: false);
+
+        Assert.NotEmpty(paths);
+        foreach (var point in paths.SelectMany(path => path))
+        {
+            double nearestEdge = Math.Min(
+                Math.Min(point.X, 10.0 - point.X),
+                Math.Min(point.Y, 10.0 - point.Y));
+
+            Assert.True(-point.Z <= nearestEdge + 1e-6,
+                $"Clearing point ({point.X}, {point.Y}, {point.Z}) exceeds its nearest-edge depth limit {nearestEdge}.");
+        }
+    }
+
+    [Fact]
     public void GenerateVCarveTaggedForRegions_AssignsSequentialRegionIndices()
     {
         var provider = new EmptyMedialAxisProvider();

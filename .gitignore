@@ -34,3 +34,6 @@ RW.Toolpaths.Avalonia/perf_payload.json
 # OS-generated files
 Thumbs.db
 Desktop.ini
+
+test-artifacts/
+artifacts/
