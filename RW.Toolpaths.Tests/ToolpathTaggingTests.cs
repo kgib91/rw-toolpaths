@@ -1,5 +1,6 @@
 using Clipper2Lib;
 using RW.Toolpaths;
+using RW.Toolpaths.Milling;
 using Xunit;
 
 namespace RW.Toolpaths.Tests;
@@ -222,5 +223,38 @@ public class ToolpathTaggingTests
             .ToList();
 
         Assert.Equal(new List<int> { 0, 1 }, regionIndices);
+    }
+
+    [Fact]
+    public void VCarveStrategy_UsesSurfaceRelativeDepthAndReportsSweptArea()
+    {
+        var plan = VCarveToolpaths.Generate(
+            new[]
+            {
+                new MillingRegion(new List<PointD>
+                {
+                    new(0, 0),
+                    new(20, 0),
+                    new(20, 20),
+                    new(0, 20),
+                }),
+            },
+            new ToolGeometry(2)
+            {
+                TipAngleRadians = Math.PI / 2.0,
+                BottomRadius = 0,
+                TopRadius = 10,
+                ConeLength = 10,
+            },
+            new DepthSchedule(4, 2) { SurfaceZ = 10 },
+            new VCarveOptions { IncludeInteriorFill = false },
+            new EmptyMedialAxisProvider());
+
+        Assert.NotEmpty(plan.Toolpaths);
+        Assert.NotEmpty(plan.SweptArea);
+        Assert.All(plan.Toolpaths.SelectMany(path => path.Points), point =>
+        {
+            Assert.InRange(point.Z, 6 - 1e-6, 10 + 1e-6);
+        });
     }
 }

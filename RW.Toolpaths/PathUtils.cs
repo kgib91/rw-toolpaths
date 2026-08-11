@@ -17,6 +17,9 @@ public static class PathUtils
     /// </summary>
     public const double Scale = 32_768.0;
 
+    /// <summary>Half a Clipper quantum; below this two ring endpoints are the same vertex.</summary>
+    private const double RingClosureEpsilon = 0.5 / Scale;
+
     // --- Coordinate conversions -----------------------------------------------
 
     /// <summary>
@@ -133,31 +136,39 @@ public static class PathUtils
 
     /// <summary>
     /// Rotates a closed polygon ring so that it starts at the vertex nearest
-    /// <paramref name="target"/>.
+    /// <paramref name="target"/>, preserving every vertex.
     /// </summary>
+    /// <remarks>
+    /// Callers mix both ring conventions: Clipper returns rings with no repeated closing vertex,
+    /// while the offset planner carries one. Rotating the distinct cycle and then restoring the
+    /// caller's convention keeps the ring intact either way. Treating an open ring as closed drops
+    /// its first vertex, which on a coarse ring such as an offset triangle cuts a whole corner off
+    /// and leaves material standing.
+    /// </remarks>
     public static List<PointD> RebaseNear(
         IList<PointD> closedRing,
         PointD target,
         double tolerance = 0.0)
     {
-        if (closedRing.Count == 0)
-            return new List<PointD>(closedRing);
-
-        // a closed ring from offset paths.
         if (tolerance < 0)
             throw new ArgumentOutOfRangeException(nameof(tolerance),
                 "RebaseNear tolerance must be >= 0.");
 
-        // tolerance of target.
-        double firstDx = closedRing[0].x - target.x;
-        double firstDy = closedRing[0].y - target.y;
-        double bestDist = Math.Sqrt(firstDx * firstDx + firstDy * firstDy);
-        if (bestDist <= tolerance)
+        if (closedRing.Count == 0)
+            return new List<PointD>();
+
+        bool closed = closedRing.Count > 1
+            && Math.Abs(closedRing[0].x - closedRing[^1].x) <= RingClosureEpsilon
+            && Math.Abs(closedRing[0].y - closedRing[^1].y) <= RingClosureEpsilon;
+
+        int count = closed ? closedRing.Count - 1 : closedRing.Count;
+        if (count < 2)
             return new List<PointD>(closedRing);
 
         int bestIdx = 0;
+        double bestDist = double.MaxValue;
 
-        for (int i = 1; i < closedRing.Count - 1; i++)
+        for (int i = 0; i < count; i++)
         {
             double dx = closedRing[i].x - target.x;
             double dy = closedRing[i].y - target.y;
@@ -174,12 +185,13 @@ public static class PathUtils
         if (bestIdx == 0)
             return new List<PointD>(closedRing);
 
-        //   bt = n.slice(bestIdx)
-        //   mt = n.slice(1, bestIdx+1)
-        //   return [...bt, ...mt]
         var result = new List<PointD>(closedRing.Count);
-        result.AddRange(closedRing.Skip(bestIdx));
-        result.AddRange(closedRing.Skip(1).Take(bestIdx));
+        for (int i = 0; i < count; i++)
+            result.Add(closedRing[(bestIdx + i) % count]);
+
+        if (closed)
+            result.Add(result[0]);
+
         return result;
     }
 

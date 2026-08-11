@@ -32,8 +32,9 @@ public readonly record struct MedialPoint(double X, double Y, double Radius);
 ///   Pass category, for example <c>"clearing"</c> or <c>"final-carve"</c>.
 /// </param>
 /// <param name="DepthPassIndex">
-///   Zero-based depth-layer index for clearing passes; <c>null</c> for non-layered
-///   passes (e.g. final carve).
+///   Deepest zero-based depth layer represented by this path. A continuous profile spiral may
+///   contain several scheduled layers and is tagged with the terminal layer it reaches;
+///   <c>null</c> identifies non-layered paths such as a final carve.
 /// </param>
 public readonly record struct TaggedToolpath
 {
@@ -41,13 +42,15 @@ public readonly record struct TaggedToolpath
         IReadOnlyList<Point3D> points,
         int regionIndex,
         string category,
-        int? depthPassIndex)
+        int? depthPassIndex,
+        int? visitIdentity = null)
         : this(
             points,
             ToolpathCurveDetector.DetectMoves(points),
             regionIndex,
             category,
-            depthPassIndex)
+            depthPassIndex,
+            visitIdentity)
     {
     }
 
@@ -56,14 +59,36 @@ public readonly record struct TaggedToolpath
         IReadOnlyList<ToolMove> moves,
         int regionIndex,
         string category,
-        int? depthPassIndex)
+        int? depthPassIndex,
+        int? visitIdentity = null)
     {
         Points = points;
         Moves = moves;
         RegionIndex = regionIndex;
         Category = category;
         DepthPassIndex = depthPassIndex;
+        VisitIdentity = visitIdentity;
+        _spans = null;
     }
+
+    public TaggedToolpath(
+        IReadOnlyList<Point3D> points,
+        IReadOnlyList<ToolpathSpan> spans,
+        int regionIndex,
+        string category,
+        int? depthPassIndex,
+        int? visitIdentity = null)
+    {
+        Points = points;
+        Moves = ToolpathCurveDetector.DetectMoves(points);
+        RegionIndex = regionIndex;
+        Category = category;
+        DepthPassIndex = depthPassIndex;
+        VisitIdentity = visitIdentity;
+        _spans = spans;
+    }
+
+    private readonly IReadOnlyList<ToolpathSpan>? _spans;
 
     public IReadOnlyList<Point3D> Points { get; init; }
 
@@ -74,9 +99,25 @@ public readonly record struct TaggedToolpath
     /// </summary>
     public IReadOnlyList<ToolMove> Moves { get; init; }
 
+    /// <summary>
+    /// Classification of each run of <see cref="Points"/> as cutting, ramping, lifted over a tab
+    /// and so on. Empty when the producing strategy does not distinguish them.
+    /// </summary>
+    public IReadOnlyList<ToolpathSpan> Spans
+    {
+        get => _spans ?? Array.Empty<ToolpathSpan>();
+        init => _spans = value;
+    }
+
     public int RegionIndex { get; init; }
     public string Category { get; init; }
     public int? DepthPassIndex { get; init; }
+
+    /// <summary>
+    /// Source contour/depth visit shared by fragments created when a routed carrier pauses for
+    /// an excursion. <c>null</c> means this path is an independent visit.
+    /// </summary>
+    public int? VisitIdentity { get; init; }
 }
 
 /// <summary>
