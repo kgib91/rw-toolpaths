@@ -113,4 +113,44 @@ public class ProfileToolFitTests
                 Assert.InRange(point.Y, 3.17, 196.83);
             });
     }
+
+    [Fact]
+    public void OutsideProfile_OmitEdgeLoops_SlicesCrossingMotionsToInteriorFragments()
+    {
+        var clipBoundary = Rect(20, -10, 100, 90);
+        var plan = ProfileToolpaths.Generate(
+            [new MillingRegion(Rect(0, 0, 120, 80))],
+            ToolGeometry.Flat(3),
+            new DepthSchedule(2, 2),
+            new ProfileOptions
+            {
+                Side = ProfileSide.Outside,
+                ClipBoundary = clipBoundary,
+                OmitEdgeLoops = true,
+                Ramp = RampSettings.Plunge,
+            });
+
+        Assert.NotEmpty(plan.Toolpaths);
+        Assert.All(plan.Toolpaths, path =>
+        {
+            for (int pointIndex = 1; pointIndex < path.Points.Count; pointIndex++)
+            {
+                Point3D start = path.Points[pointIndex - 1];
+                Point3D end = path.Points[pointIndex];
+                double midpointX = (start.X + end.X) * 0.5;
+                double midpointY = (start.Y + end.Y) * 0.5;
+                Assert.InRange(midpointX, 20 + 1e-9, 100 - 1e-9);
+                Assert.InRange(midpointY, -10 + 1e-9, 90 - 1e-9);
+            }
+        });
+
+        Assert.DoesNotContain(
+            plan.Toolpaths.SelectMany(path => path.Points.Zip(path.Points.Skip(1))),
+            segment => Math.Abs(segment.First.X - 20) < 1e-9
+                && Math.Abs(segment.Second.X - 20) < 1e-9);
+        Assert.DoesNotContain(
+            plan.Toolpaths.SelectMany(path => path.Points.Zip(path.Points.Skip(1))),
+            segment => Math.Abs(segment.First.X - 100) < 1e-9
+                && Math.Abs(segment.Second.X - 100) < 1e-9);
+    }
 }
