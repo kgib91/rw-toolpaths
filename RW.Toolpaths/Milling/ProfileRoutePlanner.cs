@@ -55,6 +55,12 @@ internal sealed record ProfileRouteForest(
 /// </summary>
 internal static class ProfileRoutePlanner
 {
+    internal sealed class PortalSearchMetrics
+    {
+        public long SegmentPairsConsidered;
+        public long SegmentPairsPruned;
+    }
+
     private readonly record struct BoundaryBounds(
         double MinX,
         double MinY,
@@ -82,6 +88,7 @@ internal static class ProfileRoutePlanner
         int portalCount = 0;
         int portalSolves = 0;
         int portalFrontierChecks = 0;
+        var portalSearchMetrics = new PortalSearchMetrics();
         foreach (var ringCluster in ringClusters)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -89,6 +96,7 @@ internal static class ProfileRoutePlanner
                 rings,
                 ringCluster,
                 cancellationToken,
+            portalSearchMetrics,
                 out int treePortalSolves,
                 out int treePortalFrontierChecks);
             trees.Add(tree);
@@ -116,6 +124,8 @@ internal static class ProfileRoutePlanner
             $"rings={rings.Count} clusters={trees.Count} portals={portalCount} " +
             $"sourcePairCandidates={sourcePairCandidates} sourcePairSolves={sourcePairSolves} " +
             $"portalSolves={portalSolves} portalFrontierChecks={portalFrontierChecks} " +
+            $"segmentPairs={portalSearchMetrics.SegmentPairsConsidered} " +
+            $"segmentPairsPruned={portalSearchMetrics.SegmentPairsPruned} " +
             $"sourceProximity={toolRadius:F3}");
         return new ProfileRouteForest(trees, portalCount, toolRadius);
     }
@@ -236,6 +246,7 @@ internal static class ProfileRoutePlanner
         IReadOnlyList<OffsetRing> rings,
         IReadOnlyList<int> ringIndices,
         CancellationToken cancellationToken,
+        PortalSearchMetrics portalSearchMetrics,
         out int portalSolves,
         out int portalFrontierChecks)
     {
@@ -259,7 +270,8 @@ internal static class ProfileRoutePlanner
                     addedRingIndex,
                     rings[addedRingIndex].Points,
                     toRingIndex,
-                    rings[toRingIndex].Points);
+                    rings[toRingIndex].Points,
+                    portalSearchMetrics);
                 portalSolves++;
                 if (!frontier.TryGetValue(toRingIndex, out var current)
                     || IsBetterPortal(candidate, current))
@@ -302,20 +314,38 @@ internal static class ProfileRoutePlanner
         int firstRingIndex,
         IReadOnlyList<PointD> first,
         int secondRingIndex,
-        IReadOnlyList<PointD> second)
+        IReadOnlyList<PointD> second,
+        PortalSearchMetrics? portalSearchMetrics = null)
     {
         PointD bestFirst = first[0];
         PointD bestSecond = second[0];
         double bestDistanceSquared = double.MaxValue;
+        var secondSegments = new BoundaryBounds[second.Count];
+        for (int secondSegment = 0; secondSegment < second.Count; secondSegment++)
+        {
+            PointD secondStart = second[secondSegment];
+            PointD secondEnd = second[(secondSegment + 1) % second.Count];
+            secondSegments[secondSegment] = GetSegmentBounds(secondStart, secondEnd);
+        }
 
         for (int firstSegment = 0; firstSegment < first.Count; firstSegment++)
         {
             PointD firstStart = first[firstSegment];
             PointD firstEnd = first[(firstSegment + 1) % first.Count];
+            BoundaryBounds firstBounds = GetSegmentBounds(firstStart, firstEnd);
             for (int secondSegment = 0; secondSegment < second.Count; secondSegment++)
             {
                 PointD secondStart = second[secondSegment];
                 PointD secondEnd = second[(secondSegment + 1) % second.Count];
+
+                if (portalSearchMetrics != null)
+                    portalSearchMetrics.SegmentPairsConsidered++;
+                if (BoundsDistanceSquared(firstBounds, secondSegments[secondSegment]) >= bestDistanceSquared)
+                {
+                    if (portalSearchMetrics != null)
+                        portalSearchMetrics.SegmentPairsPruned++;
+                    continue;
+                }
 
                 if (TrySegmentIntersection(
                         firstStart,
@@ -390,6 +420,13 @@ internal static class ProfileRoutePlanner
             1);
         return Interpolate(start, end, position);
     }
+
+    private static BoundaryBounds GetSegmentBounds(PointD start, PointD end)
+        => new(
+            Math.Min(start.x, end.x),
+            Math.Min(start.y, end.y),
+            Math.Max(start.x, end.x),
+            Math.Max(start.y, end.y));
 
     private static bool TrySegmentIntersection(
         PointD firstStart,
