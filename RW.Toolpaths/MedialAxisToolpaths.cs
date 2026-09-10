@@ -69,6 +69,7 @@ public readonly record struct TaggedToolpath
         DepthPassIndex = depthPassIndex;
         VisitIdentity = visitIdentity;
         _spans = null;
+        DetectCurves = true;
     }
 
     public TaggedToolpath(
@@ -77,18 +78,22 @@ public readonly record struct TaggedToolpath
         int regionIndex,
         string category,
         int? depthPassIndex,
-        int? visitIdentity = null)
+        int? visitIdentity = null,
+        bool detectCurves = true)
     {
         Points = points;
-        Moves = ToolpathCurveDetector.DetectMoves(points);
+        Moves = detectCurves ? ToolpathCurveDetector.DetectMoves(points)
+            : Enumerable.Range(1, Math.Max(0, points.Count - 1)).Select(i => ToolMove.Line(points[i - 1], points[i])).ToArray();
         RegionIndex = regionIndex;
         Category = category;
         DepthPassIndex = depthPassIndex;
         VisitIdentity = visitIdentity;
         _spans = spans;
+        DetectCurves = detectCurves;
     }
 
     private readonly IReadOnlyList<ToolpathSpan>? _spans;
+    internal bool DetectCurves { get; }
 
     public IReadOnlyList<Point3D> Points { get; init; }
 
@@ -2187,5 +2192,4 @@ public static class MedialAxisToolpaths
     }
 
 }
-
 

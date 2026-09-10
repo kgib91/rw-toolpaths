@@ -19,6 +19,14 @@ public static class PolygonSimplify
     /// <param name="points">Closed polygon vertices.</param>
     /// <param name="epsilon">Maximum allowed deviation in workspace units.</param>
     public static List<PointD> Rdp(IReadOnlyList<PointD> points, double epsilon)
+        => RdpCore(points, epsilon, false);
+
+    // A machining boundary needs distance to the finite replacement segment, including
+    // vertices that double back past an endpoint of that segment.
+    internal static List<PointD> RdpSegmentBounded(IReadOnlyList<PointD> points, double epsilon)
+        => RdpCore(points, epsilon, true);
+
+    private static List<PointD> RdpCore(IReadOnlyList<PointD> points, double epsilon, bool boundToSegment)
     {
         int n = points.Count;
         if (n < 4 || epsilon <= 0)
@@ -43,13 +51,19 @@ public static class PolygonSimplify
             double ax = points[s].x, ay = points[s].y;
             double dx = points[e].x - ax, dy = points[e].y - ay;
             double lenSq = dx * dx + dy * dy;
+            double length = Math.Sqrt(lenSq);
 
             for (int i = s + 1; i < e; i++)
             {
                 double px = points[i].x - ax, py = points[i].y - ay;
-                double dist = lenSq < 1e-18
-                    ? Math.Sqrt(px * px + py * py)
-                    : Math.Abs(px * dy - py * dx) / Math.Sqrt(lenSq);
+                double dist;
+                if (boundToSegment)
+                {
+                    double t = lenSq < 1e-18 ? 0 : Math.Clamp((px * dx + py * dy) / lenSq, 0, 1);
+                    double ex = px - t * dx, ey = py - t * dy;
+                    dist = Math.Sqrt(ex * ex + ey * ey);
+                }
+                else dist = lenSq < 1e-18 ? Math.Sqrt(px * px + py * py) : Math.Abs(px * dy - py * dx) / length;
 
                 if (dist > maxDist)
                 {

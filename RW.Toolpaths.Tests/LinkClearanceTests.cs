@@ -11,6 +11,51 @@ namespace RW.Toolpaths.Tests;
 /// </summary>
 public class LinkClearanceTests
 {
+    [Theory]
+    [InlineData(0.000004)]
+    [InlineData(0.01)]
+    [InlineData(0.1)]
+    public void PreparedQueriesMatchPolygonClippingAcrossHolesAndQuantizedBoundaries(double tolerance)
+    {
+        var source = new List<IReadOnlyList<PointD>> {
+            Rect(0, 0, 100, 100), Reversed(Rect(40, 40, 60, 60)),
+            Reversed(Rect(80, 5, 80.004, 90)), Rect(110, 10, 120, 30)
+        };
+        var clearance = LinkClearance.WithinRegion(source, tolerance);
+        var paths = new Paths64(source.Select(ring => new Path64(ring.Select(p =>
+            new Point64((long)Math.Round(p.x * PathUtils.Scale), (long)Math.Round(p.y * PathUtils.Scale))))));
+        var grown = Clipper.InflatePaths(paths, 0.001 * PathUtils.Scale, JoinType.Miter, EndType.Polygon, miterLimit: 2);
+        bool Reference(Point3D a, Point3D b)
+        {
+            var clipper = new Clipper64();
+            clipper.AddOpenSubject(new Path64 {
+                new((long)Math.Round(a.X * PathUtils.Scale), (long)Math.Round(a.Y * PathUtils.Scale)),
+                new((long)Math.Round(b.X * PathUtils.Scale), (long)Math.Round(b.Y * PathUtils.Scale)) });
+            clipper.AddClip(grown);
+            var outside = new Paths64();
+            clipper.Execute(ClipType.Difference, FillRule.NonZero, new Paths64(), outside);
+            double length = 0;
+            foreach (var path in outside)
+            for (int i = 1; i < path.Count; i++)
+            {
+                double dx = path[i].X - path[i - 1].X, dy = path[i].Y - path[i - 1].Y;
+                length += Math.Sqrt(dx * dx + dy * dy) / PathUtils.Scale;
+            }
+            return length <= tolerance;
+        }
+        var random = new Random(2194);
+        var queries = Enumerable.Range(0, 2000).Select(_ => (
+            A: new Point3D(random.NextDouble() * 140 - 10, random.NextDouble() * 120 - 10, -2),
+            B: new Point3D(random.NextDouble() * 140 - 10, random.NextDouble() * 120 - 10, -2))).ToList();
+        foreach (double coordinate in new[] { -0.001, 0, 40.001, 50, 59.999, 80.001, 80.003, 100, 100.001 })
+        {
+            queries.Add((new(coordinate, 0, -2), new(coordinate, 100, -2)));
+            queries.Add((new(0, coordinate, -2), new(100, coordinate, -2)));
+        }
+        foreach (var (a, b) in queries)
+            Assert.Equal(Reference(a, b), clearance.IsTravelSafe(a, b, 3));
+    }
+
     private static List<PointD> Rect(double minX, double minY, double maxX, double maxY) => new()
     {
         new PointD(minX, minY),

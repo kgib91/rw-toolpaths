@@ -1,4 +1,5 @@
 using Clipper2Lib;
+using RW.Toolpaths.Geometry;
 
 namespace RW.Toolpaths.Milling;
 
@@ -109,11 +110,16 @@ public static class LinkClearance
     {
         private readonly Paths64 _travelRegion;
         private readonly double _tolerance;
+        private readonly PolygonOps.BoundarySegmentIndex _boundary;
+        private long _queries, _fallbacks;
 
         internal RegionClearance(Paths64 travelRegion, double tolerance)
         {
             _travelRegion = travelRegion;
             _tolerance = tolerance;
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            _boundary = new PolygonOps.BoundarySegmentIndex(travelRegion);
+            Console.WriteLine($"[LinkClearance.Prepared] contours={travelRegion.Count} edges={_boundary.SegmentCount} elapsedMs={System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}");
         }
 
         public bool IsTravelSafe(Point3D from, Point3D to, double toolRadius)
@@ -121,11 +127,19 @@ public static class LinkClearance
             if (PlanarDistance(from, to) <= _tolerance)
                 return true;
 
+            var start = new Point64((long)Math.Round(from.X * PathUtils.Scale), (long)Math.Round(from.Y * PathUtils.Scale));
+            var end = new Point64((long)Math.Round(to.X * PathUtils.Scale), (long)Math.Round(to.Y * PathUtils.Scale));
+            bool? prepared = _boundary.ContainsSegment(start, end, _tolerance * PathUtils.Scale);
+            long queries = Interlocked.Increment(ref _queries);
+            if (!prepared.HasValue) Interlocked.Increment(ref _fallbacks);
+            if ((queries & 4095) == 0)
+                Console.WriteLine($"[LinkClearance.Queries] queries={queries} polygonFallbacks={Interlocked.Read(ref _fallbacks)}");
+            if (prepared.HasValue) return prepared.Value;
+
             var clipper = new Clipper64();
             clipper.AddOpenSubject(new Path64(2)
             {
-                new((long)Math.Round(from.X * PathUtils.Scale), (long)Math.Round(from.Y * PathUtils.Scale)),
-                new((long)Math.Round(to.X * PathUtils.Scale), (long)Math.Round(to.Y * PathUtils.Scale)),
+                start, end,
             });
             clipper.AddClip(_travelRegion);
 

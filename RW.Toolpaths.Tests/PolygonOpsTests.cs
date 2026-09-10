@@ -10,6 +10,68 @@ namespace RW.Toolpaths.Tests;
 /// </summary>
 public class PolygonOpsTests
 {
+    [Fact]
+    public void ChunkedOpenStrokePreservesItsHoleAndEndCaps()
+    {
+        var circle = Circle(0, 0, 10, 9000); circle.Add(circle[0]);
+        var stroke = PolygonOps.BufferOpenCenterlines([circle], 1, 0.001);
+        // Independently tessellated caps can leave sub-tolerance voids. Those remain
+        // excluded from the clearance proof; the main annulus and its hole must survive.
+        Assert.Equal(2, stroke.Count(p => Math.Abs(Clipper.Area(new PathD(p))) > 0.01));
+        foreach (var ring in stroke)
+        foreach (var point in ring)
+            Assert.InRange(Math.Sqrt(point.x * point.x + point.y * point.y), 9 - 0.001, 11 + 0.001);
+        Assert.InRange(Math.Abs(stroke.Sum(p => Clipper.Area(new PathD(p)))), 40 * Math.PI - 0.1, 40 * Math.PI + 0.1);
+    }
+
+    [Fact]
+    public void InsetFeasibilityFindsAnOffCenterRoomAndRejectsThinWalls()
+    {
+        Paths64 Canonical(params List<PointD>[] paths) => Clipper.Union(
+            Clipper.ScalePaths64(new PathsD(paths.Select(p => new PathD(p))), PathUtils.Scale), FillRule.NonZero);
+        // The bounding-box center is in a narrow corridor; a real cutter fits at the far end.
+        var room = new PolygonOps.BoundarySegmentIndex(Canonical(Rect(0, 0, 100, 2), Rect(88, -6, 100, 14)));
+        Assert.True(room.MayContainDisc(5 * PathUtils.Scale, 0.001 * PathUtils.Scale));
+        Assert.False(room.MayContainDisc(8 * PathUtils.Scale, 0.001 * PathUtils.Scale));
+        var hole = Rect(2, 2, 98, 98); hole.Reverse();
+        var walls = new PolygonOps.BoundarySegmentIndex(Canonical(Rect(0, 0, 100, 100), hole));
+        Assert.False(walls.MayContainDisc(2 * PathUtils.Scale, 0.001 * PathUtils.Scale));
+        var elbow = new PolygonOps.BoundarySegmentIndex(Canonical(Rect(0, 0, 20, 2), Rect(0, 0, 2, 20)));
+        Assert.False(elbow.MayContainDisc(2 * PathUtils.Scale, 0.001 * PathUtils.Scale));
+    }
+
+    [Fact]
+    public void DenseBoundaryStrokePreservesCutterClearanceAndHoleAcrossChunkSeams()
+    {
+        var outer = Circle(0, 0, 20, 9000);
+        var hole = Circle(0, 0, 5, 1000);
+        var result = PolygonOps.OffsetBoundary(outer, new[] { hole }, -1,
+            arcTolerance: 0.001, simplifyTolerance: 0);
+        Assert.Equal(2, result.Count);
+        foreach (var ring in result)
+        foreach (var point in ring)
+        {
+            double radius = Math.Sqrt(point.x * point.x + point.y * point.y);
+            Assert.InRange(radius, 6 - 0.0002, 19 + 0.0002);
+        }
+        double area = Math.Abs(result.Sum(ring => Clipper.Area(new PathD(ring))));
+        Assert.InRange(area, Math.PI * (19 * 19 - 6 * 6) - 2, Math.PI * (19 * 19 - 6 * 6) + 0.01);
+        var rings = RW.Toolpaths.Milling.RingOffsetEngine.BuildRings(
+            [new RW.Toolpaths.Milling.MillingRegion(outer, [hole])],
+            new RW.Toolpaths.Milling.RingOffsetOptions(1, 1)
+            {
+                RingLimit = 3,
+                Tolerances = new RW.Toolpaths.Milling.GeometryTolerances { ArcTolerance = 0.001, SimplifyTolerance = 0 }
+            });
+        Assert.Equal(6, rings.Count);
+        foreach (var ring in rings)
+        foreach (var point in ring.Points)
+        {
+            double radius = Math.Sqrt(point.x * point.x + point.y * point.y);
+            Assert.InRange(radius, 6 + ring.Level - 0.0002, 19 - ring.Level + 0.0002);
+        }
+    }
+
     private const double Tol = 1e-6;
 
     private static List<PointD> Rect(double minX, double minY, double maxX, double maxY) => new()

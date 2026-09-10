@@ -39,6 +39,8 @@ public sealed record PocketOptions
     /// operations already removed.
     /// </summary>
     public ILinkClearance? LinkClearance { get; init; }
+    /// <summary>Fit optional curve metadata. Linear-only consumers can avoid this work.</summary>
+    public bool DetectCurves { get; init; } = true;
 }
 
 /// <summary>Counters describing what a strategy produced, for logging and regression checks.</summary>
@@ -128,7 +130,8 @@ public static class PocketToolpaths
         ToolGeometry tool,
         DepthSchedule depth,
         PocketOptions options,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Action<double, string>? progress = null)
     {
         long t0 = PerfLog.Start();
 
@@ -146,7 +149,7 @@ public static class PocketToolpaths
                 RingLimit = options.MaxRings,
                 Tolerances = options.Tolerances,
             },
-            cancellationToken);
+            cancellationToken, (fraction, stage) => progress?.Invoke(0.65 * fraction, stage));
 
         if (options.ClipBoundary is { Count: >= 3 })
             rings = ClipRings(rings, options.ClipBoundary);
@@ -154,6 +157,7 @@ public static class PocketToolpaths
         if (rings.Count == 0)
             return ToolpathPlan.Empty;
 
+        progress?.Invoke(0.65, "Ordering pocket rings");
         RingOffsetEngine.BuildNesting(rings);
         var traversal = RingOffsetEngine.BuildTraversal(rings, options.InsideOut);
 
@@ -162,7 +166,9 @@ public static class PocketToolpaths
             LinkClearance = options.LinkClearance ?? BuildTravelClearance(rings),
         };
 
-        var plan = Emit(rings, traversal, depth, guarded, tool, Category, cancellationToken);
+        var plan = Emit(rings, traversal, depth, guarded, tool, Category, cancellationToken,
+            progress: (fraction, stage) => progress?.Invoke(0.7 + 0.3 * fraction, stage));
+        progress?.Invoke(1, "Pocket complete");
 
         PerfLog.Stop("PocketToolpaths.Generate", t0,
             $"regions={regions.Count} rings={rings.Count} paths={plan.Toolpaths.Count} " +
@@ -213,7 +219,8 @@ public static class PocketToolpaths
         ToolGeometry tool,
         string category,
         CancellationToken cancellationToken,
-        Func<int, List<Point3D>, List<ToolpathSpan>, (List<Point3D> Points, List<ToolpathSpan> Spans)>? applyTabs = null)
+        Func<int, List<Point3D>, List<ToolpathSpan>, (List<Point3D> Points, List<ToolpathSpan> Spans)>? applyTabs = null,
+        Action<double, string>? progress = null)
     {
         long t0 = PerfLog.Start();
         var toolpaths = new List<TaggedToolpath>();
@@ -242,6 +249,8 @@ public static class PocketToolpaths
             .Select(group => group.ToList())
             .ToList();
 
+        int completedRings = 0;
+        double totalRings = Math.Max(1d, (double)rings.Count * depth.PassCount);
         foreach (var regionIslands in regionRoutes)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -288,6 +297,8 @@ public static class PocketToolpaths
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     RingChain passChain = passChains[chainIndex];
+                    progress?.Invoke(completedRings / totalRings, $"Routing pocket rings {completedRings:N0}/{totalRings:N0}");
+                    completedRings += passChain.RingIndices.Count;
 
                     foreach (var built in BuildChainPaths(
                                  rings, passChain, topZ, bottomZ, regionEnd,
@@ -336,7 +347,7 @@ public static class PocketToolpaths
                             rings[passChain.RingIndices[0]].RegionIndex,
                             category,
                             pass,
-                            visitIdentity: toolpaths.Count));
+                            visitIdentity: toolpaths.Count, detectCurves: options.DetectCurves));
                     }
                 }
             }
@@ -666,7 +677,7 @@ public static class PocketToolpaths
             source.RegionIndex,
             source.Category,
             source.DepthPassIndex,
-            source.VisitIdentity);
+            source.VisitIdentity, detectCurves: source.DetectCurves);
     }
 
     private static ToolpathSpanKind MoveKindAt(
@@ -795,7 +806,7 @@ public static class PocketToolpaths
             source.RegionIndex,
             source.Category,
             source.DepthPassIndex,
-            source.VisitIdentity);
+            source.VisitIdentity, detectCurves: source.DetectCurves);
     }
 
     private static double BoundaryLinkLength(IReadOnlyList<TaggedToolpath> paths)

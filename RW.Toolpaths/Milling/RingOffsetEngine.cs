@@ -116,7 +116,8 @@ public static class RingOffsetEngine
     public static List<OffsetRing> BuildRings(
         IReadOnlyList<MillingRegion> regions,
         RingOffsetOptions options,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Action<double, string>? progress = null)
     {
         long t0 = PerfLog.Start();
         var rings = new List<OffsetRing>();
@@ -134,6 +135,13 @@ public static class RingOffsetEngine
             cancellationToken.ThrowIfCancellationRequested();
 
             var region = regions[regionIndex];
+            progress?.Invoke((double)regionIndex / regions.Count, $"Preparing pocket region {regionIndex + 1}/{regions.Count}");
+            // An inward ring cannot survive past half the smaller bounding-box span.
+            // This is an upper work bound; regions with holes can finish earlier.
+            double maxInset = region.Outer.Count == 0 ? 0 : Math.Min(region.Outer.Max(p => p.x) - region.Outer.Min(p => p.x),
+                region.Outer.Max(p => p.y) - region.Outer.Min(p => p.y)) / 2;
+            double estimatedLevels = options.OffsetSign < 0 && stepOver > 1e-9
+                ? Math.Clamp(Math.Ceiling((maxInset - options.FirstOffset) / stepOver) + 1, 1, ringLimit) : ringLimit;
             var preparedOffset = PolygonOps.PrepareBoundaryOffset(
                 region.Outer,
                 region.Holes,
@@ -151,6 +159,8 @@ public static class RingOffsetEngine
                 cancellationToken.ThrowIfCancellationRequested();
 
                 double distance = options.FirstOffset + level * stepOver;
+                progress?.Invoke((regionIndex + Math.Min(0.99, level / estimatedLevels)) / regions.Count,
+                    $"Pocket region {regionIndex + 1}/{regions.Count}, offset {level + 1}");
                 var polygons = preparedOffset.Execute(options.OffsetSign * distance);
 
                 if (polygons.Count == 0)
@@ -205,6 +215,7 @@ public static class RingOffsetEngine
         PerfLog.Stop("RingOffsetEngine.BuildRings", t0,
             $"regions={regions.Count} rings={rings.Count} step={stepOver:F4} limit={ringLimit}");
 
+        progress?.Invoke(1, "Pocket offsets complete");
         return rings;
     }
 
