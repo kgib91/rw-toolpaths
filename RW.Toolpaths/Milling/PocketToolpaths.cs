@@ -41,6 +41,9 @@ public sealed record PocketOptions
     public ILinkClearance? LinkClearance { get; init; }
     /// <summary>Fit optional curve metadata. Linear-only consumers can avoid this work.</summary>
     public bool DetectCurves { get; init; } = true;
+    /// <summary>Produce the optional 2D swept-area summary. Physical stock simulation
+    /// can consume the emitted paths directly without building this polygon union.</summary>
+    public bool CalculateSweptArea { get; init; } = true;
 }
 
 /// <summary>Counters describing what a strategy produced, for logging and regression checks.</summary>
@@ -370,7 +373,7 @@ public static class PocketToolpaths
             .ToList();
         var linkKeys = new HashSet<(long StartX, long StartY, long EndX, long EndY)>();
         int linkCenterlineCount = 0;
-        foreach (var toolpath in toolpaths)
+        foreach (var toolpath in options.CalculateSweptArea ? toolpaths : Enumerable.Empty<TaggedToolpath>())
         {
             foreach (var span in toolpath.Spans.Where(span => span.Kind == ToolpathSpanKind.Link))
             {
@@ -401,7 +404,7 @@ public static class PocketToolpaths
         }
 
         int bufferedPointCount = sweptCenterlines.Sum(centerline => centerline.Count);
-        var sweptArea = toolpaths.Count > 0
+        var sweptArea = options.CalculateSweptArea && toolpaths.Count > 0
             ? PolygonOps.BufferCenterlines(
                 sweptCenterlines,
                 tool.Radius,
@@ -409,7 +412,7 @@ public static class PocketToolpaths
             : new List<List<PointD>>();
         PerfLog.Stop("PocketToolpaths.SweptArea", sweptAreaStart,
             $"rings={rings.Count} links={linkCenterlineCount} emittedPoints={emittedPointCount} " +
-            $"bufferedPoints={bufferedPointCount} polygons={sweptArea.Count}");
+            $"bufferedPoints={bufferedPointCount} polygons={sweptArea.Count} calculated={options.CalculateSweptArea}");
 
         var diagnostics = new ToolpathDiagnostics
         {

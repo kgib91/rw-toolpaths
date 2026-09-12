@@ -7,6 +7,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>RW.Toolpaths</AssemblyName>
     <RootNamespace>RW.Toolpaths</RootNamespace>
+    <!-- Interactive geometry must retain compiler/JIT optimization in Debug too.
+         Symbols and diagnostic logging remain available; /p:Optimize=false can
+         still opt into unoptimized instruction-level debugging when required. -->
+    <Optimize>true</Optimize>
   </PropertyGroup>
 
   <ItemGroup>

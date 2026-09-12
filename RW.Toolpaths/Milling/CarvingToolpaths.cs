@@ -3,6 +3,10 @@ using RW.Toolpaths.Geometry;
 
 namespace RW.Toolpaths.Milling;
 
+/// <summary>Original image domain in surface-local coordinates and its native sample counts.
+/// Synthetic edge aprons do not consume the image's guide sampling budget.</summary>
+public sealed record CarvingSamplingRegion(double X, double Y, double Width, double Height, int Columns, int Rows);
+
 public sealed record CarvingOptions
 {
     public double StepOver { get; init; } = 0.1;
@@ -14,14 +18,17 @@ public sealed record CarvingOptions
     public double Tolerance { get; init; } = 0.02;
     /// <summary>Legacy physical clearance-field spacing in millimeters. Used only when SamplingPercent is zero.</summary>
     public double SamplingSpacing { get; init; }
-    /// <summary>Percentage of each source image dimension used for the conservative clearance field.
+    /// <summary>Percentage of each source image dimension used for the raster guide field.
     /// Values between zero and 100 scale independently onto the physical placement; 100 uses the exact
     /// source-query path. Zero preserves legacy SamplingSpacing behavior. Original pixels remain the
     /// authority for cutter clearance at every percentage.</summary>
     public double SamplingPercent { get; init; }
+    public CarvingSamplingRegion? SamplingRegion { get; init; }
     public double OutputRoundingMargin { get; init; }
     public RampSettings Ramp { get; init; } = RampSettings.FromRatio(2);
     public IReadOnlyList<PointD>? StockBoundary { get; init; }
+    /// <summary>Return a 2D roughing swept-area summary for callers that consume it.</summary>
+    public bool CalculateSweptArea { get; init; } = true;
 }
 
 public static class CarvingRoughingToolpaths
@@ -63,10 +70,17 @@ public static class CarvingRoughingToolpaths
             double previous = Math.Min(maximum, pass * depthPerPass);
             double depth = Math.Min(maximum, (pass + 1) * depthPerPass);
             double z = surface.SurfaceZ - depth;
+            // The final slice targets the exact source minimum. Reconstructing it
+            // by subtracting the allowance after the depth schedule can round a
+            // few ULPs below that minimum and discard every flat floor contour.
+            double rawSliceLimit = z - options.SurfaceAllowance;
+            double sliceLimit = depth == maximum ? surface.Minimum : rawSliceLimit;
+            Console.WriteLine($"[Carving.SliceDepth] level={pass + 1}/{count} z={z:R} allowance={options.SurfaceAllowance:R} " +
+                $"sourceLimit={sliceLimit:R} minimum={surface.Minimum:R} floorSnap={sliceLimit - rawSliceLimit:R}");
             ReportPass(pass, 0, "Tracing heightmap");
             PathsD rings;
             int boundaryPatches;
-            if (!HeightmapSliceContours.TryBuild(surface, z - options.SurfaceAllowance, options.Tolerance,
+            if (!HeightmapSliceContours.TryBuild(surface, sliceLimit, options.Tolerance,
                 cancellationToken, out rings, out boundaryPatches,
                 (done, total) => ReportPass(pass, 0.3 * done / total, $"Tracing image rows {done:N0}/{total:N0}")))
             {
@@ -105,7 +119,7 @@ public static class CarvingRoughingToolpaths
                 if ((++boundaryPatches & 255) == 0) cancellationToken.ThrowIfCancellationRequested();
                 if (boundaryPatches > 32_000_000)
                     throw new InvalidOperationException("Carving slice exceeds its subdivision budget; increase tolerance or simplify the image.");
-                double limit = z - options.SurfaceAllowance;
+                double limit = sliceLimit;
                 if (Math.Max(Math.Max(a, b), Math.Max(c, d)) <= limit)
                 { AddRectangle(x0, y0, x1, y1); return; }
                 if (Math.Min(Math.Min(a, b), Math.Min(c, d)) >= limit) return;
@@ -157,7 +171,7 @@ public static class CarvingRoughingToolpaths
                 for (int x = 0; x <= surface.Grid.Width - 1; x++)
                 {
                     bool include = x < surface.Grid.Width - 1 && surface.CellIncluded(x, y)
-                        && surface.CellMaximum(x, y) + options.SurfaceAllowance <= z + 1e-9;
+                        && surface.CellMaximum(x, y) <= sliceLimit;
                     if (!include && x < surface.Grid.Width - 1 && surface.CellIncluded(x, y))
                     {
                         double x0 = x * surface.PixelX, y0 = y * surface.PixelY;
@@ -221,6 +235,7 @@ public static class CarvingRoughingToolpaths
                     // Independent rings retain unambiguous clearance across evolving slice islands.
                     SpiralChaining = false,
                     DetectCurves = false,
+                    CalculateSweptArea = options.CalculateSweptArea,
                 }, cancellationToken, (fraction, stage) => ReportPass(pass, 0.4 + 0.59 * fraction, stage));
             if (Interlocked.Add(ref totalPoints, plan.Toolpaths.Sum(p => (long)p.Points.Count)) > 2_000_000)
                 throw new InvalidOperationException("Carving roughing exceeds two million points; increase tolerance or stepover.");
@@ -232,7 +247,7 @@ public static class CarvingRoughingToolpaths
         // to two levels, then publish the resulting cuts strictly in machining depth order.
         var passPlans = new ToolpathPlan[count];
         int workers = Math.Min(2, Math.Min(count, Environment.ProcessorCount));
-        Console.WriteLine($"[Carving.RoughSchedule] levels={count} workers={workers} curves=False");
+        Console.WriteLine($"[Carving.RoughSchedule] levels={count} workers={workers} curves=False sweptArea={options.CalculateSweptArea}");
         try
         {
             Parallel.For(0, count, new ParallelOptions { MaxDegreeOfParallelism = workers,
@@ -256,6 +271,11 @@ public static class CarvingRoughingToolpaths
 
     internal static void Validate(ToolGeometry tool, CarvingOptions options)
     {
+        if (options.SamplingRegion is { } region
+            && (!double.IsFinite(region.X) || !double.IsFinite(region.Y)
+                || !double.IsFinite(region.Width) || !double.IsFinite(region.Height)
+                || region.Width <= 0 || region.Height <= 0 || region.Columns < 2 || region.Rows < 2))
+            throw new ArgumentException("Invalid carving sampling region.", nameof(options));
         if (!double.IsFinite(options.SamplingPercent) || options.SamplingPercent < 0 || options.SamplingPercent > 100)
             throw new ArgumentException("Carving sampling must be between 0 and 100 percent; zero preserves legacy spacing.", nameof(options));
         if (!double.IsFinite(tool.Radius) || tool.Radius <= 0 || !double.IsFinite(options.StepOver)
@@ -277,26 +297,28 @@ public static class CarvingFinishingToolpaths
         CarvingCutterProfile? cutter = null)
     {
         CarvingRoughingToolpaths.Validate(tool, options);
+        bool useField = options.SamplingPercent > 0 ? options.SamplingPercent < 100 : options.SamplingSpacing > 0;
+        if (useField && ballNose && cutter == null)
+        {
+            // Sampled guides still require a physical swept-chord proof. Represent a
+            // plain ball nose explicitly so that proof uses its curved tip, not a disk.
+            cutter = new CarvingCutterProfile(
+                new[] { new CarvingCutterSection(CarvingCutterSectionKind.Hemisphere, 0, tool.Radius, tool.Radius) },
+                Math.Max(tool.Radius, surface.SurfaceZ - surface.Minimum));
+        }
         double r = cutter?.MaximumRadius ?? tool.Radius;
         double tipRadius = cutter?.TipRadius ?? tool.Radius;
-        bool useField = options.SamplingPercent > 0 ? options.SamplingPercent < 100 : options.SamplingSpacing > 0;
-        // Fields need at least five nodes per axis for an adjacent-cell support box that avoids
-        // the exterior. Smaller fields would flatten the entire relief to protected stock height.
-        if (useField && options.SamplingPercent > 0
-            && (Math.Ceiling(surface.Grid.Width * options.SamplingPercent / 100) <= 4
-                || Math.Ceiling(surface.Grid.Height * options.SamplingPercent / 100) <= 4))
-        {
-            useField = false;
-            Console.WriteLine($"[Carving.Sampling] source={surface.Grid.Width}x{surface.Grid.Height} " +
-                $"samplingPercent={options.SamplingPercent:R} mode=exact reason=minimum-detail");
-        }
         var field = useField ? new CarvingClearanceField(surface, r, ballNose, cutter,
-            options, cancellationToken, (fraction, stage) => progress?.Invoke(0.85 * fraction, stage)) : null;
-        void Report(double fraction, string stage) => progress?.Invoke(field == null ? fraction : 0.85 + 0.15 * fraction, stage);
+            options, cancellationToken, (fraction, stage) => progress?.Invoke(0.15 * fraction, stage)) : null;
+        void Report(double fraction, string stage) => progress?.Invoke(field == null ? fraction : 0.15 + 0.85 * fraction, stage);
         double Height(PointD p) => field?.Sample(p) ?? surface.CutterUpperBound(p, p, r, ballNose,
             options.Tolerance / 8, cancellationToken, options.OutputRoundingMargin, cutter);
         bool slopedProof = field != null || !ballNose || cutter != null;
-        double step = 2 * tipRadius * options.StepOver, inset = tipRadius + options.OutputRoundingMargin;
+        double step = 2 * tipRadius * options.StepOver;
+        // Keep the rounded footprint strictly inside the image at row endpoints.
+        // Exact tangency to a straight ball shaft creates a discontinuous exterior
+        // contact constraint, which cannot be represented by a finite sloping chord.
+        double inset = tipRadius + options.OutputRoundingMargin + Math.Max(1e-7, tipRadius * 1e-10);
         if (surface.Placement.Width <= 2 * inset || surface.Placement.Height <= 2 * inset)
             throw new InvalidOperationException("The carving image is smaller than the cutter diameter.");
         double angle = options.ScanAngle * Math.PI / 180, dx = Math.Cos(angle), dy = Math.Sin(angle);
@@ -312,6 +334,10 @@ public static class CarvingFinishingToolpaths
         int totalPoints = 0;
         long totalSamples = 0;
         long smoothedPoints = 0, proofBudgetSkips = 0, originalReversals = 0, filteredReversals = 0;
+        long exactPointQueries = 0, physicalChordQueries = 0, guideRejects = 0, physicalRejects = 0;
+        long failedProofs = 0, rejectedValleys = 0, discontinuityBridges = 0;
+        long surfaceClampedPoints = 0, surfaceIntersections = 0;
+        var rowMaximumBridgeSpan = new double[rows + 1];
         var rowMaximumLift = new double[rows + 1];
         // This is an automatic microtexture allowance, separate from numerical
         // chord accuracy. Limit it to 5% of the ball-tip diameter and 0.05 mm;
@@ -336,17 +362,71 @@ public static class CarvingFinishingToolpaths
                     || !Clip(wa.y, wb.y, stock.Min(p => p.y) + inset, stock.Max(p => p.y) - inset, ref low, ref high))) return (new(), 0);
             var start = Mix(a, b, low); var end = Mix(a, b, high);
             if (options.BothWays && (row & 1) == 1) (start, end) = (end, start);
+            return GenerateTrace(start, end, row);
+        }
+        // Raster rows and their turns use the same source, full physical cutter,
+        // adaptive chord proof and bounded simplification.
+        (List<Point3D[]> Runs, int Points) GenerateTrace(PointD start, PointD end, int row)
+        {
             var samples = new List<(PointD p, double z)>();
+            long rowExact = 0, rowPhysical = 0, rowGuideReject = 0, rowPhysicalReject = 0;
+            long rowFailedProofs = 0, rowRejectedValleys = 0, rowBridges = 0;
+            var exactCache = new Dictionary<(double X, double Y), double>();
+            double ExactHeight(PointD p)
+            {
+                if (exactCache.TryGetValue((p.x, p.y), out double cached)) return cached;
+                rowExact++;
+                double result = surface.CutterUpperBound(p, p, r, ballNose, options.Tolerance / 8,
+                    cancellationToken, options.OutputRoundingMargin, cutter);
+                exactCache[(p.x, p.y)] = result;
+                return result;
+            }
             double za = Height(start), zb = Height(end);
-            samples.Add((start, za));
+            samples.Add((start, field == null ? za : ExactHeight(start)));
             void Refine(PointD p, double zp, PointD q, double zq, int level)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (totalSamples + samples.Count > 16_000_000) throw new InvalidOperationException("Carving exceeds sixteen million clearance samples; increase tolerance or stepover.");
-                double lift = field != null ? field.ChordLift(p, zp, q, zq, options.Tolerance * 0.5) : !slopedProof
+                var mid = Mix(p, q, 0.5);
+                double? middleHeight = null;
+                if (field != null)
+                {
+                    // Reject long chords cheaply using the sampled guide. Its heights
+                    // cannot certify safety or replace source-derived contact heights.
+                    double guideLift = field.ChordLift(p, zp, q, zq, options.Tolerance * 0.5);
+                    middleHeight = Height(mid);
+                    // Exact apron heights need not meet the interpolated guide at its
+                    // boundary. Only test the guide's valley where it owns both ends;
+                    // the full-source proof below still tests the actual midpoint.
+                    bool guideValley = !field.Contains(p) || !field.Contains(q)
+                        || (zp + zq) / 2 - middleHeight.Value <= options.Tolerance * 0.25;
+                    if (!double.IsFinite(guideLift) || !guideValley)
+                    {
+                        rowGuideReject++;
+                        if (level >= 24)
+                        {
+                            Console.Error.WriteLine($"[Carving.Guide] row={row} p=({p.x:R},{p.y:R},{zp:R}) " +
+                                $"q=({q.x:R},{q.y:R},{zq:R}) lift={guideLift:R} followsValley={guideValley}");
+                            throw new InvalidOperationException("Carving raster guide did not converge.");
+                        }
+                        Refine(p, zp, mid, middleHeight.Value, level + 1);
+                        Refine(mid, middleHeight.Value, q, zq, level + 1);
+                        return;
+                    }
+                }
+                // Keep guide endpoints for recursive guide tests. Feeding exact values
+                // back into interpolation can make a guide reject its own endpoints.
+                double guideZp = zp, guideZq = zq;
+                if (field != null)
+                {
+                    zp = ExactHeight(p);
+                    zq = ExactHeight(q);
+                }
+                rowPhysical++;
+                double lift = !slopedProof
                     ? Math.Max(0, surface.CutterUpperBound(p, q, r, true, options.Tolerance / 8, cancellationToken, options.OutputRoundingMargin) - Math.Min(zp, zq))
                     : surface.FlatCutterChordLift(p, zp, q, zq, r, options.Tolerance * 0.5, cancellationToken, options.OutputRoundingMargin, cutter);
-                if (field == null && slopedProof && !double.IsFinite(lift)
+                if (slopedProof && !double.IsFinite(lift)
                     && Math.Max(Math.Abs(p.x - q.x), Math.Abs(p.y - q.y))
                         <= Math.Max(surface.PixelX, surface.PixelY) / 8)
                 {
@@ -359,13 +439,12 @@ public static class CarvingFinishingToolpaths
                         cancellationToken, options.OutputRoundingMargin, cutter) - Math.Min(zp, zq));
                     if (lift > options.Tolerance * 0.5) lift = double.PositiveInfinity;
                 }
-                var mid = Mix(p, q, 0.5);
-                double? middleHeight = null;
                 bool followsValley = true;
                 if (slopedProof && lift <= options.Tolerance * 0.75)
                 {
-                    middleHeight = Height(mid);
-                    followsValley = (zp + zq) / 2 + options.Tolerance * 0.5 - middleHeight.Value <= options.Tolerance * 0.75;
+                    double middleExact = field == null ? Height(mid) : ExactHeight(mid);
+                    if (field == null) middleHeight = middleExact;
+                    followsValley = (zp + zq) / 2 + options.Tolerance * 0.5 - middleExact <= options.Tolerance * 0.75;
                 }
                 if (lift <= options.Tolerance * 0.75 && followsValley)
                 {
@@ -381,14 +460,44 @@ public static class CarvingFinishingToolpaths
                 }
                 if (level >= 24)
                 {
+                    double span = Math.Sqrt(Math.Pow(q.x - p.x, 2) + Math.Pow(q.y - p.y, 2));
+                    if (lift > options.Tolerance * 0.75
+                        && span <= Math.Max(options.OutputRoundingMargin, 1e-7))
+                    {
+                        // An abrupt wider shaft can create a real jump in required tip
+                        // height. At sub-output precision, no sloping chord can follow
+                        // that discontinuity. Prove a horizontal bridge over the entire
+                        // rounded XY rectangle, retaining vertical motion at each end.
+                        double upper = surface.CutterUpperBound(p, q, r, ballNose, options.Tolerance / 8,
+                            cancellationToken, options.OutputRoundingMargin, cutter);
+                        if (double.IsFinite(upper))
+                        {
+                            double pz = ExactHeight(p) + options.Tolerance * 0.5;
+                            double qz = ExactHeight(q) + options.Tolerance * 0.5;
+                            double bridgeZ = Math.Max(upper + options.Tolerance * 0.5,
+                                Math.Max(samples[^1].z, Math.Max(pz, qz)));
+                            // Preserve the preceding proven endpoint. Raising it in place
+                            // would turn the previous chord into an unrelated long ramp.
+                            samples.Add((p, bridgeZ));
+                            samples.Add((q, bridgeZ));
+                            if (qz < bridgeZ) samples.Add((q, qz));
+                            rowBridges++;
+                            rowMaximumBridgeSpan[row] = Math.Max(rowMaximumBridgeSpan[row], span);
+                            return;
+                        }
+                    }
                     Console.Error.WriteLine($"[Carving.Clearance] row={row} p=({p.x:R},{p.y:R},{zp:R}) q=({q.x:R},{q.y:R},{zq:R}) lift={lift:R} middle={middleHeight:R} followsValley={followsValley} tolerance={options.Tolerance:R}");
                     throw new InvalidOperationException("Carving clearance did not converge; inspect image discontinuities or increase tolerance.");
                 }
                 double zm = middleHeight ?? Height(mid);
-                Refine(p, zp, mid, zm, level + 1); Refine(mid, zm, q, zq, level + 1);
+                rowPhysicalReject++;
+                if (lift > options.Tolerance * 0.75) rowFailedProofs++;
+                else rowRejectedValleys++;
+                Refine(p, guideZp, mid, zm, level + 1); Refine(mid, zm, q, guideZq, level + 1);
             }
             Refine(start, za, end, zb, 0);
-            // Protected/white regions split paths; they are never connected through stock below the surface.
+            // White and masked regions are stock at SurfaceZ. Keep the proven
+            // approach, traverse at the top, and continue down the next slope.
             var runs = new List<Point3D[]>();
             var run = new List<Point3D>();
             void Flush()
@@ -409,29 +518,29 @@ public static class CarvingFinishingToolpaths
                         Interlocked.Add(ref filteredReversals, result.ResultReversals);
                         rowMaximumLift[row] = Math.Max(rowMaximumLift[row], result.MaximumLift);
                     }
-                    runs.Add(SimplifyRasterRun(filtered,
-                        options.Tolerance * (slopedProof ? 3d / 16 : 1d / 16), cancellationToken));
+                    var simplified = SimplifyRasterRun(filtered,
+                        options.Tolerance * (slopedProof ? 3d / 16 : 1d / 16), cancellationToken);
+                    runs.Add(ClampRasterToSurface(simplified, surface.SurfaceZ + options.OutputRoundingMargin,
+                        out int clamped, out int intersections));
+                    Interlocked.Add(ref surfaceClampedPoints, clamped);
+                    Interlocked.Add(ref surfaceIntersections, intersections);
                 }
                 run.Clear();
             }
-            Point3D? previousProtected = null;
             foreach (var sample in samples)
             {
                 var world = surface.Placement.ToWorld(sample.p.x, sample.p.y);
                 var point = new Point3D(world.x, world.y, sample.z + options.OutputRoundingMargin);
-                if (sample.z >= surface.SurfaceZ - 1e-7)
-                {
-                    // Retain the proven chord up to the surface. Dropping its last endpoint
-                    // would discard an entire compact slope with only two samples.
-                    if (run.Count > 0) { run.Add(point); Flush(); }
-                    previousProtected = point;
-                    continue;
-                }
-                if (previousProtected is { } entry) run.Add(entry);
-                previousProtected = null;
                 run.Add(point);
             }
             Flush();
+            Interlocked.Add(ref exactPointQueries, rowExact);
+            Interlocked.Add(ref physicalChordQueries, rowPhysical);
+            Interlocked.Add(ref guideRejects, rowGuideReject);
+            Interlocked.Add(ref physicalRejects, rowPhysicalReject);
+            Interlocked.Add(ref failedProofs, rowFailedProofs);
+            Interlocked.Add(ref rejectedValleys, rowRejectedValleys);
+            Interlocked.Add(ref discontinuityBridges, rowBridges);
             return (runs, samples.Count);
         }
         // Keep workers occupied when neighboring rows have very different relief costs.
@@ -456,7 +565,7 @@ public static class CarvingFinishingToolpaths
                 lock (progressGate)
                 {
                     completed = ++completedRows;
-                    Report(0.98 * completed / (rows + 1), $"Finishing scanlines {completed:N0}/{rows + 1:N0}");
+                    Report(0.9 * completed / (rows + 1), $"Finishing scanlines {completed:N0}/{rows + 1:N0}");
                 }
                 if ((completed & 31) == 0) Console.WriteLine($"[Carving.Finish] completedRows={completed}/{rows + 1} samples={Interlocked.Read(ref totalSamples)} points={Volatile.Read(ref totalPoints)} ball={ballNose} angle={options.ScanAngle:R} elapsedMs={System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}");
             });
@@ -468,14 +577,64 @@ public static class CarvingFinishingToolpaths
                 failures.FirstOrDefault(failure => failure is not OperationCanceledException) ?? failures[0]).Throw();
             throw;
         }
+        if (!rasterRows.Any(row => row.Runs.Any(run =>
+            run.Any(point => point.Z < surface.SurfaceZ + options.OutputRoundingMargin - 1e-7))))
+        {
+            Console.WriteLine("[Carving.Finish] empty reason=no-reachable-relief-below-stock-top");
+            Report(1, "No reachable relief below stock top");
+            return ToolpathPlan.Empty;
+        }
+        var rowLinks = new Point3D[rows + 1][];
+        int linkedRows = 0, previousRow = -1;
+        double maximumLinkLength = 0;
+        for (int row = 0; row <= rows; row++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (rasterRows[row].Runs.Count == 0) continue;
+            if (options.BothWays && previousRow == row - 1 && previousRow >= 0)
+            {
+                var previous = rasterRows[previousRow].Runs[^1];
+                var current = rasterRows[row].Runs[0];
+                var from = previous[^1]; var to = current[0];
+                var linkResult = GenerateTrace(surface.Placement.ToLocal(from.X, from.Y),
+                    surface.Placement.ToLocal(to.X, to.Y), row);
+                var link = linkResult.Runs.Single();
+                // Different adjacent chords may carry different conservative lifts.
+                // Share the higher endpoint; raising either proven chord preserves
+                // clearance and avoids a vertical seam at the row junction.
+                link[0] = previous[^1] = new Point3D(from.X, from.Y, Math.Max(from.Z, link[0].Z));
+                link[^1] = current[0] = new Point3D(to.X, to.Y, Math.Max(to.Z, link[^1].Z));
+                rowLinks[row] = link;
+                linkedRows++;
+                maximumLinkLength = Math.Max(maximumLinkLength,
+                    Math.Sqrt(Math.Pow(to.X - from.X, 2) + Math.Pow(to.Y - from.Y, 2)));
+                totalSamples += linkResult.Points;
+                totalPoints += link.Length - 1;
+                if (totalSamples > 16_000_000 || totalPoints > 4_000_000)
+                    throw new InvalidOperationException("Carving finishing links exceed the sample/point budget; increase stepover.");
+            }
+            previousRow = row;
+            Report(0.9 + 0.08 * (row + 1) / (rows + 1), $"Finishing row links {row + 1:N0}/{rows + 1:N0}");
+        }
         for (int row = 0; row <= rows; row++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             foreach (var run in rasterRows[row].Runs)
-                paths.Add(new TaggedToolpath(run,
-                    new[] { new ToolpathSpan(0, run.Length - 1, ToolpathSpanKind.Cut) }, row, "carving-finish", null, paths.Count, detectCurves: false));
+            {
+                var link = rowLinks[row];
+                var points = link == null ? run : link.Take(link.Length - 1).Concat(run).ToArray();
+                int cutStart = link == null ? 0 : link.Length - 1;
+                var spans = new List<ToolpathSpan>();
+                if (cutStart > 0) spans.Add(new(0, cutStart, ToolpathSpanKind.Link));
+                spans.Add(new(cutStart, points.Length - 1, ToolpathSpanKind.Cut));
+                paths.Add(new TaggedToolpath(points, spans, row, "carving-finish", null, paths.Count, detectCurves: false));
+            }
             rasterRows[row] = default;
         }
+        Console.WriteLine($"[Carving.Continuity] bothWays={options.BothWays} linkedRows={linkedRows} " +
+            $"maximumLinkLength={maximumLinkLength:R} clearance=original-source-full-profile");
+        Console.WriteLine($"[Carving.SurfaceClamp] surface={surface.SurfaceZ:R} roundingReserve={options.OutputRoundingMargin:R} " +
+            $"clampedPoints={surfaceClampedPoints} intersections={surfaceIntersections} peakRetracts=0");
         if (ballNose)
             Console.WriteLine($"[Carving.Microtexture] tipDiameter={microtextureSpan:R} allowance={microtextureLift:R} " +
                 $"maximumLift={rowMaximumLift.Max():R} removedPoints={smoothedPoints} " +
@@ -483,7 +642,40 @@ public static class CarvingFinishingToolpaths
                 $"clearance=upper-envelope");
         Report(1, "Finishing scanlines complete");
         Console.WriteLine($"[Carving.Finish] complete rows={rows + 1} samples={totalSamples} points={totalPoints} paths={paths.Count} tolerance={options.Tolerance:R} elapsedMs={System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}");
+        if (discontinuityBridges > 0)
+            Console.WriteLine($"[Carving.Discontinuity] bridges={discontinuityBridges} maximumSpan={rowMaximumBridgeSpan.Max():R} " +
+                "clearance=original-source-rectangle");
+        Console.WriteLine($"[Carving.SourceProof] method=correlated-section-support exactPointQueries={exactPointQueries} physicalChordQueries={physicalChordQueries} " +
+            $"guideRejects={guideRejects} physicalRejects={physicalRejects} failedProofs={failedProofs} rejectedValleys={rejectedValleys}");
+        field?.ReportFallbacks();
         return new ToolpathPlan(paths, new List<List<PointD>>(), new ToolpathDiagnostics { PathCount = paths.Count, DepthPassCount = 1 });
+    }
+    internal static Point3D[] ClampRasterToSurface(IReadOnlyList<Point3D> points, double top,
+        out int clamped, out int intersections)
+    {
+        clamped = intersections = 0;
+        var result = new List<Point3D>(points.Count);
+        for (int i = 0; i < points.Count; i++)
+        {
+            var p = points[i];
+            if (i > 0)
+            {
+                var a = points[i - 1];
+                if ((a.Z < top && p.Z > top) || (a.Z > top && p.Z < top))
+                {
+                    double t = (top - a.Z) / (p.Z - a.Z);
+                    result.Add(new Point3D(a.X + t * (p.X - a.X), a.Y + t * (p.Y - a.Y), top));
+                    intersections++;
+                }
+            }
+            if (p.Z > top) clamped++;
+            result.Add(new Point3D(p.X, p.Y, Math.Min(p.Z, top)));
+        }
+        // Clip the complete proven polyline, not just its vertices: lowering an
+        // above-top endpoint alone can pull the approaching chord into a peak.
+        // Every cutter section lies above its tip and the entire target (including
+        // masks/exterior) is bounded by SurfaceZ. Retain output rounding clearance.
+        return result.ToArray();
     }
     private static Point3D[] SimplifyRasterRun(IReadOnlyList<Point3D> points, double tolerance, CancellationToken cancellationToken)
     {

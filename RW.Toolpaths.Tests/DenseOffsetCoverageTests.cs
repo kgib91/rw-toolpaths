@@ -12,11 +12,14 @@ public class DenseOffsetCoverageTests
     private const double ClearanceSlack = ArcTolerance * 0.05 + 0.000002;
 
     [Theory]
-    [InlineData(0)]
-    [InlineData(113)]
-    public void DenseNoisyPocketRetainsReachableRoomsAcrossInsetLevelsAndChunkSeams(int rotation)
+    [InlineData(0, 10240, 20, 160)]
+    [InlineData(113, 10240, 20, 160)]
+    [InlineData(0, 2560, 40, 40)]
+    [InlineData(0, 5120, 20, 80)]
+    public void DenseNoisyPocketRetainsReachableRoomsAcrossInsetLevelsAndChunkSeams(
+        int rotation, int outerPoints, int holeCount, int holePoints)
     {
-        var (outer, holes, holeCenters) = CreatePocket();
+        var (outer, holes, holeCenters) = CreatePocket(outerPoints, holeCount, holePoints);
         outer = outer.Skip(rotation).Concat(outer.Take(rotation)).ToList();
         var source = new[] { outer }.Concat(holes).ToArray();
         var segments = source.SelectMany(Edges).ToArray();
@@ -54,27 +57,62 @@ public class DenseOffsetCoverageTests
         }
     }
 
-    private static (List<PointD> Outer, List<List<PointD>> Holes, List<PointD> Centers) CreatePocket()
+    [Fact]
+    public void LargeLateInsetsRetainReachableMaterialAndProtectIslands()
+    {
+        var (outer, holes, holeCenters) = CreatePocket();
+        List<PointD> Enlarge(List<PointD> path) => path.Select(p => new PointD(p.x * 3, p.y * 3)).ToList();
+        outer = Enlarge(outer);
+        holes = holes.Select(Enlarge).ToList();
+        holeCenters = Enlarge(holeCenters);
+        var source = new[] { outer }.Concat(holes).ToArray();
+        var segments = source.SelectMany(Edges).ToArray();
+        var prepared = PolygonOps.PrepareBoundaryOffset(outer, holes, ArcTolerance, simplifyTolerance: 0);
+        double previousArea = double.PositiveInfinity;
+        foreach (int level in new[] { 0, 5, 17 })
+        {
+            double inset = FirstInset + Stepover * level;
+            var contours = prepared.Execute(-inset);
+            double area = contours.Sum(PolygonOps.SignedArea);
+            Assert.True(area > 1000 && area < previousArea, $"Invalid area at level {level}: {area:R}");
+            previousArea = area;
+            int witnesses = 0;
+            for (int y = -60; y <= 60; y += 20)
+            for (int x = -60; x <= 60; x += 20)
+            {
+                var p = new PointD(x, y);
+                if (!Contains(source, p) || PointClearanceSquared(segments, p) < Math.Pow(inset + 0.1, 2)) continue;
+                witnesses++;
+                Assert.True(Contains(contours, p), $"Lost reachable room at level {level}: ({x},{y})");
+            }
+            Assert.True(witnesses >= 9);
+            foreach (var center in holeCenters) Assert.False(Contains(contours, center));
+            AssertContinuousClearance(contours, source, segments, inset - ClearanceSlack, level);
+        }
+    }
+
+    private static (List<PointD> Outer, List<List<PointD>> Holes, List<PointD> Centers) CreatePocket(
+        int outerPoints = 10240, int holeCount = 20, int holePoints = 160)
     {
         var random = new Random(0);
-        var outer = new List<PointD>(10240);
-        for (int i = 0; i < 10240; i++)
+        var outer = new List<PointD>(outerPoints);
+        for (int i = 0; i < outerPoints; i++)
         {
-            double a = 2 * Math.PI * i / 10240;
+            double a = 2 * Math.PI * i / outerPoints;
             double r = 55 + 0.05 * (2 * random.NextDouble() - 1) + 7 * Math.Sin(7 * a);
             outer.Add(new PointD(r * Math.Cos(a), r * Math.Sin(a)));
         }
 
         var holes = new List<List<PointD>>();
         var centers = new List<PointD>();
-        for (int h = 0; h < 20; h++)
+        for (int h = 0; h < holeCount; h++)
         {
-            double a = 2 * Math.PI * h / 20;
+            double a = 2 * Math.PI * h / holeCount;
             var center = new PointD(31 * Math.Cos(a) + 3, 31 * Math.Sin(a) - 2);
-            var hole = new List<PointD>(160);
-            for (int i = 0; i < 160; i++)
+            var hole = new List<PointD>(holePoints);
+            for (int i = 0; i < holePoints; i++)
             {
-                double b = 2 * Math.PI * i / 160;
+                double b = 2 * Math.PI * i / holePoints;
                 double r = 1.4 + 0.1 * (2 * random.NextDouble() - 1);
                 hole.Add(new PointD(center.x + r * Math.Cos(b), center.y + r * Math.Sin(b)));
             }

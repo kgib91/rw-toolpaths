@@ -291,7 +291,49 @@ public sealed class HeightmapSurface
         {
             double edge = Math.Max(0, Math.Min(Math.Min(a.x, b.x), Math.Min(Math.Min(a.y, b.y),
                 Math.Min(Placement.Width - Math.Max(a.x, b.x), Placement.Height - Math.Max(a.y, b.y)))) - horizontalMargin);
-            if (edge <= radius) result = Math.Max(result, SurfaceZ - Math.Min(za, zb) - cutter.Bottom(edge));
+            if (edge <= radius)
+            {
+                double exterior = SurfaceZ - Math.Min(za, zb) - cutter.Bottom(edge);
+                if (exterior > tolerance)
+                {
+                    // The image exterior is the union of four half-planes. The nearest
+                    // radius to each half-plane varies linearly along this chord; keep
+                    // that distance correlated with tip Z. Reuse exact planar support
+                    // on a degenerate rectangle to include every physical profile section.
+                    double Edge(double da, double db)
+                    {
+                        da -= horizontalMargin; db -= horizontalMargin;
+                        double lo = Math.Min(da, db), hi = Math.Max(da, db);
+                        if (lo > radius) return double.NegativeInfinity;
+                        double delta = db - da;
+                        if (Math.Abs(delta) < 1e-12)
+                            return SurfaceZ - Math.Min(za, zb) - cutter.Bottom(Math.Max(0, lo));
+                        double edgeSlope = (zb - za) / delta;
+                        double bound = double.NegativeInfinity;
+                        if (lo < 0)
+                        {
+                            double negativeHi = Math.Min(0, hi);
+                            double d = edgeSlope >= 0 ? lo : negativeHi;
+                            bound = SurfaceZ - za - edgeSlope * (d - da);
+                        }
+                        lo = Math.Max(0, lo); hi = Math.Min(radius, hi);
+                        if (lo <= hi)
+                        {
+                            // Shift the support coordinates to the first endpoint so
+                            // nearly equal edge distances do not subtract large products.
+                            double support = cutter.ClippedPlaneSupport(-edgeSlope, 0,
+                                lo - da, 0, hi - da, 0, -da, 0, -da, 0, out _, out _);
+                            bound = Math.Max(bound, SurfaceZ - za + support + 1e-8);
+                        }
+                        return bound;
+                    }
+                    double correlated = Math.Max(Math.Max(Edge(a.x, b.x), Edge(a.y, b.y)),
+                        Math.Max(Edge(Placement.Width - a.x, Placement.Width - b.x),
+                            Edge(Placement.Height - a.y, Placement.Height - b.y)));
+                    exterior = Math.Min(exterior, correlated);
+                }
+                result = Math.Max(result, exterior);
+            }
         }
         return result <= tolerance ? result : double.PositiveInfinity;
     }

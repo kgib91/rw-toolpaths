@@ -91,25 +91,45 @@ public sealed class CarvingCutterProfile
         double nearX = Math.Max(0, Math.Max(x0 - qx1, qx0 - x1));
         double nearY = Math.Max(0, Math.Max(y0 - qy1, qy0 - y1));
         double near = Math.Sqrt(nearX * nearX + nearY * nearY);
+        if (!queryRectangle)
+            near = SegmentBoxDistance(ax, ay, bx, by, x0 - margin, y0 - margin, x1 + margin, y1 + margin);
         double farX = Math.Max(Math.Abs(x0 - qx1), Math.Abs(x1 - qx0));
         double farY = Math.Max(Math.Abs(y0 - qy1), Math.Abs(y1 - qy0));
         double far = Math.Sqrt(farX * farX + farY * farY);
         double cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
         double vx = cx - Math.Clamp(cx, qx0, qx1), vy = cy - Math.Clamp(cy, qy0, qy1);
         double radial = Math.Sqrt(vx * vx + vy * vy);
+        double sourceGx = (h10 + h11 - h00 - h01) / (2 * (x1 - x0));
+        double sourceGy = (h01 + h11 - h00 - h10) / (2 * (y1 - y0));
+        double lineX = bx - ax, lineY = by - ay, lineLength2 = lineX * lineX + lineY * lineY;
+        double correction = !queryRectangle && lineLength2 > 1e-24
+            ? (bz - az - sourceGx * lineX - sourceGy * lineY) / lineLength2 : 0;
+        double lineGx = sourceGx + correction * lineX, lineGy = sourceGy + correction * lineY;
+        double sweepLength = !queryRectangle ? Math.Sqrt(lineLength2) : 0;
+        double sweepX = sweepLength > 1e-12 ? lineX / sweepLength : 0;
+        double sweepY = sweepLength > 1e-12 ? lineY / sweepLength : 0;
+        double sweepSlope = sweepLength > 1e-12 ? (bz - az) / sweepLength : 0;
+        double sweepAlong = (cx - ax) * sweepX + (cy - ay) * sweepY;
+        double sweepAcross = (cy - ay) * sweepX - (cx - ax) * sweepY;
         double maximum = double.NegativeInfinity, z = 0;
-        void Plane(double gx, double gy, double intercept)
+        double Plane(double gx, double gy, double intercept)
         {
             double patch = Math.Max(Math.Max(h00 - gx * x0 - gy * y0, h10 - gx * x1 - gy * y0),
                 Math.Max(h01 - gx * x0 - gy * y1, h11 - gx * x1 - gy * y1));
             double centers = Math.Max(gx * ax + gy * ay - az, gx * bx + gy * by - bz);
             if (queryRectangle) centers = Math.Max(gx * ax, gx * bx) + Math.Max(gy * ay, gy * by) - Math.Min(az, bz);
-            maximum = Math.Max(maximum, patch + centers - intercept + margin * (Math.Abs(gx) + Math.Abs(gy)));
+            return patch + centers - intercept + margin * (Math.Abs(gx) + Math.Abs(gy));
         }
         foreach (var section in _sections)
         {
             if (z > MaximumContactHeight) break;
             double height = Math.Min(section.Height, MaximumContactHeight - z);
+            double Dual(double gx, double gy) => Plane(gx, gy,
+                -SectionSupport(section, z, height, Math.Sqrt(gx * gx + gy * gy), out _));
+            // Rectangle queries have the same two dual planes. Only evaluate a
+            // section's supports after its radial domain can reach this patch.
+            double DualBound() => queryRectangle ? Dual(sourceGx, sourceGy)
+                : Math.Min(Dual(sourceGx, sourceGy), Dual(lineGx, lineGy));
             if (section.Kind == CarvingCutterSectionKind.Hemisphere)
             {
                 double r = section.TopRadius;
@@ -119,23 +139,99 @@ public sealed class CarvingCutterProfile
                     double tangentRadius = Math.Min(radial, r * (1 - 1e-8));
                     double root = Math.Sqrt(r * r - tangentRadius * tangentRadius);
                     double scale = radial > 0 ? tangentRadius / (root * radial) : 0;
-                    Plane(scale * vx, scale * vy, z + r - r * r / root);
+                    double bound = Math.Min(DualBound(), Plane(scale * vx, scale * vy, z + r - r * r / root));
+                    if (sweepLength > 1e-12)
+                    {
+                        // At the source patch center, minimize tip Z plus this sphere's
+                        // underside along the actual sloped segment. Its tangent remains
+                        // a lower support for the full spherical section and entire patch.
+                        double t = Math.Clamp(sweepAlong - sweepSlope * Math.Sqrt(
+                            Math.Max(0, r * r - sweepAcross * sweepAcross) / (1 + sweepSlope * sweepSlope)), 0, sweepLength);
+                        double rx = cx - ax - t * sweepX, ry = cy - ay - t * sweepY;
+                        double radial2 = rx * rx + ry * ry;
+                        double contact = Math.Min(Math.Sqrt(radial2), r * (1 - 1e-8));
+                        double sr = Math.Sqrt(r * r - contact * contact);
+                        double factor = radial2 > 0 ? contact / (sr * Math.Sqrt(radial2)) : 0;
+                        bound = Math.Min(bound, Plane(factor * rx, factor * ry, z + r - r * r / sr));
+                    }
+                    maximum = Math.Max(maximum, bound);
                 }
             }
             else
             {
-                if (near <= section.BottomRadius) Plane(0, 0, z);
                 double outer = section.BottomRadius + (section.TopRadius - section.BottomRadius) * height / section.Height;
-                if (outer > section.BottomRadius && near <= outer && far >= section.BottomRadius)
+                if (near <= Math.Max(section.BottomRadius, outer))
                 {
-                    double slope = section.Height / (section.TopRadius - section.BottomRadius);
-                    double scale = radial > 0 ? slope / radial : 0;
-                    Plane(scale * vx, scale * vy, z - slope * section.BottomRadius);
+                    double bound = Math.Min(DualBound(), Plane(0, 0, z));
+                    if (outer > section.BottomRadius && far >= section.BottomRadius)
+                    {
+                        double slope = section.Height / (section.TopRadius - section.BottomRadius);
+                        double scale = radial > 0 ? slope / radial : 0;
+                        bound = Math.Min(bound, Plane(scale * vx, scale * vy, z - slope * section.BottomRadius));
+                        if (sweepLength > 1e-12)
+                        {
+                            double t = sweepSlope >= slope ? 0 : sweepSlope <= -slope ? sweepLength
+                                : Math.Clamp(sweepAlong - sweepSlope * Math.Abs(sweepAcross)
+                                    / Math.Sqrt(slope * slope - sweepSlope * sweepSlope), 0, sweepLength);
+                            double rx = cx - ax - t * sweepX, ry = cy - ay - t * sweepY;
+                            double distance = Math.Sqrt(rx * rx + ry * ry);
+                            double gx = distance > 1e-14 ? slope * rx / distance : Math.Clamp(sweepSlope, -slope, slope) * sweepX;
+                            double gy = distance > 1e-14 ? slope * ry / distance : Math.Clamp(sweepSlope, -slope, slope) * sweepY;
+                            bound = Math.Min(bound, Plane(gx, gy, z - slope * section.BottomRadius));
+                        }
+                    }
+                    maximum = Math.Max(maximum, bound);
                 }
             }
             z += section.Height;
         }
         return maximum + 1e-8;
+    }
+
+    private static double SegmentBoxDistance(double ax, double ay, double bx, double by,
+        double x0, double y0, double x1, double y1)
+    {
+        double dx = bx - ax, dy = by - ay, length2 = dx * dx + dy * dy;
+        double lo = 0, hi = 1;
+        bool Clip(double p, double d, double min, double max)
+        {
+            if (Math.Abs(d) < 1e-20) return p >= min && p <= max;
+            double a = (min - p) / d, b = (max - p) / d;
+            lo = Math.Max(lo, Math.Min(a, b)); hi = Math.Min(hi, Math.Max(a, b));
+            return lo <= hi;
+        }
+        if (Clip(ax, dx, x0, x1) && Clip(ay, dy, y0, y1)) return 0;
+        double Endpoint(double x, double y)
+        {
+            double ex = x - Math.Clamp(x, x0, x1), ey = y - Math.Clamp(y, y0, y1);
+            return ex * ex + ey * ey;
+        }
+        double Corner(double x, double y)
+        {
+            double t = length2 > 1e-24 ? Math.Clamp(((x - ax) * dx + (y - ay) * dy) / length2, 0, 1) : 0;
+            double ex = x - ax - t * dx, ey = y - ay - t * dy;
+            return ex * ex + ey * ey;
+        }
+        double square = Math.Min(Math.Min(Endpoint(ax, ay), Endpoint(bx, by)),
+            Math.Min(Math.Min(Corner(x0, y0), Corner(x1, y0)), Math.Min(Corner(x0, y1), Corner(x1, y1))));
+        return Math.Max(0, Math.Sqrt(square) - 1e-10);
+    }
+
+    /// <summary>Planar support of one physical section, clipped at its reachable height.</summary>
+    private static double SectionSupport(CarvingCutterSection section, double z, double height,
+        double gradient, out double contactRadius)
+    {
+        if (section.Kind == CarvingCutterSectionKind.Hemisphere)
+        {
+            double contact = Math.Min(height, section.TopRadius * (1 - 1 / Math.Sqrt(1 + gradient * gradient)));
+            contactRadius = Math.Sqrt(Math.Max(0, contact * (2 * section.TopRadius - contact)));
+            return gradient * contactRadius - z - contact;
+        }
+        double top = section.BottomRadius + (section.TopRadius - section.BottomRadius) * height / section.Height;
+        double lowerValue = gradient * section.BottomRadius - z;
+        double upperValue = gradient * top - z - height;
+        contactRadius = upperValue >= lowerValue ? top : section.BottomRadius;
+        return Math.Max(lowerValue, upperValue);
     }
 
     internal double Support(double gradient, out double contactRadius)
@@ -145,21 +241,9 @@ public sealed class CarvingCutterProfile
         foreach (var section in _sections)
         {
             if (z > MaximumContactHeight) break;
-            double h = Math.Min(section.Height, MaximumContactHeight - z);
-            if (section.Kind == CarvingCutterSectionKind.Hemisphere)
-            {
-                double contact = Math.Min(h, section.TopRadius * (1 - 1 / Math.Sqrt(1 + gradient * gradient)));
-                double radius = Math.Sqrt(Math.Max(0, contact * (2 * section.TopRadius - contact)));
-                double value = gradient * radius - z - contact;
-                if (value >= result) { result = value; contactRadius = radius; }
-            }
-            else
-            {
-                double top = section.BottomRadius + (section.TopRadius - section.BottomRadius) * h / section.Height;
-                double lowerValue = gradient * section.BottomRadius - z, upperValue = gradient * top - z - h;
-                if (lowerValue >= result) { result = lowerValue; contactRadius = section.BottomRadius; }
-                if (upperValue >= result) { result = upperValue; contactRadius = top; }
-            }
+            double height = Math.Min(section.Height, MaximumContactHeight - z);
+            double value = SectionSupport(section, z, height, gradient, out double radius);
+            if (value >= result) { result = value; contactRadius = radius; }
             z += section.Height;
         }
         return result;

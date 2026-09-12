@@ -458,7 +458,10 @@ public static class PolygonOps
                 return new List<List<PointD>>();
 
             long executeStart = Stopwatch.GetTimestamp();
-            bool usedBoundaryStroke = SourcePointCount > 8192;
+            // Many short protected islands can make joined offsets expensive well
+            // below the single-contour point threshold (e.g. 3,700 points / 53 holes).
+            bool usedBoundaryStroke = SourcePointCount > 4096
+                || (SourcePointCount > 2048 && SourcePathCount > 32);
             if (usedBoundaryStroke)
             {
                 // Dense image contours make one monolithic offset pathological. The existing
@@ -469,12 +472,12 @@ public static class PolygonOps
                 // the first inset (never the preceding ring), so rounding does not accumulate.
                 if (reuseInset)
                 {
-                    var insetOffsetter = CreateOffsetter(_arcTolerance);
-                    insetOffsetter.AddPaths(KeepInsetComponents(_denseInsetBase!, scaledDelta - _denseInsetDelta), JoinType.Round, EndType.Polygon);
-                    // A polygonal round join can fall short of its exact disk by one arc tolerance.
-                    // Reserve that error when reusing the first proven inset, without accumulating it per ring.
-                    double insetGuard = Math.Max(8.0, 2 * _arcTolerance * PathUtils.Scale);
-                    insetOffsetter.Execute(scaledDelta - _denseInsetDelta - insetGuard, solution);
+                    // Even compacted contours can make a joined polygon offset spend
+                    // seconds resolving inverted inner loops. The same round-capped
+                    // boundary construction is cheap on this much smaller fixed inset.
+                    // It reserves cap error and the original source still validates it.
+                    solution = BuildConservativeOffset(_denseInsetBase!,
+                        scaledDelta - _denseInsetDelta, _arcTolerance, sourceIsCanonical: true);
                 }
                 else
                 {
@@ -539,7 +542,7 @@ public static class PolygonOps
             {
                 long repairStart = Stopwatch.GetTimestamp();
                 solution = RepairConservativeOffset(_boundaryIndex, _sourceRegion!, rawCandidate,
-                    scaledDelta, _arcTolerance, significantDeficit);
+                    scaledDelta, _arcTolerance, significantDeficit, _denseInsetBase, _denseInsetDelta);
                 FallbackMilliseconds += ElapsedMilliseconds(repairStart);
                 FallbackCount++;
             }
@@ -697,7 +700,9 @@ public static class PolygonOps
         Paths64 candidate,
         double scaledDelta,
         double arcTolerance,
-        double significantDeficit)
+        double significantDeficit,
+        Paths64? firstInset = null,
+        double firstInsetDelta = 0)
     {
         // Repair the entire region before validation removes any contour: dropping an outer
         // loses a whole pocket, while dropping a hole changes which material is protected.
@@ -727,10 +732,17 @@ public static class PolygonOps
             }
             else
             {
-                candidate = BuildConservativeOffset(sourceRegion,
-                    scaledDelta + Math.Sign(scaledDelta) * totalMargin,
+                // The first validated inset has already removed source-scale teeth
+                // and merged nearby islands. Erode that fixed region by the remaining
+                // distance instead of restroking every original edge at the full radius.
+                // Always validate against the original boundary; retain the original
+                // rebuild for the final recovery attempt. Never chain previous rings.
+                bool reuseInset = attempt < 3 && firstInset != null
+                    && firstInsetDelta < 0 && scaledDelta < firstInsetDelta;
+                candidate = BuildConservativeOffset(reuseInset ? firstInset! : sourceRegion,
+                    scaledDelta - (reuseInset ? firstInsetDelta : 0) + Math.Sign(scaledDelta) * totalMargin,
                     repairArcTolerance, sourceIsCanonical: true);
-                method = "boundary-rebuild";
+                method = reuseInset ? "first-inset-boundary-rebuild" : "boundary-rebuild";
             }
 
             var validated = new Paths64(candidate);
@@ -822,6 +834,7 @@ public static class PolygonOps
             }
         }
         var bands = new Paths64[chunks.Count];
+        long strokeStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         void StrokeChunk(int i)
         {
             var sourceChunk = chunks[i];
@@ -841,10 +854,40 @@ public static class PolygonOps
                 MaxDegreeOfParallelism = Math.Min(4, Environment.ProcessorCount) }, StrokeChunk);
         foreach (var band in bands) boundaryBand.AddRange(band);
         strokeChunks = chunks.Count;
+        double strokeMs = System.Diagnostics.Stopwatch.GetElapsedTime(strokeStarted).TotalMilliseconds;
         if (boundaryBand.Count == 0)
             return new Paths64();
 
+        long unionStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        int unionBatches = 0;
+        // Nearby stroke chunks overlap heavily. Collapse those overlaps locally
+        // before the final union instead of intersecting thousands of duplicate
+        // caps in one sweep. Each batch is a canonical union of complete bands,
+        // including their holes; the original boundary still validates the inset.
+        var groups = bands;
+        while (groups.Length > 64)
+        {
+            const int batchSize = 32;
+            var sourceGroups = groups;
+            var combined = new Paths64[(sourceGroups.Length + batchSize - 1) / batchSize];
+            Parallel.For(0, combined.Length, new ParallelOptions {
+                MaxDegreeOfParallelism = Math.Min(4, Environment.ProcessorCount) }, batch =>
+            {
+                var paths = new Paths64();
+                for (int i = batch * batchSize; i < Math.Min(sourceGroups.Length, (batch + 1) * batchSize); i++)
+                    paths.AddRange(sourceGroups[i]);
+                combined[batch] = Clipper.Union(paths, FillRule.NonZero);
+            });
+            unionBatches += combined.Length;
+            groups = combined;
+        }
+        if (unionBatches > 0)
+        {
+            boundaryBand = new Paths64();
+            foreach (var group in groups) boundaryBand.AddRange(group);
+        }
         boundaryBand = Clipper.Union(boundaryBand, FillRule.NonZero);
+        double unionMs = System.Diagnostics.Stopwatch.GetElapsedTime(unionStarted).TotalMilliseconds;
 
         Paths64 result;
         if (scaledDelta < 0)
@@ -861,7 +904,8 @@ public static class PolygonOps
 
         PerfLog.Stop("PolygonOps.BuildConservativeOffset", t0,
             $"sourcePaths={sourceRegion.Count} sourcePoints={sourcePoints} " +
-            $"strokeChunks={strokeChunks} bandPaths={boundaryBand.Count} resultPaths={result.Count}");
+            $"strokeChunks={strokeChunks} bandPaths={boundaryBand.Count} resultPaths={result.Count} " +
+            $"strokeMs={strokeMs:F2} unionMs={unionMs:F2} unionBatches={unionBatches}");
         return result;
     }
 
