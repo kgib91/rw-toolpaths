@@ -41,7 +41,20 @@ public sealed record ProfileOptions
     /// </summary>
     public bool ExcludeInnerEnvelopes { get; init; }
 
-    /// <summary>Material deliberately left on the wall for a later finishing pass.</summary>
+    /// <summary>For Center profiles, skip original filled components that cannot
+    /// admit the supplied minimum positive commanded cutter footprint. Opt-in;
+    /// accepted contours retain their complete authored boundaries.</summary>
+    public bool SkipRegionsWithoutToolAccess { get; init; }
+
+    /// <summary>Minimum physically cutting footprint radius, including machine XY
+    /// precision. Used only by the Center access policy. Null means the requested
+    /// depth has no positive cutting command; zero permits an ideal point footprint.</summary>
+    public double? MinimumOpeningRadius { get; init; }
+
+    /// <summary>Signed radial wall offset after cutter compensation. Positive leaves material;
+    /// negative overcuts, and values below minus the tool radius cross the source boundary.
+    /// Original inside openings and outside-profile holes must fit the physical cutter
+    /// independently of this offset; eligible contours retain the requested signed value.</summary>
     public double StockToLeave { get; init; }
 
     /// <summary>Extra passes at final depth that remove the deflection the first pass left.</summary>
@@ -53,8 +66,14 @@ public sealed record ProfileOptions
 
     public GeometryTolerances Tolerances { get; init; } = GeometryTolerances.Default;
 
+    /// <summary>Optional geometric policy for travel between contours.</summary>
+    public ILinkClearance? LinkClearance { get; init; }
+
     /// <summary>Holding tabs; <c>null</c> cuts straight through.</summary>
     public TabOptions? Tabs { get; init; }
+
+    /// <summary>Common material-space holding plan projected onto this profile's prepared rings.</summary>
+    public HoldingTabPlan? SharedHoldingPlan { get; init; }
 
     /// <summary>Stock frame used by material-space tab planning; falls back to a padded bounding box.</summary>
     public IReadOnlyList<PointD>? StockOutline { get; init; }
@@ -67,6 +86,9 @@ public sealed record ProfileOptions
 
     /// <summary>Optional boundary that rings are trimmed to.</summary>
     public IReadOnlyList<PointD>? ClipBoundary { get; init; }
+
+    /// <summary>Build the optional planar footprint; disable when consumers use physical sweeps.</summary>
+    public bool CalculateSweptArea { get; init; } = true;
 
     /// <summary>
     /// Whether to omit edge loops by emitting profile centerlines only within
@@ -107,17 +129,93 @@ public static class ProfileToolpaths
         if (regions.Count == 0 || tool.Radius <= 1e-6 || depth.Depth <= 0)
             return ToolpathPlan.Empty;
 
+        var prepared = Prepare(regions, tool, options, cancellationToken);
+        var rings = prepared.Rings;
+        var sourceMaterial = prepared.SourceMaterial;
+        var sourceComponents = prepared.SourceComponents;
+        bool filterOutsideBoundaries = options.Side == ProfileSide.Outside;
+        bool includeOuter = !filterOutsideBoundaries || options.IncludeOuterEnvelopes;
+        bool includeInner = !filterOutsideBoundaries || !options.ExcludeInnerEnvelopes;
+        bool omitEdgeLoops = options.OmitEdgeLoops && options.ClipBoundary is { Count: >= 3 };
+        bool clipCenterlines = options.Side == ProfileSide.OnLine && options.ClipBoundary is { Count: >= 3 };
+        int edgeBypassCount = prepared.EdgeBypassCount;
+
+        if (rings.Count == 0)
+            return ToolpathPlan.Empty;
+
+        HoldingTabReport? tabReport = null;
+        var tabHook = BuildTabHook(rings, sourceMaterial, tool, depth, options, out tabReport);
+
+        ProfileRouteForest route = ProfileRoutePlanner.Plan(
+            rings,
+            sourceComponents,
+            tool.Radius,
+            cancellationToken);
+        ToolpathPlan plan = ProfileRouteMaterializer.Emit(
+            rings,
+            route,
+            depth,
+            options,
+            tool,
+            cancellationToken,
+            tabHook);
+
+        int interiorFragmentCount = plan.Toolpaths.Count;
+        if (omitEdgeLoops || clipCenterlines)
+        {
+            plan = ClipToolpathsToInterior(
+                plan,
+                options.ClipBoundary!,
+                tool,
+                options.Tolerances,
+                clipCenterlines,
+                options.CalculateSweptArea,
+                out interiorFragmentCount);
+        }
+
+        PerfLog.Stop("ProfileToolpaths.Generate", t0,
+            $"regions={regions.Count} side={options.Side} outer={includeOuter} inner={includeInner} rings={rings.Count} " +
+            $"omitEdgeLoops={omitEdgeLoops} clipCenterlines={clipCenterlines} edgeBypasses={edgeBypassCount} " +
+            $"interiorFragments={interiorFragmentCount} paths={plan.Toolpaths.Count} " +
+            $"tabs={(options.Tabs is null ? "off" : tabReport?.Summary ?? "on")}");
+
+        // Run the common execution policy AFTER optional clipping. A deleted
+        // outside fragment cannot remain an earlier-execution witness.
+        var executed=ToolpathContinuationPlanner.Reconnect(plan.Toolpaths,"profile",2*tool.Radius,cancellationToken);
+        return new ToolpathPlan(
+            executed,
+            plan.SweptArea.ToList(),
+            plan.Diagnostics with{PathCount=executed.Count,CutLength=MeasureLength(executed,ToolpathSpanKind.Cut),
+                LinkLength=MeasureLength(executed,ToolpathSpanKind.Link)},
+            tabReport);
+    }
+
+    /// <summary>Prepare the exact compensated rings used by generation and shared tab planning.</summary>
+    public static PreparedProfile Prepare(IReadOnlyList<MillingRegion> regions, ToolGeometry tool,
+        ProfileOptions options, CancellationToken cancellationToken = default)
+    {
+        if (!double.IsFinite(options.StockToLeave))
+            throw new ArgumentOutOfRangeException(nameof(options), "Profile edge offset must be finite.");
+        if (options.Side == ProfileSide.OnLine && Math.Abs(options.StockToLeave) > 1e-6)
+            throw new ArgumentException("A nonzero edge offset requires an Inside or Outside profile orientation.", nameof(options));
+        bool centerOpeningAccess = options.Side == ProfileSide.OnLine && options.SkipRegionsWithoutToolAccess;
+        if (centerOpeningAccess && options.MinimumOpeningRadius is double radius
+            && (!double.IsFinite(radius) || radius < 0))
+            throw new ArgumentOutOfRangeException(nameof(options), "A Center opening radius must be finite and nonnegative.");
+
         double offset = options.Side switch
         {
             ProfileSide.Outside => tool.Radius + options.StockToLeave,
             ProfileSide.Inside => -(tool.Radius + options.StockToLeave),
             _ => 0.0,
         };
+        Console.WriteLine($"[ProfileToolpaths.EdgeOffset] side={options.Side} toolRadius={tool.Radius:R} "
+            + $"edgeOffset={options.StockToLeave:R} signedBoundaryOffset={offset:R} regions={regions.Count}");
 
         var rings = new List<OffsetRing>();
         var sourceMaterial = new List<List<PointD>>();
         var sourceComponents = new List<ProfileSourceComponent>();
-        int componentIndex = 0;
+        var originalComponents = new List<PolygonComponent>();
         bool filterOutsideBoundaries = options.Side == ProfileSide.Outside;
         bool includeOuter = !filterOutsideBoundaries || options.IncludeOuterEnvelopes;
         bool includeInner = !filterOutsideBoundaries || !options.ExcludeInnerEnvelopes;
@@ -130,36 +228,82 @@ public static class ProfileToolpaths
                 new[] { region.Outer },
                 region.Holes);
 
-            foreach (var component in components)
+            originalComponents.AddRange(components);
+        }
+
+        // Keep the original topology for stock-edge and holding-tab planning. Fit
+        // eligibility belongs to the source opening, before an authored wall offset
+        // can enlarge it enough to manufacture a cutter entry.
+        for (int componentIndex = 0; componentIndex < originalComponents.Count; componentIndex++)
+        {
+            var component = originalComponents[componentIndex];
+            var originalMaterial = new List<IReadOnlyList<PointD>>(1 + component.Holes.Count) { component.Outer };
+            originalMaterial.AddRange(component.Holes);
+            sourceMaterial.Add(component.Outer);
+            sourceMaterial.AddRange(component.Holes);
+            sourceComponents.Add(new ProfileSourceComponent(componentIndex, originalMaterial));
+        }
+
+        int skippedComponents = 0, skippedCenterComponents = 0, skippedHoles = 0;
+        for (int componentIndex = 0; componentIndex < originalComponents.Count; componentIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var component = originalComponents[componentIndex];
+            var material = new List<IReadOnlyList<PointD>>(sourceComponents[componentIndex].Boundaries);
+            if (centerOpeningAccess && (options.MinimumOpeningRadius is not double minimumRadius
+                || !PolygonOps.HasInteriorPointWithClearance(material, minimumRadius, cancellationToken)))
             {
-                var material = new List<IReadOnlyList<PointD>>(1 + component.Holes.Count) { component.Outer };
-                material.AddRange(component.Holes);
+                skippedComponents++;
+                skippedCenterComponents++;
+                LogSkippedOpening(options.MinimumOpeningRadius.HasValue
+                    ? "center-minimum-command-footprint" : "center-no-positive-command-depth",
+                    componentIndex, component.Outer, options.MinimumOpeningRadius, options.StockToLeave);
+                continue;
+            }
+            if (options.Side == ProfileSide.Inside
+                && !PolygonOps.HasInteriorPointWithClearance(material, tool.Radius, cancellationToken))
+            {
+                skippedComponents++;
+                LogSkippedOpening("inside-component", componentIndex, component.Outer, tool.Radius, options.StockToLeave);
+                continue;
+            }
 
-                sourceMaterial.Add(component.Outer);
-                sourceMaterial.AddRange(component.Holes);
-                sourceComponents.Add(new ProfileSourceComponent(
-                    componentIndex,
-                    material.Select(boundary => (IReadOnlyList<PointD>)boundary).ToList()));
-
-                var contours = Math.Abs(offset) < 1e-9
-                    ? material.Select(boundary => new List<PointD>(boundary)).ToList()
-                    : PolygonOps.Offset(
-                        material,
-                        offset,
-                        options.Tolerances.ArcTolerance,
-                        options.Tolerances.SimplifyTolerance);
-
-                foreach (var contour in contours)
+            if (options.Side == ProfileSide.Outside)
+            {
+                for (int holeIndex = component.Holes.Count - 1; holeIndex >= 0; holeIndex--)
                 {
-                    if (contour.Count < 3)
+                    var hole = component.Holes[holeIndex];
+                    // Nested retained islands are separate source components. Subtract
+                    // all original material so they also participate in the void's fit proof.
+                    var opening = PolygonOps.Difference(new[] { hole }, sourceMaterial);
+                    if (PolygonOps.HasInteriorPointWithClearance(opening, tool.Radius, cancellationToken))
                         continue;
-
-                    rings.Add(RingOffsetEngine.CreateRing(contour, level: 0, componentIndex));
+                    material.RemoveAt(holeIndex + 1);
+                    skippedHoles++;
+                    LogSkippedOpening("outside-hole", componentIndex, hole, tool.Radius, options.StockToLeave);
                 }
+            }
 
-                componentIndex++;
+            var contours = Math.Abs(offset) < 1e-9
+                ? material.Select(boundary => new List<PointD>(boundary)).ToList()
+                : PolygonOps.Offset(
+                    material,
+                    offset,
+                    options.Tolerances.ArcTolerance,
+                    options.Tolerances.SimplifyTolerance);
+
+            foreach (var contour in contours)
+            {
+                if (contour.Count < 3)
+                    continue;
+                rings.Add(RingOffsetEngine.CreateRing(contour, level: 0, componentIndex));
             }
         }
+        Console.WriteLine($"[ProfileToolpaths.OpeningFit] side={options.Side} "
+            + $"physicalRadius={tool.Radius:R} edgeOffset={options.StockToLeave:R} "
+            + $"centerOpeningAccess={centerOpeningAccess} minimumOpeningRadius={options.MinimumOpeningRadius?.ToString("R", System.Globalization.CultureInfo.InvariantCulture) ?? "unavailable"} "
+            + $"sourceComponents={originalComponents.Count} skippedComponents={skippedComponents} "
+            + $"skippedCenterComponents={skippedCenterComponents} skippedHoles={skippedHoles} rings={rings.Count}");
 
         // Compensation needs every material boundary: omitting an outer boundary before
         // PolygonOps.Offset reinterprets its holes as positive islands. Filter the final rings
@@ -171,9 +315,9 @@ public static class ProfileToolpaths
             && options.ClipBoundary is { Count: >= 3 };
         if (options.ClipBoundary is { Count: >= 3 } clipBoundary)
         {
-            // Standard clipping retains closed rings by intersecting their filled area. Outside
-            // clipping instead slices the emitted centreline, preserving only interior spans.
-            if (!omitEdgeLoops)
+            // Center has no compensated filled area: intersecting that area would invent
+            // a closing cut on the stock boundary. Slice the emitted original path instead.
+            if (!omitEdgeLoops && options.Side != ProfileSide.OnLine)
                 rings = ClipRings(rings, clipBoundary);
         }
 
@@ -197,48 +341,16 @@ public static class ProfileToolpaths
             }
         }
 
-        if (rings.Count == 0)
-            return ToolpathPlan.Empty;
+        return new PreparedProfile(rings, sourceMaterial, sourceComponents, edgeBypassCount);
+    }
 
-        HoldingTabReport? tabReport = null;
-        var tabHook = BuildTabHook(rings, sourceMaterial, tool, depth, options, out tabReport);
-
-        ProfileRouteForest route = ProfileRoutePlanner.Plan(
-            rings,
-            sourceComponents,
-            tool.Radius,
-            cancellationToken);
-        ToolpathPlan plan = ProfileRouteMaterializer.Emit(
-            rings,
-            route,
-            depth,
-            options,
-            tool,
-            cancellationToken,
-            tabHook);
-
-        int interiorFragmentCount = plan.Toolpaths.Count;
-        if (omitEdgeLoops)
-        {
-            plan = ClipToolpathsToInterior(
-                plan,
-                options.ClipBoundary!,
-                tool,
-                options.Tolerances,
-                out interiorFragmentCount);
-        }
-
-        PerfLog.Stop("ProfileToolpaths.Generate", t0,
-            $"regions={regions.Count} side={options.Side} outer={includeOuter} inner={includeInner} rings={rings.Count} " +
-            $"omitEdgeLoops={omitEdgeLoops} edgeBypasses={edgeBypassCount} " +
-            $"interiorFragments={interiorFragmentCount} paths={plan.Toolpaths.Count} " +
-            $"tabs={(options.Tabs is null ? "off" : tabReport?.Summary ?? "on")}");
-
-        return new ToolpathPlan(
-            plan.Toolpaths.ToList(),
-            plan.SweptArea.ToList(),
-            plan.Diagnostics,
-            tabReport);
+    private static void LogSkippedOpening(string kind, int componentIndex,
+        IReadOnlyList<PointD> boundary, double? physicalRadius, double edgeOffset)
+    {
+        Console.WriteLine($"[ProfileToolpaths.OpeningSkipped] kind={kind} component={componentIndex} "
+            + $"physicalRadius={physicalRadius?.ToString("R", System.Globalization.CultureInfo.InvariantCulture) ?? "unavailable"} edgeOffset={edgeOffset:R} "
+            + $"bounds=({boundary.Min(point => point.x):R},{boundary.Min(point => point.y):R})"
+            + $"-({boundary.Max(point => point.x):R},{boundary.Max(point => point.y):R})");
     }
 
     private static List<OffsetRing> BypassStockEdgeFillets(
@@ -250,7 +362,7 @@ public static class ProfileToolpaths
         out int bypassCount)
     {
         bypassCount = 0;
-        double compensatedOffset = toolRadius + Math.Max(0, stockToLeave);
+        double compensatedOffset = toolRadius + stockToLeave;
         if (compensatedOffset <= 1e-6)
             return rings.ToList();
 
@@ -467,6 +579,8 @@ public static class ProfileToolpaths
         IReadOnlyList<PointD> clipBoundary,
         ToolGeometry tool,
         GeometryTolerances tolerances,
+        bool includeBoundary,
+        bool calculateSweptArea,
         out int interiorFragmentCount)
     {
         var fragments = new List<TaggedToolpath>();
@@ -477,6 +591,7 @@ public static class ProfileToolpaths
             var pathFragments = ClipToolpathToInterior(
                 toolpath,
                 clipBoundary,
+                includeBoundary,
                 out int pathSourceMoveCount,
                 out int pathRetainedMoveCount);
             fragments.AddRange(pathFragments);
@@ -486,7 +601,7 @@ public static class ProfileToolpaths
 
         interiorFragmentCount = fragments.Count;
         var sweptCenterlines = new List<IReadOnlyList<PointD>>();
-        foreach (var fragment in fragments)
+        foreach (var fragment in calculateSweptArea ? fragments : Enumerable.Empty<TaggedToolpath>())
         {
             if (!HasPlanarMotion(fragment.Points))
                 continue;
@@ -512,15 +627,16 @@ public static class ProfileToolpaths
         };
 
         Console.WriteLine(
-            $"[ProfileToolpaths.ClipOutside] sourcePaths={source.Toolpaths.Count} "
+            $"[ProfileToolpaths.ClipCenterlines] includeBoundary={includeBoundary} sourcePaths={source.Toolpaths.Count} "
             + $"sourceMoves={sourceMoveCount} retainedMoves={retainedMoveCount} "
-            + $"interiorFragments={fragments.Count} sweptPolygons={sweptArea.Count}");
+            + $"interiorFragments={fragments.Count} calculateSweptArea={calculateSweptArea} sweptPolygons={sweptArea.Count}");
         return new ToolpathPlan(fragments, sweptArea, diagnostics, source.TabReport);
     }
 
     private static List<TaggedToolpath> ClipToolpathToInterior(
         TaggedToolpath source,
         IReadOnlyList<PointD> clipBoundary,
+        bool includeBoundary,
         out int sourceMoveCount,
         out int retainedMoveCount)
     {
@@ -554,7 +670,7 @@ public static class ProfileToolpaths
             Point3D end = source.Points[pointIndex];
             ToolpathSpanKind kind = moveKinds[pointIndex - 1];
             bool retainedThisMove = false;
-            foreach (var (startT, endT) in FindInteriorIntervals(start, end, clipBoundary))
+            foreach (var (startT, endT) in FindInteriorIntervals(start, end, clipBoundary, includeBoundary))
             {
                 Point3D clippedStart = Interpolate(start, end, startT);
                 Point3D clippedEnd = Interpolate(start, end, endT);
@@ -593,7 +709,8 @@ public static class ProfileToolpaths
     private static IEnumerable<(double Start, double End)> FindInteriorIntervals(
         Point3D start,
         Point3D end,
-        IReadOnlyList<PointD> boundary)
+        IReadOnlyList<PointD> boundary,
+        bool includeBoundary)
     {
         const double tolerance = 1e-10;
         var splitPoints = new List<double> { 0, 1 };
@@ -607,6 +724,23 @@ public static class ProfileToolpaths
                     startPoint, endPoint, boundaryStart, boundaryEnd, out double parameter))
             {
                 splitPoints.Add(parameter);
+            }
+            else
+            {
+                // Collinear boundary spans still need their endpoints as split locations.
+                // Otherwise a midpoint on the edge could retain an extension outside stock.
+                double dx = endPoint.x - startPoint.x;
+                double dy = endPoint.y - startPoint.y;
+                double lengthSquared = dx * dx + dy * dy;
+                if (lengthSquared > tolerance * tolerance)
+                {
+                    foreach (PointD vertex in new[] { boundaryStart, boundaryEnd })
+                    {
+                        double t = ((vertex.x - startPoint.x) * dx + (vertex.y - startPoint.y) * dy) / lengthSquared;
+                        if (t >= 0 && t <= 1 && PointIsOnSegment(vertex, startPoint, endPoint))
+                            splitPoints.Add(t);
+                    }
+                }
             }
         }
 
@@ -631,7 +765,7 @@ public static class ProfileToolpaths
 
             double midpoint = (intervalStart + intervalEnd) * 0.5;
             Point3D midpointPoint = Interpolate(start, end, midpoint);
-            if (IsPointStrictlyInsidePolygon(new PointD(midpointPoint.X, midpointPoint.Y), boundary))
+            if (IsPointInsidePolygon(new PointD(midpointPoint.X, midpointPoint.Y), boundary, includeBoundary))
                 yield return (intervalStart, intervalEnd);
         }
     }
@@ -670,7 +804,7 @@ public static class ProfileToolpaths
         return true;
     }
 
-    private static bool IsPointStrictlyInsidePolygon(PointD point, IReadOnlyList<PointD> polygon)
+    private static bool IsPointInsidePolygon(PointD point, IReadOnlyList<PointD> polygon, bool includeBoundary)
     {
         bool inside = false;
         for (int currentIndex = 0, previousIndex = polygon.Count - 1;
@@ -680,7 +814,7 @@ public static class ProfileToolpaths
             PointD current = polygon[currentIndex];
             PointD previous = polygon[previousIndex];
             if (PointIsOnSegment(point, previous, current))
-                return false;
+                return includeBoundary;
 
             bool crossesRay = (current.y > point.y) != (previous.y > point.y)
                 && point.x < (previous.x - current.x) * (point.y - current.y)
@@ -816,12 +950,12 @@ public static class ProfileToolpaths
 
         var zonesByRing = new Dictionary<int, TabZone[]>();
 
-        if (tabs.ConstrainFloating)
+        if (tabs.ConstrainFloating || options.SharedHoldingPlan != null)
         {
             var ringPoints = rings.Select(r => r.Points).ToList();
             var perimeters = rings.Select(r => r.Perimeter).ToList();
 
-            var plan = HoldingTabPlanner.Plan(
+            var plan = options.SharedHoldingPlan ?? HoldingTabPlanner.Plan(
                 ringPoints,
                 perimeters,
                 options.StockOutline is null ? null : new List<PointD>(options.StockOutline),
@@ -1013,4 +1147,16 @@ public static class ProfileToolpaths
         }
         return clipped;
     }
+}
+
+/// <summary>Prepared geometry; ring indices match HoldingTabPlan.RingZones.</summary>
+public sealed class PreparedProfile
+{
+    internal PreparedProfile(List<OffsetRing> rings, List<List<PointD>> material,
+        List<ProfileSourceComponent> components, int edgeBypassCount)
+    { Rings = rings; SourceMaterial = material; SourceComponents = components; EdgeBypassCount = edgeBypassCount; }
+    public List<OffsetRing> Rings { get; }
+    public List<List<PointD>> SourceMaterial { get; }
+    internal List<ProfileSourceComponent> SourceComponents { get; }
+    internal int EdgeBypassCount { get; }
 }

@@ -112,6 +112,10 @@ public static class LinkClearance
         private readonly double _tolerance;
         private readonly PolygonOps.BoundarySegmentIndex _boundary;
         private long _queries, _fallbacks;
+        private readonly object _memoLock=new();
+        private readonly Dictionary<(Point64,Point64),bool> _memo=new();
+        private readonly Queue<(Point64,Point64)> _memoOrder=new();
+        private long _memoHits;
 
         internal RegionClearance(Paths64 travelRegion, double tolerance)
         {
@@ -129,12 +133,15 @@ public static class LinkClearance
 
             var start = new Point64((long)Math.Round(from.X * PathUtils.Scale), (long)Math.Round(from.Y * PathUtils.Scale));
             var end = new Point64((long)Math.Round(to.X * PathUtils.Scale), (long)Math.Round(to.Y * PathUtils.Scale));
-            bool? prepared = _boundary.ContainsSegment(start, end, _tolerance * PathUtils.Scale);
             long queries = Interlocked.Increment(ref _queries);
+            lock(_memoLock)
+                if(_memo.TryGetValue((start,end),out bool cached))
+                {Interlocked.Increment(ref _memoHits);return cached;}
+            bool? prepared = _boundary.ContainsSegment(start, end, _tolerance * PathUtils.Scale);
             if (!prepared.HasValue) Interlocked.Increment(ref _fallbacks);
             if ((queries & 4095) == 0)
-                Console.WriteLine($"[LinkClearance.Queries] queries={queries} polygonFallbacks={Interlocked.Read(ref _fallbacks)}");
-            if (prepared.HasValue) return prepared.Value;
+                Console.WriteLine($"[LinkClearance.Queries] queries={queries} polygonFallbacks={Interlocked.Read(ref _fallbacks)} immutableXYMemoHits={Interlocked.Read(ref _memoHits)} maximumMemoEntries=65536");
+            if (prepared.HasValue) return Remember(prepared.Value);
 
             var clipper = new Clipper64();
             clipper.AddOpenSubject(new Path64(2)
@@ -148,7 +155,18 @@ public static class LinkClearance
             var strayed = new Paths64();
             clipper.Execute(ClipType.Difference, FillRule.NonZero, enclosed, strayed);
 
-            return StrayLength(strayed) <= _tolerance;
+            return Remember(StrayLength(strayed) <= _tolerance);
+
+            bool Remember(bool result)
+            {
+                lock(_memoLock)
+                if(!_memo.ContainsKey((start,end)))
+                {
+                    if(_memo.Count==65536)_memo.Remove(_memoOrder.Dequeue());
+                    _memo.Add((start,end),result);_memoOrder.Enqueue((start,end));
+                }
+                return result;
+            }
         }
 
         private static double StrayLength(Paths64 paths)

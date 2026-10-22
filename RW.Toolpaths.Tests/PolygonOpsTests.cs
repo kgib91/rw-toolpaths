@@ -11,6 +11,65 @@ namespace RW.Toolpaths.Tests;
 public class PolygonOpsTests
 {
     [Fact]
+    public void DilationDropsAnUnreachableStencilSliverWithoutLosingANeighboringVoid()
+    {
+        // Reduced from the imported result.svg outside-profile failure. The narrow
+        // cavity cannot admit this cutter, but joined offsets and independently
+        // tessellated boundary strokes both leave a microscopic inverted hole.
+        var collapsedHole = new List<PointD>
+        {
+            new(13.087799072265625, 21.845703125),
+            new(4.62451171875, 1.110015869140625),
+            new(2.09765625, 5.787750244140625),
+            new(1.94268798828125, 6.002593994140625),
+            new(1.844970703125, 6.123046875),
+            new(1.79779052734375, 6.175140380859375),
+            new(1.753997802734375, 6.227203369140625),
+            new(1.73040771484375, 6.25),
+            new(1.710205078125, 6.272796630859375),
+        };
+        // Independent fit proof: this entire cavity lies inside a strip narrower
+        // than the cutter diameter, including the curved tip represented above.
+        var a = collapsedHole[0];
+        var b = collapsedHole[1];
+        double edgeLength = Math.Sqrt(Math.Pow(b.x - a.x, 2) + Math.Pow(b.y - a.y, 2));
+        var distances = collapsedHole.Select(p =>
+            ((b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)) / edgeLength).ToArray();
+        Assert.True(distances.Max() - distances.Min() < 6.35);
+        var reachableHole = Rect(30, 0, 50, 20);
+        reachableHole.Reverse();
+        var result = PolygonOps.Offset(
+            new[] { Rect(-10, -10, 70, 40), collapsedHole, reachableHole },
+            (double)3.175f, arcTolerance: 0.02, simplifyTolerance: 0);
+
+        Assert.Equal(2, result.Count);
+        var compensatedVoid = Assert.Single(result.Where(ring => PolygonOps.SignedArea(ring) < 0));
+        var bounds = Bounds(compensatedVoid);
+        Assert.InRange(bounds.MinX, 33.17, 33.20);
+        Assert.InRange(bounds.MaxX, 46.80, 46.83);
+        Assert.InRange(bounds.MinY, 3.17, 3.20);
+        Assert.InRange(bounds.MaxY, 16.80, 16.83);
+    }
+
+    [Fact]
+    public void DilationPreservesAReachableVoidSmallerThanTheArtifactAreaThreshold()
+    {
+        var outer = Rect(-20, -20, 20, 20);
+        var hole = Rect(-3.18, -3.18, 3.18, 3.18);
+        hole.Reverse();
+        var result = PolygonOps.Offset(new[] { outer, hole }, 3.175,
+            arcTolerance: 0.001, simplifyTolerance: 0);
+
+        var retainedHole = Assert.Single(result.Where(ring => PolygonOps.SignedArea(ring) < 0));
+        Assert.InRange(Math.Abs(PolygonOps.SignedArea(retainedHole)), 0.000098, 0.000102);
+        Assert.All(retainedHole, point =>
+        {
+            Assert.InRange(Math.Abs(point.x), 0.005 - 1 / PathUtils.Scale, 0.005 + 1 / PathUtils.Scale);
+            Assert.InRange(Math.Abs(point.y), 0.005 - 1 / PathUtils.Scale, 0.005 + 1 / PathUtils.Scale);
+        });
+    }
+
+    [Fact]
     public void ChunkedOpenStrokePreservesItsHoleAndEndCaps()
     {
         var circle = Circle(0, 0, 10, 9000); circle.Add(circle[0]);
@@ -22,6 +81,40 @@ public class PolygonOpsTests
         foreach (var point in ring)
             Assert.InRange(Math.Sqrt(point.x * point.x + point.y * point.y), 9 - 0.001, 11 + 0.001);
         Assert.InRange(Math.Abs(stroke.Sum(p => Clipper.Area(new PathD(p)))), 40 * Math.PI - 0.1, 40 * Math.PI + 0.1);
+    }
+
+    [Fact]
+    public void DenseShortStrokeAndSharedChunkEndpointsRetainLiteralCapsuleGeometry()
+    {
+        // Below the former 8,192-point threshold. Dense overlapping joins are
+        // representative of emitted clipped Pocket traces, not extra stock.
+        var line=Enumerable.Range(0,1025).Select(i=>new PointD(i/1024d*4,0)).ToArray();
+        var stroke=PolygonOps.BufferOpenCenterlines([line],.5,.001);
+        Assert.True(PolygonOps.Contains(stroke,-.499,0));
+        Assert.True(PolygonOps.Contains(stroke,4.499,0));
+        Assert.False(PolygonOps.Contains(stroke,-.501,0));
+        Assert.False(PolygonOps.Contains(stroke,4.501,0));
+        for(int i=0;i<=32;i++)
+        {
+            Assert.True(PolygonOps.Contains(stroke,i/32d*4,.499));
+            Assert.False(PolygonOps.Contains(stroke,i/32d*4,.501));
+        }
+        Assert.False(PolygonOps.Contains(stroke,10,0));
+    }
+
+    [Fact]
+    public void DenseFilledDilationKeepsInteriorAndSignedHoles()
+    {
+        var outer=Circle(0,0,10,1024);var hole=Circle(0,0,5,512);hole.Reverse();
+        var expanded=PolygonOps.Buffer([outer,hole],1,.001);
+        Assert.False(PolygonOps.Contains(expanded,0,0));
+        Assert.False(PolygonOps.Contains(expanded,3.998,0));
+        Assert.True(PolygonOps.Contains(expanded,4.002,0));
+        Assert.True(PolygonOps.Contains(expanded,7,0));
+        Assert.True(PolygonOps.Contains(expanded,10.998,0));
+        Assert.False(PolygonOps.Contains(expanded,11.002,0));
+        var solid=PolygonOps.Buffer([outer],1,.001);
+        Assert.True(PolygonOps.Contains(solid,0,0));
     }
 
     [Fact]

@@ -90,9 +90,10 @@ public static class PolygonSimplify
     }
 
     /// <summary>
-    /// Applies <see cref="Rdp"/> to every polygon, dropping any that degenerate below
-    /// three vertices. Polygons of six or fewer vertices are passed through untouched
-    /// so that rectangles and triangles never lose a corner to rounding.
+    /// Applies <see cref="Rdp"/> to every nondegenerate polygon. A valid source
+    /// contour survives unchanged when simplification collapses it. Polygons of
+    /// six or fewer vertices are passed through untouched so that rectangles and
+    /// triangles never lose a corner to rounding.
     /// </summary>
     public static List<List<PointD>> RdpAll(
         IEnumerable<IReadOnlyList<PointD>> polygons,
@@ -104,12 +105,23 @@ public static class PolygonSimplify
             if (polygon.Count < 3)
                 continue;
 
+            double sourceArea = PolygonOps.SignedArea(polygon);
+            if (!double.IsFinite(sourceArea) || sourceArea == 0)
+                continue;
+
             var simplified = polygon.Count > 6
                 ? Rdp(polygon, epsilon)
                 : new List<PointD>(polygon);
 
-            if (simplified.Count >= 3)
-                output.Add(simplified);
+            double simplifiedArea = simplified.Count >= 3 ? PolygonOps.SignedArea(simplified) : 0;
+            if (simplified.Count < 3 || !double.IsFinite(simplifiedArea) || simplifiedArea == 0)
+            {
+                Console.WriteLine($"[PolygonSimplify.RdpAll] result=retain-source reason=degenerate-simplification "
+                    + $"sourcePoints={polygon.Count} simplifiedPoints={simplified.Count} "
+                    + $"sourceArea={sourceArea:R} simplifiedArea={simplifiedArea:R} epsilon={epsilon:R}");
+                simplified = new List<PointD>(polygon);
+            }
+            output.Add(simplified);
         }
         return output;
     }

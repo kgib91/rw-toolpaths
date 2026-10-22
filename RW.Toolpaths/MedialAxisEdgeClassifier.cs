@@ -1,8 +1,9 @@
 ﻿using Clipper2Lib;
+using System.Diagnostics;
 
 namespace RW.Toolpaths;
 
-internal static class MedialAxisEdgeClassifier
+internal static partial class MedialAxisEdgeClassifier
 {
     internal static class Colors
     {
@@ -42,8 +43,34 @@ internal static class MedialAxisEdgeClassifier
     internal static void ClassifyEdges(
         IReadOnlyList<EdgeData> edges,
         IReadOnlyList<PointD> boundary,
-        IReadOnlyList<IReadOnlyList<PointD>> holes)
+        IReadOnlyList<IReadOnlyList<PointD>> holes,
+        CancellationToken cancellationToken = default, Action<string>? diagnostic = null,
+        Action<double>? progress = null)
+        => ClassifyEdgesCore(edges, boundary, holes, cancellationToken, diagnostic, progress,
+            reference: string.Equals(Environment.GetEnvironmentVariable("RW_TOOLPATHS_CLASSIFICATION_REFERENCE"),
+                "1", StringComparison.Ordinal));
+
+    // Diagnostic original traversal, with the same boundary and finite-site
+    // predicates. It never changes native sites, edge order or output ownership.
+    internal static void ClassifyEdgesReference(
+        IReadOnlyList<EdgeData> edges, IReadOnlyList<PointD> boundary,
+        IReadOnlyList<IReadOnlyList<PointD>> holes,
+        CancellationToken cancellationToken = default, Action<string>? diagnostic = null,
+        Action<double>? progress = null)
+        => ClassifyEdgesCore(edges, boundary, holes, cancellationToken, diagnostic, progress, reference: true);
+
+    private static void ClassifyEdgesCore(
+        IReadOnlyList<EdgeData> edges, IReadOnlyList<PointD> boundary,
+        IReadOnlyList<IReadOnlyList<PointD>> holes, CancellationToken cancellationToken,
+        Action<string>? diagnostic, Action<double>? progress, bool reference)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        long preparationAt = Stopwatch.GetTimestamp();
+        var preparedBoundary = new PreparedRingContainment(boundary, cancellationToken);
+        var preparedHoles = holes.Select(hole => new PreparedRingContainment(hole, cancellationToken)).ToArray();
+        var containment = new PreparedRegionContainment(preparedBoundary, preparedHoles, cancellationToken,
+            useHoleIndex: !reference, memoLimit: reference ? 0 : PreparedRegionContainment.DefaultMemoLimit);
+        double preparationMs = Stopwatch.GetElapsedTime(preparationAt).TotalMilliseconds;
         var candidates = new List<EdgeData>();
 
         foreach (var edge in edges)
@@ -70,15 +97,27 @@ internal static class MedialAxisEdgeClassifier
         int outsideBoundaryCount = 0;
         int insideHoleCount = 0;
 
+        long progressAt = Stopwatch.GetTimestamp();
+        int completed = 0;
         foreach (var edge in candidates)
         {
+            if ((completed++ & 1023) == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if ((diagnostic is not null || progress is not null) && Stopwatch.GetElapsedTime(progressAt).TotalMilliseconds >= 250)
+                {
+                    diagnostic?.Invoke($"stage=voronoi-classification event=progress completed={completed} total={candidates.Count}");
+                    progress?.Invoke((double)completed / Math.Max(1, candidates.Count));
+                    progressAt = Stopwatch.GetTimestamp();
+                }
+            }
             if (edge.Color == Colors.InnerPrimary)
             {
                 continue;
             }
 
             var nonBorderPoint = GetNonBorderPoint(edge);
-            if (IsInsideRegion(nonBorderPoint, boundary, holes, out bool isInsideHole))
+            if (containment.Contains(nonBorderPoint, out bool isInsideHole))
             {
                 insideCount++;
                 edge.Color = Colors.InnerPrimary;
@@ -98,6 +137,22 @@ internal static class MedialAxisEdgeClassifier
             }
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
+        progress?.Invoke(1);
+        diagnostic?.Invoke($"stage=voronoi-classification event=complete completed={candidates.Count} total={candidates.Count} " +
+            $"inside={insideCount} outside={outsideBoundaryCount} holes={insideHoleCount} " +
+            $"sourceEdges={boundary.Count + holes.Sum(hole => hole.Count)} " +
+            $"edgeTests={preparedBoundary.EdgeTests + preparedHoles.Sum(hole => hole.EdgeTests)}");
+        string evidence = $"mode={(reference ? "original-all-holes" : "exact-hole-bounds-and-immutable-point-memo")} "
+            + $"holes={holes.Count} queries={containment.Queries} memoHits={containment.MemoHits} "
+            + $"memoEntries={containment.MemoCount} memoLimit={containment.MemoLimit} memoClears={containment.MemoClears} "
+            + $"holeNodeVisits={containment.HoleNodeVisits} holeBoundsTests={containment.HoleBoundsTests} "
+            + $"holePredicateTests={containment.HolePredicateTests} preparationMs={preparationMs:F2} "
+            + $"holeIndexBuildMs={containment.HoleIndexBuildMilliseconds:F2} "
+            + $"membershipMs={containment.QueryMilliseconds:F2} originalRayPredicate=True "
+            + "inclusiveBounds=True originalSites=True sourceOrder=unchanged";
+        diagnostic?.Invoke("stage=voronoi-classification event=containment " + evidence);
+        Console.WriteLine("[BoostVoronoi.ClassificationContainment] " + evidence);
         if (IsMedialDebugEnabled())
         {
             Console.Error.WriteLine(
@@ -108,54 +163,76 @@ internal static class MedialAxisEdgeClassifier
 
     internal static List<int> SelectInnerPrimaryTraversal(
         IReadOnlyList<EdgeData> edges,
-        double filteringAngle)
+        double filteringAngle, CancellationToken cancellationToken = default,
+        Action<string>? diagnostic = null, Action<double>? progress = null)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var innerPrimary = edges
             .Where(edge => edge.Color == Colors.InnerPrimary)
             .ToList();
 
-        var remaining = new HashSet<int>(innerPrimary.Select(edge => edge.Index));
-        var walked = new List<int>();
-
-        while (remaining.Count > 0)
+        // Edge indices are their positions in the provider's edge array. The old
+        // walk scanned that entire array for the first remaining edge whose
+        // predecessor had disappeared. Maintain the same ordered eligible set and
+        // update only dependents of removed edges (including removed twins).
+        var remaining = new bool[edges.Count];
+        var firstFollower = new int[edges.Count];
+        var nextFollower = new int[edges.Count];
+        Array.Fill(firstFollower, -1);
+        Array.Fill(nextFollower, -1);
+        foreach (var edge in innerPrimary) remaining[edge.Index] = true;
+        var eligible = new SortedSet<int>();
+        int remainingCount = innerPrimary.Count, smallestRemaining = 0;
+        foreach (var edge in innerPrimary)
         {
-            var start = edges[remaining.First()];
-
-            foreach (var candidate in innerPrimary)
+            if ((edge.Index & 4095) == 0) cancellationToken.ThrowIfCancellationRequested();
+            var previous = GetPreviousThroughSecondary(edges, edge);
+            if (previous is null || !remaining[previous.Index]) eligible.Add(edge.Index);
+            if (previous is not null)
             {
-                if (!remaining.Contains(candidate.Index))
-                {
-                    continue;
-                }
-
-                var previous = GetPreviousThroughSecondary(edges, candidate);
-                if (previous is null || !remaining.Contains(previous.Index))
-                {
-                    start = candidate;
-                    break;
-                }
-            }
-
-            var path = new List<int>();
-            EdgeData? current = start;
-            while (current is not null && remaining.Contains(current.Index))
-            {
-                walked.Add(current.Index);
-                path.Add(current.Index);
-                remaining.Remove(current.Index);
-                current = GetNextThroughSecondary(edges, current);
-            }
-
-            foreach (int edgeIndex in path)
-            {
-                int twinIndex = edges[edgeIndex].TwinIndex;
-                if (twinIndex >= 0)
-                {
-                    remaining.Remove(twinIndex);
-                }
+                nextFollower[edge.Index] = firstFollower[previous.Index];
+                firstFollower[previous.Index] = edge.Index;
             }
         }
 
+        void Remove(int index)
+        {
+            if (index < 0 || index >= remaining.Length || !remaining[index]) return;
+            remaining[index] = false;
+            remainingCount--;
+            eligible.Remove(index);
+            for (int dependent = firstFollower[index]; dependent >= 0; dependent = nextFollower[dependent])
+                if (remaining[dependent]) eligible.Add(dependent);
+        }
+
+        var walked = new List<int>();
+        long progressAt = Stopwatch.GetTimestamp();
+        while (remainingCount > 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if ((diagnostic is not null || progress is not null) && Stopwatch.GetElapsedTime(progressAt).TotalMilliseconds >= 250)
+            {
+                diagnostic?.Invoke($"stage=voronoi-traversal event=progress completed={innerPrimary.Count - remainingCount} total={innerPrimary.Count}");
+                progress?.Invoke((double)(innerPrimary.Count - remainingCount) / Math.Max(1, innerPrimary.Count));
+                progressAt = Stopwatch.GetTimestamp();
+            }
+            while (smallestRemaining < remaining.Length && !remaining[smallestRemaining]) smallestRemaining++;
+            var start = edges[eligible.Count > 0 ? eligible.Min : smallestRemaining];
+            var path = new List<int>();
+            EdgeData? current = start;
+            while (current is not null && remaining[current.Index])
+            {
+                if ((walked.Count & 4095) == 0) cancellationToken.ThrowIfCancellationRequested();
+                walked.Add(current.Index);
+                path.Add(current.Index);
+                Remove(current.Index);
+                current = GetNextThroughSecondary(edges, current);
+            }
+
+            foreach (int edgeIndex in path) Remove(edges[edgeIndex].TwinIndex);
+        }
+
+        progress?.Invoke(1);
         return walked
             .Where(index =>
             {
@@ -165,46 +242,64 @@ internal static class MedialAxisEdgeClassifier
             .ToList();
     }
 
-    private static bool IsInsideRegion(
-        EdgePoint point,
-        IReadOnlyList<PointD> boundary,
-        IReadOnlyList<IReadOnlyList<PointD>> holes,
-        out bool isInsideHole)
+    // Preserve the ray-crossing predicate exactly, including its asymmetric boundary
+    // convention. Y buckets eliminate edges that cannot cross this ray; strict bounds
+    // eliminate distant holes without changing equality behavior on a contour.
+    internal sealed class PreparedRingContainment
     {
-        isInsideHole = false;
-        if (!PointInRing(point, boundary))
-            return false;
+        private readonly IReadOnlyList<PointD> _ring;
+        private readonly int[][] _buckets;
+        private readonly double _minX, _maxX, _minY, _maxY, _bucketHeight;
+        internal long EdgeTests { get; private set; }
+        internal bool IsEmpty => _ring.Count == 0;
+        internal (double MinX, double MinY, double MaxX, double MaxY) Bounds
+            => (_minX, _minY, _maxX, _maxY);
 
-        foreach (var hole in holes)
+        internal PreparedRingContainment(IReadOnlyList<PointD> ring, CancellationToken cancellationToken = default)
         {
-            if (!PointInRing(point, hole))
-                continue;
-
-            isInsideHole = true;
-            return false;
+            _ring = ring;
+            if (ring.Count == 0)
+            {
+                _buckets = Array.Empty<int[]>();
+                return;
+            }
+            _minX = ring.Min(p => p.x); _maxX = ring.Max(p => p.x);
+            _minY = ring.Min(p => p.y); _maxY = ring.Max(p => p.y);
+            int count = Math.Clamp((int)Math.Sqrt(ring.Count), 1, 512);
+            _bucketHeight = _maxY > _minY ? (_maxY - _minY) / count : 1;
+            var buckets = Enumerable.Range(0, count).Select(_ => new List<int>()).ToArray();
+            for (int index = 0, previous = ring.Count - 1; index < ring.Count; previous = index++)
+            {
+                if ((index & 4095) == 0) cancellationToken.ThrowIfCancellationRequested();
+                double y0 = ring[index].y, y1 = ring[previous].y;
+                if (y0 == y1) continue;
+                int first = Bucket(Math.Min(y0, y1), count), last = Bucket(Math.Max(y0, y1), count);
+                for (int bucket = first; bucket <= last; bucket++) buckets[bucket].Add(index);
+            }
+            _buckets = buckets.Select(bucket => bucket.ToArray()).ToArray();
         }
 
-        return true;
-    }
+        private int Bucket(double y, int count) => Math.Clamp((int)((y - _minY) / _bucketHeight), 0, count - 1);
 
-    private static bool PointInRing(EdgePoint point, IReadOnlyList<PointD> ring)
-    {
-        bool inside = false;
-        for (int index = 0, previous = ring.Count - 1; index < ring.Count; previous = index++)
+        internal bool Contains(EdgePoint point)
         {
-            var current = ring[index];
-            var prior = ring[previous];
-            bool crosses = (current.y > point.Y) != (prior.y > point.Y);
-            if (!crosses)
-                continue;
-
-            double xAtY = (prior.x - current.x) * (point.Y - current.y) /
-                          (prior.y - current.y) + current.x;
-            if (xAtY > point.X)
-                inside = !inside;
+            if (_ring.Count == 0 || point.X < _minX || point.X > _maxX || point.Y < _minY || point.Y > _maxY)
+                return false;
+            bool inside = false;
+            var candidates = _buckets[Bucket(point.Y, _buckets.Length)];
+            EdgeTests += candidates.Length;
+            foreach (int index in candidates)
+            {
+                var current = _ring[index];
+                var prior = _ring[index == 0 ? _ring.Count - 1 : index - 1];
+                bool crosses = (current.y > point.Y) != (prior.y > point.Y);
+                if (!crosses) continue;
+                double xAtY = (prior.x - current.x) * (point.Y - current.y) /
+                              (prior.y - current.y) + current.x;
+                if (xAtY > point.X) inside = !inside;
+            }
+            return inside;
         }
-
-        return inside;
     }
 
     private static EdgePoint GetNonBorderPoint(EdgeData edge)

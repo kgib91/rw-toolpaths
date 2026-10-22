@@ -63,6 +63,11 @@ BV_API void*   bv_construct(const int32_t* x0, const int32_t* y0,
                              const int32_t* x1, const int32_t* y1,
                              int32_t count);
 
+/* Exact rational arrangement promoted to a common integer grid; |coordinate| <= 2^50. */
+BV_API void*   bv_construct_wide(const int64_t* x0, const int64_t* y0,
+                                const int64_t* x1, const int64_t* y1,
+                                int32_t count);
+
 BV_API void    bv_destroy(void* diagram);
 
 BV_API int32_t bv_edge_count(void* diagram);

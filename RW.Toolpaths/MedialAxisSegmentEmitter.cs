@@ -22,7 +22,8 @@ internal static class MedialAxisSegmentEmitter
         bool showSites = false,
         double tolerance = 0.1,
         ParabolaDiscretizationMethod method = ParabolaDiscretizationMethod.Error2D,
-        double maxRadius = -1)
+        double maxRadius = -1,
+        bool rejectIncompleteDiscretization = false)
     {
         var samples = new List<SamplePoint>
         {
@@ -47,7 +48,7 @@ internal static class MedialAxisSegmentEmitter
                         DiscretizeRadius(pointSite, segmentSite, tolerance, samples);
                         break;
                     case ParabolaDiscretizationMethod.Error2D:
-                        DiscretizeError2D(pointSite, segmentSite, tolerance, samples);
+                        DiscretizeError2D(pointSite, segmentSite, tolerance, samples, rejectIncompleteDiscretization);
                         break;
                     case ParabolaDiscretizationMethod.CentralAngle:
                         DiscretizeCentralAngle(pointSite, segmentSite, tolerance, samples);
@@ -117,7 +118,8 @@ internal static class MedialAxisSegmentEmitter
         MedialAxisEdgeClassifier.EdgePoint point,
         MedialAxisEdgeClassifier.SegmentSite segment,
         double tolerance,
-        List<SamplePoint> samples)
+        List<SamplePoint> samples,
+        bool rejectIncompleteDiscretization)
     {
         double dx = segment.High.X - segment.Low.X;
         double dy = segment.High.Y - segment.Low.Y;
@@ -146,6 +148,8 @@ internal static class MedialAxisSegmentEmitter
         {
             if (++iterations > MaxSubdivisionIterations)
             {
+                if (rejectIncompleteDiscretization)
+                    throw new InvalidOperationException("Certified medial graph exceeded its parabola subdivision budget; incomplete geometry cannot omit roughing.");
                 Console.Error.WriteLine("[medial-axis] DiscretizeError2D iteration limit reached; truncating edge discretization.");
                 break;
             }
@@ -161,6 +165,8 @@ internal static class MedialAxisSegmentEmitter
             double midX = (targetY - currentY) / (targetX - currentX) * pointDistance + projectedPoint;
             if (double.IsNaN(midX) || double.IsInfinity(midX))
             {
+                if (rejectIncompleteDiscretization)
+                    throw new InvalidOperationException("Certified medial graph encountered an indeterminate parabola interval; incomplete geometry cannot omit roughing.");
                 queue.RemoveAt(0);
                 continue;
             }

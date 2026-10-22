@@ -87,12 +87,14 @@ public class RingRebaseTests
         var depth = new DepthSchedule(3, 3);
         var options = new PocketOptions { StepOver = 0.4, MaxRings = 32 };
 
-        var rings = RingOffsetEngine.BuildRings(
+        var rings = MedialAxisGeometry.BuildConcentricFill(
             new[] { region },
             new RingOffsetOptions(tool.Radius, tool.Radius * 2.0 * options.StepOver)
             {
                 RingLimit = options.MaxRings,
-            });
+                Tolerances = options.Tolerances,
+                MinimumRingArea = 0,
+            }, tool.Radius, preserveTerminalPaths: true);
 
         foreach (bool insideOut in new[] { false, true })
         {

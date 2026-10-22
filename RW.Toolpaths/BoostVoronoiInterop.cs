@@ -17,10 +17,10 @@ internal static class BoostVoronoiInterop
     internal static class SourceCategory
     {
         internal const int SinglePoint       = 0x0;
-        internal const int SegmentStartPoint = 0x1;  // low endpoint  (y-then-x min)
-        internal const int SegmentEndPoint   = 0x2;  // high endpoint (y-then-x max)
-        internal const int InitialSegment    = 0x4;
-        internal const int ReverseSegment    = 0x8;
+        internal const int SegmentStartPoint = 0x1;  // submitted segment A
+        internal const int SegmentEndPoint   = 0x2;  // submitted segment B
+        internal const int InitialSegment    = 0x8;
+        internal const int ReverseSegment    = 0x9;
     }
 
     // -- Structs must match the C layout exactly (all int32_t / double) --------
@@ -61,6 +61,10 @@ internal static class BoostVoronoiInterop
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern IntPtr bv_construct(
         int[] x0, int[] y0, int[] x1, int[] y1, int count);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr bv_construct_wide(
+        long[] x0, long[] y0, long[] x1, long[] y1, int count);
 
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern void bv_destroy(IntPtr diagram);

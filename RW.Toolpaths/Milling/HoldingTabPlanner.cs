@@ -86,7 +86,7 @@ public sealed class HoldingTabPlan
 /// </list>
 /// A tab is useful iff it merges two distinct components of R.
 /// </summary>
-public static class HoldingTabPlanner
+public static partial class HoldingTabPlanner
 {
     private sealed class Piece
     {
@@ -397,7 +397,9 @@ public static class HoldingTabPlanner
         int tabCount,
         double tabLength,
         double tabHeightY,
-        double ignoredSliverThickness)
+        double ignoredSliverThickness,
+        List<List<PointD>>? combinedCutRegion = null,
+        double? minimumFeatureRadius = null)
     {
         long totalStart = PerfLog.Start();
         var plan = new HoldingTabPlan();
@@ -415,7 +417,7 @@ public static class HoldingTabPlanner
         foreach (var ring in rings)
             if (ring.Count >= 3) ringPolys.Add(ring);
 
-        var cutRegion = PolygonOps.BufferCenterlines(ringPolys, toolRadius);
+        var cutRegion = combinedCutRegion ?? PolygonOps.BufferCenterlines(ringPolys, toolRadius);
         if (cutRegion.Count == 0)
         {
             plan.Report.UnresolvedReasons.Add("planner skipped: cut region is empty after buffering rings.");
@@ -426,7 +428,14 @@ public static class HoldingTabPlanner
         var components = PolygonOps.DifferenceToComponents(
             new List<List<PointD>> { stock }, cutRegion);
 
-        double debrisArea = toolRadius * toolRadius * 0.5;
+        // A mixed-diameter sequence still needs the largest cutter's clearance, but
+        // its smaller channels and remnants must be resolved at the smallest cutter.
+        double featureRadius = minimumFeatureRadius.HasValue
+            ? Math.Min(toolRadius, minimumFeatureRadius.Value)
+            : toolRadius;
+        if (!double.IsFinite(featureRadius) || featureRadius <= 0)
+            throw new ArgumentOutOfRangeException(nameof(minimumFeatureRadius));
+        double debrisArea = featureRadius * featureRadius * 0.5;
         var pieces = new List<Piece>(components.Count);
         foreach (var component in components)
         {
@@ -456,7 +465,7 @@ public static class HoldingTabPlanner
         // bridge. Requiring a large fraction of cutter diameter rejects the narrow
         // strips that Constrain Floating exists to keep from entering the cutter.
         // Keep a real morphological thickness proof, but use a modest machinable floor.
-        double minWeb = Math.Max(0.5, toolRadius * 0.2);
+        double minWeb = Math.Max(0.5, featureRadius * 0.2);
         double webCoreInset = minWeb * 0.5;
         double frameEpsilon = Math.Max(toolRadius * 0.25, 0.02);
         int anchorPieceIndex = -1;
@@ -596,7 +605,7 @@ public static class HoldingTabPlanner
         {
             int pieceIndex = floatingPieces[position];
             List<Candidate> candidates = BuildCandidates(
-            pieceIndex, pieces, pieceBoundsIndex, toolRadius, tabLength, minWeb,
+                pieceIndex, pieces, pieceBoundsIndex, toolRadius, featureRadius, tabLength, minWeb,
                 out CandidateBuildDiagnostics diagnostics);
 
             candidateBuildResults[position] = (candidates, diagnostics);
@@ -893,6 +902,7 @@ public static class HoldingTabPlanner
         List<Piece> pieces,
         PieceBoundsIndex pieceBoundsIndex,
         double toolRadius,
+        double featureRadius,
         double tabLength,
         double minWeb,
         out CandidateBuildDiagnostics diagnostics)
@@ -907,9 +917,9 @@ public static class HoldingTabPlanner
         int ownerAttachmentFails = 0;
         int receiverAttachmentFails = 0;
 
-        double sampleSpacing = Math.Max(Math.Min(toolRadius * 0.35, tabLength * 0.1), 0.2);
-        double marchStep = Math.Max(toolRadius * 0.35, 0.1);
-        double minChannel = toolRadius;
+        double sampleSpacing = Math.Max(Math.Min(featureRadius * 0.35, tabLength * 0.1), 0.2);
+        double marchStep = Math.Max(featureRadius * 0.35, 0.1);
+        double minChannel = featureRadius;
         double maxChannel = toolRadius * 6;
         double maxAttachmentDepth = Math.Max(toolRadius * 6, tabLength * 2);
         double halfWidth = tabLength * 0.5;

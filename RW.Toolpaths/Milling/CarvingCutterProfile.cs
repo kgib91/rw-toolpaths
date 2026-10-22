@@ -10,6 +10,7 @@ public sealed record CarvingCutterSection(CarvingCutterSectionKind Kind, double 
 public sealed class CarvingCutterProfile
 {
     private readonly CarvingCutterSection[] _sections;
+    internal ReadOnlySpan<CarvingCutterSection> Sections => _sections;
     public double TipRadius { get; }
     public double MaximumRadius { get; }
     public double MaximumContactHeight { get; }
@@ -235,13 +236,19 @@ public sealed class CarvingCutterProfile
     }
 
     internal double Support(double gradient, out double contactRadius)
+        => Support(gradient, MaximumContactHeight, out contactRadius);
+
+    internal double SupportUpTo(double gradient, double height)
+        => Support(gradient, Math.Min(MaximumContactHeight, height), out _);
+
+    private double Support(double gradient, double maximumHeight, out double contactRadius)
     {
         double z = 0, result = 0;
         contactRadius = 0;
         foreach (var section in _sections)
         {
-            if (z > MaximumContactHeight) break;
-            double height = Math.Min(section.Height, MaximumContactHeight - z);
+            if (z > maximumHeight) break;
+            double height = Math.Min(section.Height, maximumHeight - z);
             double value = SectionSupport(section, z, height, gradient, out double radius);
             if (value >= result) { result = value; contactRadius = radius; }
             z += section.Height;

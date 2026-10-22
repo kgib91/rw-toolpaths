@@ -17,6 +17,10 @@ public enum ToolpathSpanKind
 
     /// <summary>Lifted clear of the material to reposition.</summary>
     Retract = 4,
+
+    /// <summary>Straight travel with positive full-cutter clearance in earlier
+    /// executed stock. The host may use its travel feed while retaining G1/XYZ.</summary>
+    ClearedTravel = 5,
 }
 
 /// <summary>

@@ -61,12 +61,16 @@ public sealed record RampSettings(double AngleRadians)
 /// <summary>A ring's entry move plus the cutting pass that follows it.</summary>
 public sealed class RampedPath
 {
-    internal RampedPath(List<Point3D> points, List<ToolpathSpan> spans, RampStrategy strategy, int laps)
+    internal RampedPath(List<Point3D> points, List<ToolpathSpan> spans, RampStrategy strategy, int laps,
+        int redundantPointsRemoved = 0, double redundantCutTravelRemoved = 0, bool partialAxisFallback = false)
     {
         Points = points;
         Spans = spans;
         Strategy = strategy;
         Laps = laps;
+        RedundantPointsRemoved = redundantPointsRemoved;
+        RedundantCutTravelRemoved = redundantCutTravelRemoved;
+        PartialAxisFallback = partialAxisFallback;
     }
 
     public List<Point3D> Points { get; }
@@ -78,6 +82,12 @@ public sealed class RampedPath
 
     /// <summary>Helical laps spent descending; 0 for other strategies.</summary>
     public int Laps { get; }
+
+    internal int RedundantPointsRemoved { get; }
+
+    internal double RedundantCutTravelRemoved { get; }
+
+    internal bool PartialAxisFallback { get; }
 }
 
 /// <summary>
@@ -91,6 +101,230 @@ public sealed class RampedPath
 /// </summary>
 public static class RampPlanner
 {
+    /// <summary>
+    /// Enters an existing cutting polyline from above without descending faster than
+    /// the configured ramp angle or below any original cutting chord. The ramp lands
+    /// at its first reachable local target contact, which may be shallower than the
+    /// operation's nominal depth. Every original directed XYZ cutting chord is
+    /// subsequently executed whole at its authored depth. Public closed entries
+    /// retain their legacy closing seam: downstream consumers may append an
+    /// already-authorized at-depth tail or apply a later placement transform.
+    /// Removing a repeated suffix without those consumers' endpoint and posted
+    /// motion contracts can change the outgoing chord and its removed stock.
+    /// </summary>
+    public static RampedPath PlanPathEntry(
+        IReadOnlyList<Point3D> path,
+        double entryZ,
+        RampSettings settings,
+        CancellationToken cancellationToken = default,
+        Action<string>? diagnostic = null,
+        bool landAtSourceVertex = false)
+        => PlanPathEntry(path, entryZ, settings, cancellationToken, diagnostic,
+            landAtSourceVertex, preserveClosedExit: true);
+
+    // Retain the legacy public CLR signature and exit. Internal Pocket and
+    // V-carve routing opt into reduction only for final command coordinates and
+    // visits whose outgoing motion has an endpoint-aware stock proof.
+    internal static RampedPath PlanPathEntry(
+        IReadOnlyList<Point3D> path,
+        double entryZ,
+        RampSettings settings,
+        CancellationToken cancellationToken,
+        Action<string>? diagnostic,
+        bool landAtSourceVertex,
+        bool preserveClosedExit)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentNullException.ThrowIfNull(settings);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (path.Count < 2)
+            return new RampedPath(new List<Point3D>(), new List<ToolpathSpan>(), RampStrategy.Linear, 0);
+        if (entryZ <= path[0].Z + 1e-9)
+        {
+            var unchanged = path.ToList();
+            return new RampedPath(unchanged,
+                new List<ToolpathSpan> { new(0, unchanged.Count - 1, ToolpathSpanKind.Cut) }, RampStrategy.Linear, 0);
+        }
+
+        double slope = Math.Tan(settings.AngleRadians);
+        if (settings.Strategy == RampStrategy.Plunge || !double.IsFinite(slope) || slope <= 1e-9)
+            throw new InvalidOperationException("Skipping depth passes requires a positive ramp angle.");
+
+        bool closed = path[0] == path[^1];
+        bool partialAxisFallback = false;
+        double length = 0;
+        int distinctSourceEdges = 0;
+        for (int i = 1; i < path.Count; i++)
+        {
+            if ((i & 1023) == 0) cancellationToken.ThrowIfCancellationRequested();
+            length += PlanarDistance(path[i - 1], path[i]);
+            if (path[i - 1] != path[i]) distinctSourceEdges++;
+            if (closed && !partialAxisFallback)
+                partialAxisFallback = RequiresLegacyClosedTail(path[i - 1], path[i]);
+        }
+        if (length <= 1e-9)
+        {
+            diagnostic?.Invoke("stage=ramp-entry event=reject reason=no-horizontal-entry-path");
+            throw new InvalidOperationException("The cutting path has no horizontal length for a ramp entry.");
+        }
+
+        var points = new List<Point3D> { new(path[0].X, path[0].Y, entryZ) };
+        int fromIndex = 0, direction = 1, traversals = 0, contactSegment = -1;
+        double travelled = 0;
+        // Match the existing carving path budget without steepening a tiny ring's
+        // entry when the configured angle requires more than MaxLaps revolutions.
+        const int MaximumEntryPoints = 2_000_000;
+        while (contactSegment < 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (points.Count >= MaximumEntryPoints)
+            {
+                diagnostic?.Invoke($"stage=ramp-entry event=reject reason=point-budget " +
+                    $"points={points.Count} traversals={traversals} requestedSlope={slope:R}");
+                throw new InvalidOperationException("Ramp entry exceeds two million points; lengthen the entry path or increase the ramp angle.");
+            }
+
+            int toIndex = fromIndex + direction;
+            Point3D from = path[fromIndex], to = path[toIndex];
+            double distance = PlanarDistance(from, to);
+            double currentZ = points[^1].Z;
+            double nextZ = currentZ - distance * slope;
+            double gapStart = currentZ - from.Z, gapEnd = nextZ - to.Z;
+            if (gapEnd <= 1e-9)
+            {
+                // A physically certified command chord must retain its source XY
+                // endpoints: rounding a synthetic contact can cross a nearby wall.
+                // Landing at the next vertex stays above the original chord and
+                // descends no faster than the requested ramp plane.
+                double t = landAtSourceVertex ? 1
+                    : gapStart <= 1e-9 ? 0 : Math.Clamp(gapStart / (gapStart - gapEnd), 0, 1);
+                Point3D contact = landAtSourceVertex ? to : new Point3D(from.X + (to.X - from.X) * t,
+                    from.Y + (to.Y - from.Y) * t, from.Z + (to.Z - from.Z) * t);
+                if (closed && !partialAxisFallback)
+                    partialAxisFallback = RequiresLegacyClosedTail(points[^1], contact);
+                points.Add(contact);
+                travelled += distance * t;
+                contactSegment = Math.Min(fromIndex, toIndex);
+                fromIndex = toIndex;
+                break;
+            }
+            if (distance > 1e-12)
+            {
+                var rampPoint = new Point3D(to.X, to.Y, nextZ);
+                if (closed && !partialAxisFallback)
+                    partialAxisFallback = RequiresLegacyClosedTail(points[^1], rampPoint);
+                points.Add(rampPoint);
+            }
+            travelled += distance;
+            fromIndex = toIndex;
+            if (fromIndex == path.Count - 1)
+            {
+                traversals++;
+                if (closed) fromIndex = 0;
+                else direction = -1;
+            }
+            else if (fromIndex == 0 && direction < 0)
+            {
+                traversals++;
+                direction = 1;
+            }
+        }
+
+        int cutStart = points.Count - 1;
+        int redundantPointsRemoved = 0;
+        double redundantCutTravelRemoved = 0;
+        if (closed)
+        {
+            // Retain the existing contact-to-seam suffix, including an interior
+            // contact's partial chord. Then execute only the missing source prefix.
+            // Each original directed XYZ chord is still executed whole once: an
+            // interior contact's chord is recut whole in the prefix, rather than
+            // split at a new endpoint that could change its rounded depth profile.
+            // The omitted tail consists of exact source chords already cut in
+            // the retained suffix. Partial-axis command classification can leave
+            // different planar cursors on different laps, so preserve those tails.
+            for (int i = contactSegment + 1; i < path.Count; i++)
+            {
+                if ((i & 1023) == 0) cancellationToken.ThrowIfCancellationRequested();
+                if (!partialAxisFallback)
+                    partialAxisFallback = RequiresLegacyClosedTail(points[^1], path[i]);
+                AppendDistinct(points, path[i]);
+            }
+            // Callers retaining a dependent outgoing seam keep the old exit.
+            // A vertex contact with an endpoint-aware outgoing link instead
+            // executes one complete rotated cycle and exits at that contact.
+            int prefixEnd = preserveClosedExit || partialAxisFallback ? path.Count - 1
+                : points[cutStart] == path[contactSegment] ? contactSegment : contactSegment + 1;
+            int suffixCount = points.Count;
+            for (int i = 0; i <= prefixEnd; i++)
+            {
+                if ((i & 1023) == 0) cancellationToken.ThrowIfCancellationRequested();
+                AppendDistinct(points, path[i]);
+            }
+            redundantPointsRemoved = distinctSourceEdges - (points.Count - suffixCount);
+            for (int i = prefixEnd + 1; i < path.Count; i++)
+            {
+                if ((i & 1023) == 0) cancellationToken.ThrowIfCancellationRequested();
+                Point3D a = path[i - 1], b = path[i];
+                double dx = b.X - a.X, dy = b.Y - a.Y, dz = b.Z - a.Z;
+                redundantCutTravelRemoved += Math.Sqrt(dx * dx + dy * dy + dz * dz);
+            }
+        }
+        else
+        {
+            // An open path has no permissible closing chord. Return along its
+            // exact prefix before recutting the complete original directed trace.
+            for (int i = contactSegment; i >= 0; i--)
+                AppendDistinct(points, path[i]);
+            foreach (Point3D point in path)
+                AppendDistinct(points, point);
+        }
+        var spans = new List<ToolpathSpan>
+        {
+            new(0, cutStart, ToolpathSpanKind.Ramp),
+            new(cutStart, points.Count - 1, ToolpathSpanKind.Cut),
+        };
+        diagnostic?.Invoke($"stage=ramp-entry event=complete sourcePoints={path.Count} " +
+            $"entryZ={entryZ:R} sourceStartZ={path[0].Z:R} contactZ={points[cutStart].Z:R} " +
+            $"requestedSlope={slope:R} horizontalRun={travelled:R} traversals={traversals} " +
+            $"points={points.Count} redundantPointsRemoved={redundantPointsRemoved} " +
+            $"closedTailReductionAllowed={!(preserveClosedExit || partialAxisFallback)} partialAxisFallback={partialAxisFallback} " +
+            $"cutCycleClosed={closed && points[cutStart] == points[^1]} cutMoves={points.Count - cutStart - 1} " +
+            $"redundantCutTravelRemoved={redundantCutTravelRemoved:R} " +
+            $"finalExit=({points[^1].X:R},{points[^1].Y:R},{points[^1].Z:R}) " +
+            $"localTargetContact=True sourceVertexContact={landAtSourceVertex} originalCutTracePreserved=True");
+        return new RampedPath(points, spans,
+            closed && traversals > 0 ? RampStrategy.Helical : RampStrategy.Linear,
+            closed ? traversals : 0, redundantPointsRemoved, redundantCutTravelRemoved, partialAxisFallback);
+    }
+
+    private static bool RequiresLegacyClosedTail(Point3D a, Point3D b)
+    {
+        // Use the same command-shape owner as Shared. Subdivision never turns
+        // a sloped chord into an axis-only command. Even sub-float native drift
+        // is harmless here when its two actual F3 planar endpoints coincide.
+        float ax = (float)a.X, ay = (float)a.Y, az = (float)a.Z;
+        float bx = (float)b.X, by = (float)b.Y, bz = (float)b.Z;
+        if (!float.IsFinite(ax) || !float.IsFinite(ay) || !float.IsFinite(az)
+            || !float.IsFinite(bx) || !float.IsFinite(by) || !float.IsFinite(bz)) return true;
+        float dz = bz - az;
+        if (!float.IsFinite(dz)) return true;
+        float dx = bx - ax, dy = by - ay;
+        if (!float.IsFinite(dx) || !float.IsFinite(dy)) return true;
+        return ToolpathCommandRounding.IsVerticalOnly(dx,dz,dy)
+            && (ToolpathCommandRounding.Round(ax)!=ToolpathCommandRounding.Round(bx)
+                || ToolpathCommandRounding.Round(ay)!=ToolpathCommandRounding.Round(by));
+    }
+
+    private static double PlanarDistance(Point3D a, Point3D b)
+        => Math.Sqrt((b.X - a.X) * (b.X - a.X) + (b.Y - a.Y) * (b.Y - a.Y));
+
+    private static void AppendDistinct(List<Point3D> points, Point3D point)
+    {
+        if (points[^1] != point)
+            points.Add(point);
+    }
+
     /// <summary>
     /// Produces the entry move and the full-depth cutting pass for one closed ring.
     /// </summary>
@@ -131,6 +365,40 @@ public static class RampPlanner
             RampStrategy.Helical => PlanHelical(loop, entryZ, cutZ, perimeter, run, settings.MaxLaps),
             _ => PlanLinear(loop, entryZ, cutZ, perimeter, run),
         };
+    }
+
+    /// <summary>Pocket-only entry policy. Replaying the same immutable command
+    /// chords at every scheduled depth is stronger than replaying an XY curve:
+    /// a rounded interior contact can split a chord differently on later passes.
+    /// Public entry defaults and other machining strategies remain unchanged.</summary>
+    internal static RampedPath PlanClosedRingAtCommandVertices(
+        IReadOnlyList<PointD> ring, double entryZ, double cutZ, RampSettings settings,
+        CancellationToken token = default, Action<string>? diagnostic = null)
+    {
+        token.ThrowIfCancellationRequested();
+        var loop = Normalize(ring);
+        double perimeter = ClosedPerimeter(loop);
+        double drop = entryZ - cutZ;
+        double run = settings.HorizontalRunFor(drop);
+        var strategy = Resolve(settings, run, perimeter);
+        if (loop.Count < 2 || drop <= 1e-9 || perimeter <= 1e-9
+            || strategy == RampStrategy.Plunge
+            || strategy == RampStrategy.Helical && Math.Ceiling(run / perimeter) <= Math.Max(1, settings.MaxLaps))
+        {
+            var wholeVertexEntry = PlanClosedRing(loop, entryZ, cutZ, settings);
+            token.ThrowIfCancellationRequested();
+            return wholeVertexEntry;
+        }
+        // Descent follows every whole original edge; the final edge clamps its
+        // height drop to the remaining depth, producing a shallower grade. Cut
+        // exactly one complete directed cycle from that original contact vertex.
+        // Pocket's outgoing link is checked from the actual resulting endpoint;
+        // retaining the former closing seam would recut an unnecessary suffix
+        // and make the complete cycle appear open to chronological routing.
+        var source = loop.Select(p => new Point3D(p.x, p.y, cutZ)).ToList();
+        source.Add(source[0]);
+        return PlanPathEntry(source, entryZ, settings, token, diagnostic,
+            landAtSourceVertex: true, preserveClosedExit: false);
     }
 
     private static RampStrategy Resolve(RampSettings settings, double run, double perimeter)

@@ -1,4 +1,4 @@
-﻿namespace RW.Toolpaths;
+namespace RW.Toolpaths;
 
 /// <summary>
 /// A 3-D point used for toolpath output.
@@ -28,6 +28,9 @@ public class PathTreeNode
     /// </summary>
     public int Offset { get; set; }
 
+    /// <summary>Whether the offset trace has a closing chord.</summary>
+    public bool IsClosed { get; set; } = true;
+
     /// <summary>
     /// Rings that are geometrically inside this ring.
     /// </summary>
@@ -35,10 +38,11 @@ public class PathTreeNode
 
     private Clipper2Lib.Path64? _cachedIntPath;
 
-    public PathTreeNode(List<Clipper2Lib.PointD> points, int offset)
+    public PathTreeNode(List<Clipper2Lib.PointD> points, int offset, bool isClosed = true)
     {
         Points   = points;
         Offset   = offset;
+        IsClosed = isClosed;
         Children = new List<PathTreeNode>();
     }
 

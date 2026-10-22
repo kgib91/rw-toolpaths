@@ -14,9 +14,14 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Clipper2 by Angus Johnson - the .NET port of Clipper2 -->
-    <PackageReference Include="Clipper2" Version="1.4.0" />
+    <!-- Pinned 1.4.0 source and identity; Shared uses this same project. -->
+    <ProjectReference Include="..\vendor\Clipper2\Clipper2Lib.csproj" />
     <PackageReference Include="MIConvexHull" Version="1.1.19.1019" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="native/vcarve_cuda/disc_witness.cu"
+                      LogicalName="RW.Toolpaths.Milling.Acceleration.disc_witness.cu" />
   </ItemGroup>
 
   <!-- Native Boost Voronoi library - copy whichever RID was built. -->

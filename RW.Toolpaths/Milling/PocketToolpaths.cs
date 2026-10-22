@@ -6,10 +6,24 @@ namespace RW.Toolpaths.Milling;
 /// <summary>Configuration for concentric-offset pocket clearing.</summary>
 public sealed record PocketOptions
 {
+    public MillingBoundaryAccess? BoundaryAccess { get; init; }
+    internal IReadOnlyList<IReadOnlyList<PointD>>? KnownEmptyBoundary { get; init; }
+    internal double KnownEmptyFloor { get; init; } = double.PositiveInfinity;
+    /// <summary>
+    /// Restricts roughing to a flat-floor plateau in this pocket's continuous
+    /// grade envelope. Later operations are not inputs.
+    /// </summary>
+    public bool SmoothRoughing { get; init; }
+
+    /// <summary>Maximum grade in degrees used by this pocket's own omission analysis.</summary>
+    public double SmoothRampAngleDegrees { get; init; } = 30;
+    public bool RampOutsideEdges { get; init; }
+
     /// <summary>Radial engagement as a fraction of tool diameter; 0.4 removes 40% per pass.</summary>
     public double StepOver { get; init; } = 0.4;
 
-    /// <summary>Material deliberately left on the walls for a later finishing pass.</summary>
+    /// <summary>Signed radial wall offset after cutter compensation. Positive leaves material;
+    /// negative overcuts, and values below minus the tool radius start outside the source boundary.</summary>
     public double StockToLeave { get; init; }
 
     /// <summary>Work from the centre outward instead of from the wall inward.</summary>
@@ -44,12 +58,62 @@ public sealed record PocketOptions
     /// <summary>Produce the optional 2D swept-area summary. Physical stock simulation
     /// can consume the emitted paths directly without building this polygon union.</summary>
     public bool CalculateSweptArea { get; init; } = true;
+
+    /// <summary>
+    /// Source-space material excluded from this pocket's physical cutter sweep.
+    /// They are removed before cutter compensation, independently of wall allowance.
+    /// Null preserves ordinary pocket generation.
+    /// </summary>
+    public IReadOnlyList<IReadOnlyList<PointD>>? ProtectedBoundary { get; init; }
+
+    /// <summary>Pocket-specific posted-depth replay uses immutable original
+    /// command vertices. Other callers of the shared emitter retain defaults.</summary>
+    internal bool PreserveCommandVertices { get; init; }
+
+    /// <summary>Dense raster construction uses local, independently safe entries
+    /// instead of rebuilding a large executed-stock continuation network.</summary>
+    internal bool IndependentRasterEntries { get; init; }
+
+    /// <summary>Use finite world-chord certificates for this pocket's complete
+    /// original medial graph. Indirect strategies retain their own emitter contract.</summary>
+    internal bool BoundOriginalSourceMedial { get; init; } = true;
+
+    /// <summary>Only adaptive OffsetPocket selection can defer mutual raw-front
+    /// footprint comparison to the mandatory final whole-shell audit.</summary>
+    internal bool AdaptiveCompactionProposals { get; init; } = true;
+
+    /// <summary>Raw adaptive trials may nominate with filled dilation; actual
+    /// selected commands retain the original complete physical shell proof.</summary>
+    internal bool TrialFilledSweepProposals { get; init; } = true;
+
+    /// <summary>Bounded parent-local open rescue may retain the requested closed
+    /// inset after the original complete physical shell proof succeeds.</summary>
+    internal bool ParentLocalRescueProposals { get; init; } = true;
+
+    /// <summary>Request the bounded complete reachable-stock proof before the
+    /// eager original graph; unresolved proofs retain the full graph.</summary>
+    internal bool ExactFirstCoverageProposals { get; init; } = true;
+
+    /// <summary>Use the certified dense original-boundary arc construction for Pocket alone.</summary>
+    internal bool DenseFirstArcConstruction { get; init; } = true;
+
+    /// <summary>Keep fixed shallow and deep construction aids, with original walls and whole-shell proofs.</summary>
+    internal bool TwoOriginConstruction { get; init; } = true;
+    /// <summary>Only the initial dense original Pocket source can use independently
+    /// certified filled-hole dilation. Every later trial retains its fixed source.</summary>
+    internal bool SeparateOriginalFirstConstruction { get; init; } = true;
 }
 
 /// <summary>Counters describing what a strategy produced, for logging and regression checks.</summary>
 public sealed record ToolpathDiagnostics
 {
+    /// <summary>Actual discontinuous XYZ visits after final shared routing,
+    /// including the operation's first entry. Independent of source ring count.</summary>
+    public int ExecutionEntryCount { get; init; }
+    public int ExecutionTransferCount { get; init; }
     public int RingCount { get; init; }
+    /// <summary>Open terminal wavefront paths retained by the shared fill geometry.</summary>
+    public int StripCount { get; init; }
     public int IslandCount { get; init; }
     public int PathCount { get; init; }
     public int DepthPassCount { get; init; }
@@ -94,12 +158,39 @@ public sealed class ToolpathPlan
     {
         Toolpaths = toolpaths;
         SweptArea = sweptArea;
-        Diagnostics = diagnostics;
+        int entries=0;Point3D? previous=null;
+        double cutting=0,ramping=0,linking=0,travel=0;
+        foreach(var path in toolpaths)
+        {
+            if(path.Points.Count<2)continue;
+            if(previous!=path.Points[0])entries++;
+            previous=path.Points[^1];
+            var spans=path.Spans.Count>0 ? path.Spans : new[]{new ToolpathSpan(0,path.Points.Count-1,ToolpathSpanKind.Cut)};
+            foreach(var span in spans)
+            for(int i=span.StartIndex+1;i<=span.EndIndex;i++)
+            {
+                double length=ToolpathContinuationPlanner.Distance(path.Points[i-1],path.Points[i]);
+                switch(span.Kind)
+                {
+                    case ToolpathSpanKind.Cut:cutting+=length;break;
+                    case ToolpathSpanKind.Ramp:ramping+=length;break;
+                    case ToolpathSpanKind.Link:linking+=length;break;
+                    case ToolpathSpanKind.ClearedTravel:travel+=length;break;
+                }
+            }
+        }
+        Diagnostics = diagnostics with{ExecutionEntryCount=entries,ExecutionTransferCount=Math.Max(0,entries-1)};
+        if(toolpaths.Count>0)Console.WriteLine($"[ToolpathPlan.Execution] paths={toolpaths.Count} entries={entries} transfers={Math.Max(0,entries-1)} "
+            +$"cutLength={cutting:R} rampLength={ramping:R} linkLength={linking:R} clearedTravelLength={travel:R} coordinateSpace=native finalRouting=True");
         TabReport = tabReport;
     }
 
     /// <summary>Continuous paths in cut order. Callers insert their own rapids between them.</summary>
     public IReadOnlyList<TaggedToolpath> Toolpaths { get; }
+
+    /// <summary>Optional whole physical native/posted clearance authority for
+    /// a downstream replacement chord, in the plan's workspace coordinates.</summary>
+    public Func<Point3D,Point3D,bool>? ReplacementChordGuard { get; internal init; }
 
     /// <summary>Area the cutter sweeps, for stock tracking by later operations.</summary>
     public IReadOnlyList<List<PointD>> SweptArea { get; }
@@ -128,6 +219,58 @@ public static class PocketToolpaths
     /// <summary>Category tag applied to pocket passes.</summary>
     public const string Category = "pocket";
 
+    /// <summary>
+    /// Limits this pocket's physical clearance graph and preserves all material
+    /// above its flat-floor plateau. No later operation or cutter is an input.
+    /// The exclusion is applied before complete physical cutter compensation.
+    /// </summary>
+    public static VCarveRoughingAnalysis AnalyzeSmoothRoughing(
+        IReadOnlyList<MillingRegion> regions, ToolGeometry tool, DepthSchedule depth,
+        PocketOptions options, IMedialAxisProvider provider,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(regions);
+        ArgumentNullException.ThrowIfNull(tool);
+        ArgumentNullException.ThrowIfNull(depth);
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(provider);
+        if (!options.SmoothRoughing)
+            throw new ArgumentException("Own-pocket omission analysis requires Smooth roughing enabled.", nameof(options));
+        if (tool.VCarveProfile is null && tool.ConeLength is null)
+            throw new ArgumentException("Own-pocket omission analysis requires the roughing cutter's physical axial profile.", nameof(tool));
+        if (!double.IsFinite(tool.Radius) || tool.Radius <= 0)
+            throw new ArgumentOutOfRangeException(nameof(tool));
+        if (!double.IsFinite(depth.Depth) || depth.Depth <= 0)
+            throw new ArgumentOutOfRangeException(nameof(depth));
+        long started = System.Diagnostics.Stopwatch.GetTimestamp();
+        Console.WriteLine($"[Pocket.SmoothRoughing] event=analysis-start owner=current-pocket "
+            + $"regions={regions.Count} physicalToolRadius={tool.Radius:R} ownFloor={depth.Depth:R} "
+            + $"ownRampAngleDegrees={options.SmoothRampAngleDegrees:R} ownEdgeOffset={options.StockToLeave:R} "
+            + "futureOperationsRead=False retainedRoughingStrategyUnchanged=True");
+        var preparation = VCarveToolpaths.Prepare(regions, tool, depth,
+            new VCarveOptions
+            {
+                SmoothVCarving = true, SmoothRampAngleDegrees = options.SmoothRampAngleDegrees,
+                RampOutsideEdges = options.RampOutsideEdges,
+                BoundaryAccess = options.BoundaryAccess,
+                Ramp = options.Ramp, StockToLeave = 0,
+                StepOver = options.StepOver, IncludeInteriorFill = true,
+                DetectCurves = false, CalculateSweptArea = false,
+                DiagnosticContext = "own-pocket-smooth-roughing",
+                PreparationContactRadius = tool.VCarveProfile?.TipRadius ?? 0,
+            }, provider, cancellationToken);
+        var analysis = preparation.AnalyzePocketPlateau(depth.Depth, options.SmoothRampAngleDegrees,
+            options.StockToLeave, cancellationToken, retainBasinDiagnostics: true);
+        cancellationToken.ThrowIfCancellationRequested();
+        Console.WriteLine($"[Pocket.SmoothRoughing] event=analysis-complete owner=current-pocket "
+            + $"elapsedMs={System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
+            + $"features={analysis.Basins.Count} omittedFeatures={analysis.Basins.Count(feature => feature.OmitRoughing)} "
+            + $"protectedSources={analysis.ProtectedSourceRegionIndices.Count} protectedArea={analysis.ProtectedArea:R} "
+            + $"preparation={preparation.Fingerprint} originalGeometry={preparation.OriginalGeometryFingerprint} "
+            + "futureOperationsRead=False analysisComplete=True policy=complete-footprint-flat-plateau");
+        return analysis;
+    }
+
     public static ToolpathPlan Generate(
         IReadOnlyList<MillingRegion> regions,
         ToolGeometry tool,
@@ -137,25 +280,112 @@ public static class PocketToolpaths
         Action<double, string>? progress = null)
     {
         long t0 = PerfLog.Start();
+        // Capture before protection/prepared geometry can consult shared evidence.
+        // Later environment changes cannot change this operation's proof mode.
+        options = CaptureExactFirstCoverageMode(CaptureParentLocalRescueMode(CaptureTrialFilledSweepMode(CaptureConcentricConstructionMode(CaptureAdaptiveCompactionMode(options)))));
+        using var feasibilityDiagnostics = InsetFeasibilityDiagnostics.Begin("pocket");
+
+        if (!double.IsFinite(options.StockToLeave))
+            throw new ArgumentOutOfRangeException(nameof(options), "Pocket edge offset must be finite.");
 
         if (regions.Count == 0 || tool.Radius <= 1e-6 || depth.Depth <= 0)
+            return ToolpathPlan.Empty;
+
+        // Dense ramp exclusions do not need concentric terminal reconstruction.
+        // A flat cutter clears the same plateau with raster strips plus the
+        // compensated perimeter; all existing footprint / access proofs remain.
+        long protectedPoints=options.ProtectedBoundary?.Sum(p=>(long)p.Count)??0;
+        bool uniformFlat=tool.VCarveProfile is { } physical
+            ? (float)physical.TipRadius==(float)tool.Radius && physical.PhysicalRadiusAtDepth(depth.Depth)==physical.TipRadius
+            : tool.ConeLength is null;
+        if(options.SmoothRoughing && protectedPoints>=20_000)
+            Console.WriteLine($"[Pocket.SurfaceStrategy.Selection] protectedPoints={protectedPoints} uniformFlat={uniformFlat} "
+                +$"assignedRadius={tool.Radius:R} physicalTipRadius={tool.VCarveProfile?.TipRadius:R} radiusIdentity=binary32-assignment-and-uniform-physical-section maxRings={options.MaxRings}");
+        if(options.SmoothRoughing && options.MaxRings>1 && options.StockToLeave>=0
+            && uniformFlat && protectedPoints>=20_000)
+        {
+            double width=regions.Max(r=>r.Outer.Max(p=>p.x))-regions.Min(r=>r.Outer.Min(p=>p.x));
+            double height=regions.Max(r=>r.Outer.Max(p=>p.y))-regions.Min(r=>r.Outer.Min(p=>p.y));
+            double angle=height>width?90:0;
+            Console.WriteLine($"[Pocket.SurfaceStrategy] policy={MachiningAccuracy.Policy} strategy=raster-with-compensated-perimeter "
+                +$"reason=dense-protected-flat-plateau protectedPoints={protectedPoints} angle={angle:R} "
+                +"originalConcentricPathsRequired=False authoredFloorStepdownAndAllowanceRetained=True fullPhysicalProtectionRequired=True");
+            progress?.Invoke(0,"Clearing the protected roughing plateau");
+            var raster=ScanlinePocketToolpaths.Generate(regions,tool,depth,options with {
+                IndependentRasterEntries=true,
+                Tolerances=options.Tolerances with {ArcTolerance=Math.Min(.001,options.Tolerances.ArcTolerance),
+                    SimplifyTolerance=Math.Min(.001,options.Tolerances.SimplifyTolerance)} },angle,cancellationToken);
+            progress?.Invoke(1,"Pocket roughing complete");
+            return raster;
+        }
+
+        var access = options.BoundaryAccess?.Resolve(regions, tool, depth, options.SmoothRoughing,
+            options.SmoothRampAngleDegrees, options.StockToLeave, cancellationToken);
+        if (access != null)
+        {
+            regions = access.PocketRegions(tool.Radius, options.StockToLeave, cancellationToken);
+            options=options with {KnownEmptyBoundary=access.CertifiedEmptyBoundary(PocketContinuationRouter.KnownAirReserve,cancellationToken),
+                KnownEmptyFloor=depth.SurfaceZ-depth.Depth, ClipBoundary=options.ClipBoundary ?? access.PartBoundary};
+        }
+
+        int originalRegionCount = regions.Count;
+        int protectedContourCount = options.ProtectedBoundary?.Count ?? 0;
+        long subtractStart = PerfLog.Start();
+        regions = PocketProtection.Subtract(regions, options, cancellationToken, physicalConcentric: true);
+        PerfLog.Stop("PocketToolpaths.SubtractProtection", subtractStart,
+            $"originalRegions={originalRegionCount} retainedRegions={regions.Count} " +
+            $"protectedContours={protectedContourCount}");
+        if (regions.Count == 0)
             return ToolpathPlan.Empty;
 
         double stepOver = tool.Radius * 2.0 * options.StepOver;
         if (stepOver <= 1e-6)
             stepOver = tool.Radius;
 
-        var rings = RingOffsetEngine.BuildRings(
+        Console.WriteLine($"[PocketToolpaths.EdgeOffset] mode=offset toolRadius={tool.Radius:R} "
+            + $"edgeOffset={options.StockToLeave:R} firstInset={tool.Radius + options.StockToLeave:R} "
+            + $"stepOver={stepOver:R} regions={regions.Count} "
+            + $"adaptiveCompactionProposals={options.AdaptiveCompactionProposals} proofModeCaptured=True "
+            + $"denseFirstArcConstruction={options.DenseFirstArcConstruction} twoOriginConstruction={options.TwoOriginConstruction} "
+            + $"separateOriginalFirstConstruction={options.SeparateOriginalFirstConstruction} firstHoleModeCaptured=True "
+            + $"trialFilledSweepProposals={options.TrialFilledSweepProposals} trialFilledModeCaptured=True "
+            + $"parentLocalRescueProposals={options.ParentLocalRescueProposals} parentLocalRescueModeCaptured=True "
+            + $"exactFirstCoverageProposals={options.ExactFirstCoverageProposals} exactFirstCoverageModeCaptured=True");
+
+        long collectRingsStart = PerfLog.Start();
+        var rings = MedialAxisGeometry.BuildConcentricFill(
             regions,
             new RingOffsetOptions(tool.Radius + options.StockToLeave, stepOver)
             {
                 RingLimit = options.MaxRings,
                 Tolerances = options.Tolerances,
+                MinimumRingArea = 0,
+                RetainEmittedSweepHistory = options.ProtectedBoundary is { Count: > 0 } || options.KnownEmptyBoundary is {Count:>0},
+                KnownEmptyBoundary=options.KnownEmptyBoundary,
+                BoundOriginalSourceMedial = options.BoundOriginalSourceMedial,
+                PreserveSourceNativeGrid = options.ProtectedBoundary is { Count: > 0 },
+                SelectedCleanupProposals = options.AdaptiveCompactionProposals,
+                TrialFilledSweepProposals = options.TrialFilledSweepProposals,
+                TrialFilledSweepModeCaptured = true,
+                ParentLocalRescueProposals = options.ParentLocalRescueProposals,
+                ParentLocalRescueModeCaptured = true,
+                ExactFirstCoverageProposals = options.ExactFirstCoverageProposals,
+                ExactFirstCoverageModeCaptured = true,
+                DenseFirstArcConstruction = options.DenseFirstArcConstruction,
+                TwoOriginConstruction = options.TwoOriginConstruction,
+                SeparateOriginalFirstConstruction = options.SeparateOriginalFirstConstruction,
             },
+            tool.Radius, preserveTerminalPaths: true, options.ClipBoundary,
             cancellationToken, (fraction, stage) => progress?.Invoke(0.65 * fraction, stage));
 
         if (options.ClipBoundary is { Count: >= 3 })
-            rings = ClipRings(rings, options.ClipBoundary);
+            rings = ClipRings(rings, options.ClipBoundary, cancellationToken);
+
+        if (access != null) rings = access.TrimRings(rings, tool.Radius, cancellationToken);
+
+        PerfLog.Stop("PocketToolpaths.CollectRings", collectRingsStart,
+            $"regions={regions.Count} rings={rings.Count} clipPoints={options.ClipBoundary?.Count ?? 0} " +
+            "scope=concentric-fill-and-clipping child=RingOffsetEngine.BuildRings");
 
         if (rings.Count == 0)
             return ToolpathPlan.Empty;
@@ -164,14 +394,32 @@ public static class PocketToolpaths
         RingOffsetEngine.BuildNesting(rings);
         var traversal = RingOffsetEngine.BuildTraversal(rings, options.InsideOut);
 
+        // The level-zero center domain remains a routing restriction, but its
+        // boundary-growth allowance is not physical wall/stock-leave authority.
+        // Every offset link must also meet the original-source chord contract.
+        var callerClearance = options.LinkClearance;
+        if (!rings.Any(path => !path.IsClosed)) callerClearance ??= BuildTravelClearance(rings);
+        var sourceClearance = new FillSourceClearance(regions,
+            Math.Max(0, tool.Radius + options.StockToLeave), callerClearance, options.ClipBoundary);
         var guarded = options with
         {
-            LinkClearance = options.LinkClearance ?? BuildTravelClearance(rings),
+            LinkClearance = sourceClearance,
+            PreserveCommandVertices = true,
         };
+        Console.WriteLine("[Pocket.CommandVertices] event=enabled entryContact=original-vertex "
+            + "rebase=original-vertex excursionPause=original-vertex cutStepdownLateralAllowance=0");
 
         var plan = Emit(rings, traversal, depth, guarded, tool, Category, cancellationToken,
             progress: (fraction, stage) => progress?.Invoke(0.7 + 0.3 * fraction, stage));
+        sourceClearance.Report();
+        long verifyProtectionStart = PerfLog.Start();
+        PocketProtection.Verify(plan.Toolpaths, tool.Radius, depth.SurfaceZ,
+            options.ProtectedBoundary, cancellationToken);
+        PerfLog.Stop("PocketToolpaths.VerifyProtection", verifyProtectionStart,
+            $"nativePaths={plan.Toolpaths.Count} radius={tool.Radius:R} surfaceZ={depth.SurfaceZ:R} " +
+            $"protectedContours={protectedContourCount} result={(protectedContourCount > 0 ? "verified" : "skipped")}");
         progress?.Invoke(1, "Pocket complete");
+        access?.Verify(plan.Toolpaths,tool,depth,options.StockToLeave,cancellationToken);
 
         PerfLog.Stop("PocketToolpaths.Generate", t0,
             $"regions={regions.Count} rings={rings.Count} paths={plan.Toolpaths.Count} " +
@@ -179,6 +427,39 @@ public static class PocketToolpaths
             $"link={plan.Diagnostics.LinkLength:F1} lifts={plan.Diagnostics.LinkLifts}");
 
         return plan;
+    }
+
+    internal static PocketOptions CaptureAdaptiveCompactionMode(PocketOptions options)
+        => options with { AdaptiveCompactionProposals = options.AdaptiveCompactionProposals
+            && Environment.GetEnvironmentVariable("RW_TOOLPATHS_ADAPTIVE_COMPACTION_REFERENCE") != "1" };
+
+    internal static PocketOptions CaptureTrialFilledSweepMode(PocketOptions options)
+        => options with { TrialFilledSweepProposals = options.TrialFilledSweepProposals
+            && Environment.GetEnvironmentVariable("RW_TOOLPATHS_TRIAL_FILLED_SWEEP_REFERENCE") != "1"
+            && Environment.GetEnvironmentVariable("RW_TOOLPATHS_COHERENCE_REFERENCE") != "1" };
+
+    internal static PocketOptions CaptureParentLocalRescueMode(PocketOptions options)
+        => options with { ParentLocalRescueProposals = options.ParentLocalRescueProposals
+            && Environment.GetEnvironmentVariable("RW_TOOLPATHS_PARENT_LOCAL_RESCUE_REFERENCE") != "1"
+            && Environment.GetEnvironmentVariable("RW_TOOLPATHS_COHERENCE_REFERENCE") != "1" };
+
+    internal static PocketOptions CaptureExactFirstCoverageMode(PocketOptions options)
+        => options with { ExactFirstCoverageProposals = options.ExactFirstCoverageProposals
+            && Environment.GetEnvironmentVariable("RW_TOOLPATHS_EXACT_FIRST_COVERAGE_REFERENCE") != "1"
+            && Environment.GetEnvironmentVariable("RW_TOOLPATHS_COHERENCE_REFERENCE") != "1"
+            && Environment.GetEnvironmentVariable("RW_TOOLPATHS_LOCAL_MEDIAL_REFERENCE") != "1" };
+
+    internal static PocketOptions CaptureConcentricConstructionMode(PocketOptions options)
+    {
+        bool reference = Environment.GetEnvironmentVariable("RW_TOOLPATHS_COHERENCE_REFERENCE") == "1";
+        return options with {
+            DenseFirstArcConstruction = options.DenseFirstArcConstruction && !reference
+                && Environment.GetEnvironmentVariable("RW_TOOLPATHS_FIRST_ARC_REFERENCE") != "1",
+            TwoOriginConstruction = options.TwoOriginConstruction && !reference
+                && Environment.GetEnvironmentVariable("RW_TOOLPATHS_TWO_ORIGIN_REFERENCE") != "1",
+            SeparateOriginalFirstConstruction = options.SeparateOriginalFirstConstruction && !reference
+                && Environment.GetEnvironmentVariable("RW_TOOLPATHS_FIRST_HOLE_EROSION_REFERENCE") != "1",
+        };
     }
 
     /// <summary>
@@ -191,7 +472,7 @@ public static class PocketToolpaths
     {
         long t0 = PerfLog.Start();
         var travel = rings
-            .Where(ring => ring.Level == 0)
+            .Where(ring => ring.Level == 0 && ring.IsClosed)
             .Select(ring =>
             {
                 var points = new List<PointD>(ring.Points);
@@ -271,15 +552,22 @@ public static class PocketToolpaths
                     : islandRings.Select(r => new RingChain(new List<int> { r })));
             }
 
-            var reversedChains = chains
-                .AsEnumerable()
-                .Reverse()
-                .Select(chain => new RingChain(chain.RingIndices
-                    .AsEnumerable()
-                    .Reverse()
-                    .ToList()))
-                .ToList();
-            bool rampAcrossPassSeam = chains.Sum(chain => chain.RingIndices.Count) == 2;
+            // A hole's shallow rim can be separated from the outer fronts by
+            // virgin stock. Finish the material fronts, including their corner
+            // branches, before entering a hole at its deepest adjacent front.
+            // Only the visit order changes; each contour keeps its commanded
+            // cutting direction and all of its native edges.
+            var holeChains = chains.Where(chain => chain.RingIndices.All(index =>
+                rings[index].IsClosed && rings[index].IsHole)).ToList();
+            if (category == Category && holeChains.Count > 0)
+            {
+                chains = chains.Except(holeChains).Concat(holeChains.Select(chain =>
+                    new RingChain(chain.RingIndices.OrderByDescending(index => rings[index].Level).ToList()))).ToList();
+                Console.WriteLine($"[PocketToolpaths.HoleFrontOrder] region={rings[chains[0].RingIndices[0]].RegionIndex} "
+                    + $"holeChains={holeChains.Count} order=material-fronts-then-deep-hole-fronts "
+                    + $"insideOut={options.InsideOut} temporalProof=final-order");
+            }
+
             foreach (var chain in chains)
             {
                 foreach (int ringIndex in chain.RingIndices)
@@ -292,9 +580,34 @@ public static class PocketToolpaths
                 cancellationToken.ThrowIfCancellationRequested();
                 double topZ = depth.PassTopZ(pass);
                 double bottomZ = depth.PassBottomZ(pass);
-                IReadOnlyList<RingChain> passChains = rampAcrossPassSeam || pass % 2 == 0
-                    ? chains
-                    : reversedChains;
+                // The authored inward/outward order applies at every depth. An
+                // open terminal trace is not a closed seam to reverse on odd passes.
+                // Ring dependencies live inside each chain. Independent chains
+                // at this same floor can be visited from the current exit,
+                // retaining the material-front-before-hole-front barrier.
+                var passChains = new List<RingChain>(chains.Count);
+                Point3D? chainCursor=regionEnd;
+                if(chains.Count<8)passChains.AddRange(chains);
+                else foreach(var batch in chains.GroupBy(chain=>(
+                    Hole:chain.RingIndices.All(index=>rings[index].IsClosed&&rings[index].IsHole),
+                    FirstLevel:rings[chain.RingIndices[0]].Level,LastLevel:rings[chain.RingIndices[^1]].Level)))
+                {
+                    var candidates=batch.ToArray();
+                    var visits=candidates.Select(chain=>
+                    {
+                        var ring=rings[chain.RingIndices[0]];
+                        var points=ring.Points.Select(p=>new Point3D(p.x,p.y,bottomZ)).ToList();
+                        if(ring.IsClosed&&points[0]!=points[^1])points.Add(points[0]);
+                        return new TaggedToolpath(points,Array.Empty<ToolpathSpan>(),0,category,pass,detectCurves:false);
+                    }).ToArray();
+                    foreach(int next in ToolpathVisitOrder.Order(visits,Enumerable.Repeat(true,visits.Length).ToArray(),chainCursor,cancellationToken))
+                    {
+                        passChains.Add(candidates[next]);
+                        var visit=visits[next];int seam=chainCursor is {} from ? ToolpathVisitOrder.EntryIndex(visit,from,cancellationToken) : 0;
+                        chainCursor=visit.Points[0]==visit.Points[^1] ? visit.Points[seam]
+                            : seam==visit.Points.Count-1 ? visit.Points[0] : visit.Points[^1];
+                    }
+                }
 
                 for (int chainIndex = 0; chainIndex < passChains.Count; chainIndex++)
                 {
@@ -306,7 +619,7 @@ public static class PocketToolpaths
                     foreach (var built in BuildChainPaths(
                                  rings, passChain, topZ, bottomZ, regionEnd,
                                  requireEntry: pass == 0 && chainIndex == 0 && previousEnd is not null,
-                                 options, tool,
+                                 options, tool, cancellationToken,
                                  ref linkLifts, ref linkCandidatesTested, ref alternativeLinks,
                                  ref radialDepthRamps, ref planarRingTransitions,
                                  ref straightTransitionFallbacks))
@@ -362,13 +675,38 @@ public static class PocketToolpaths
         {
             (toolpaths, routeExcursions, routeAirSaved) = InterleaveNearbyRoutes(
                 toolpaths,
-                depth.PassCount);
+                depth.PassCount, options.PreserveCommandVertices);
             linkLength = BoundaryLinkLength(toolpaths);
             emittedPointCount = toolpaths.Sum(path => path.Points.Count);
         }
 
+        // Interleaving changes which stock has actually been cut before a
+        // continuation. Certify floor links in the final execution order.
+        if (category == Category)
+        {
+            var ordered = PocketContinuationRouter.Route(toolpaths, depth, options, tool.Radius, cancellationToken,
+                tool: tool);
+            toolpaths = ordered.Paths;
+            linkLifts += ordered.Lifts;
+            plunges += ordered.Plunges;
+            linearRamps += ordered.LinearRamps;
+            helicals += ordered.Helicals;
+            alternativeLinks += ordered.Rebased;
+            linkCandidatesTested += ordered.Candidates;
+            cutLength = toolpaths.Sum(path => CutLength(path.Points, path.Spans));
+            linkLength = BoundaryLinkLength(toolpaths);
+            emittedPointCount = toolpaths.Sum(path => path.Points.Count);
+        }
+
+        // Route construction and the temporal stock router above already own
+        // these transitions. Rediscovering them in an emitted-chord A* graph
+        // duplicates physical proofs and obscures source connectivity.
+        cutLength = toolpaths.Sum(path => CutLength(path.Points,path.Spans));
+        linkLength = BoundaryLinkLength(toolpaths);
+        emittedPointCount = toolpaths.Sum(path => path.Points.Count);
+
         long sweptAreaStart = PerfLog.Start();
-        var sweptCenterlines = rings
+        var sweptCenterlines = rings.Where(ring => ring.IsClosed)
             .Select(ring => (IReadOnlyList<PointD>)ring.Points)
             .ToList();
         var linkKeys = new HashSet<(long StartX, long StartY, long EndX, long EndY)>();
@@ -405,10 +743,9 @@ public static class PocketToolpaths
 
         int bufferedPointCount = sweptCenterlines.Sum(centerline => centerline.Count);
         var sweptArea = options.CalculateSweptArea && toolpaths.Count > 0
-            ? PolygonOps.BufferCenterlines(
-                sweptCenterlines,
-                tool.Radius,
-                options.Tolerances.ArcTolerance)
+            ? PolygonOps.Union(PolygonOps.BufferCenterlines(sweptCenterlines, tool.Radius, options.Tolerances.ArcTolerance)
+                .Concat(PolygonOps.BufferOpenCenterlines(rings.Where(ring => !ring.IsClosed).Select(ring => ring.Points),
+                    tool.Radius, options.Tolerances.ArcTolerance, cancellationToken)))
             : new List<List<PointD>>();
         PerfLog.Stop("PocketToolpaths.SweptArea", sweptAreaStart,
             $"rings={rings.Count} links={linkCenterlineCount} emittedPoints={emittedPointCount} " +
@@ -416,7 +753,8 @@ public static class PocketToolpaths
 
         var diagnostics = new ToolpathDiagnostics
         {
-            RingCount = rings.Count,
+            RingCount = rings.Count(ring => ring.IsClosed),
+            StripCount = rings.Count(ring => !ring.IsClosed),
             IslandCount = traversal.Islands.Count,
             PathCount = toolpaths.Count,
             DepthPassCount = depth.PassCount,
@@ -465,6 +803,7 @@ public static class PocketToolpaths
         internal IReadOnlyList<TaggedToolpath> Paths { get; }
         internal double CutLength { get; }
         internal List<RouteAttachment> Attachments { get; } = new();
+        internal Dictionary<int, PreparedCarrierSegments> CarrierIndexes { get; } = new();
     }
 
     private sealed record RouteAttachment(
@@ -480,10 +819,12 @@ public static class PocketToolpaths
     private static (List<TaggedToolpath> Paths, int Excursions, double AirSaved)
         InterleaveNearbyRoutes(
             IReadOnlyList<TaggedToolpath> source,
-            int scheduledPasses)
+            int scheduledPasses, bool commandVerticesOnly = false)
     {
         List<RouteBlock> routes = BuildRouteBlocks(source);
         var attachedRoutes = new HashSet<int>();
+        var carrierDiagnostics = new PreparedCarrierSegments.Diagnostics();
+        bool useCarrierIndex = Environment.GetEnvironmentVariable("RW_TOOLPATHS_ROUTING_REFERENCE") != "1";
         foreach (RouteBlock guest in routes.OrderBy(route => route.CutLength))
         {
             if (!IsSpiralRoute(guest, scheduledPasses))
@@ -504,11 +845,20 @@ public static class PocketToolpaths
 
                 for (int pathIndex = 0; pathIndex < host.Paths.Count; pathIndex++)
                 {
+                    PreparedCarrierSegments? carrier = null;
+                    if (useCarrierIndex && !host.CarrierIndexes.TryGetValue(pathIndex, out carrier))
+                    {
+                        carrier = new PreparedCarrierSegments(host.Paths[pathIndex], carrierDiagnostics);
+                        host.CarrierIndexes.Add(pathIndex, carrier);
+                    }
                     if (!TryFindRoutePause(
                             host.Paths[pathIndex],
+                            carrier,
                             guestStart,
                             guestEnd,
-                            out RoutePause pause)
+                            best?.Pause.ExcursionLength ?? double.MaxValue,
+                            carrierDiagnostics,
+                            out RoutePause pause, commandVerticesOnly)
                         || (best is not null
                             && pause.ExcursionLength >= best.Value.Pause.ExcursionLength))
                     {
@@ -534,6 +884,9 @@ public static class PocketToolpaths
             EmitRouteBlock(root, output);
 
         double airSaved = BoundaryLinkLength(source) - BoundaryLinkLength(output);
+        Console.WriteLine($"[PocketContinuation.Carrier] routes={routes.Count} excursions={attachedRoutes.Count} "
+            + $"mode={(useCarrierIndex ? "indexed" : "reference")} commandVerticesOnly={commandVerticesOnly} "
+            + carrierDiagnostics.Describe());
         return (output, attachedRoutes.Count, airSaved);
     }
 
@@ -724,40 +1077,84 @@ public static class PocketToolpaths
 
     private static bool TryFindRoutePause(
         TaggedToolpath host,
+        PreparedCarrierSegments? carrier,
         Point3D guestStart,
         Point3D guestEnd,
-        out RoutePause pause)
+        double upperBound,
+        PreparedCarrierSegments.Diagnostics diagnostics,
+        out RoutePause pause, bool commandVerticesOnly = false)
     {
-        pause = default;
-        double best = double.MaxValue;
-        foreach (ToolpathSpan span in host.Spans)
+        if (carrier is null || !carrier.SupportsBounds(guestStart, guestEnd))
         {
-            if (span.Kind != ToolpathSpanKind.Cut)
-                continue;
-
-            int firstEnd = Math.Max(1, span.StartIndex + 1);
-            int lastEnd = Math.Min(host.Points.Count - 1, span.EndIndex);
-            for (int segmentEnd = firstEnd; segmentEnd <= lastEnd; segmentEnd++)
+            if (carrier is not null) diagnostics.FallbackQueries++;
+            // Preserve the exact former comparison for malformed coordinates:
+            // a NaN excursion can replace an earlier finite candidate and make
+            // the path fail. Spatial pruning must not silently ignore it.
+            pause = default;
+            double legacyBest = double.MaxValue;
+            foreach (var span in host.Spans)
             {
-                Point3D start = host.Points[segmentEnd - 1];
-                Point3D end = host.Points[segmentEnd];
-                double position = MinimizeExcursion(start, end, guestStart, guestEnd);
-                if (position <= 1e-7 && segmentEnd == 1
-                    || position >= 1 - 1e-7 && segmentEnd == host.Points.Count - 1)
+                if (span.Kind != ToolpathSpanKind.Cut) continue;
+                for (int segmentEnd = Math.Max(1, span.StartIndex + 1);
+                    segmentEnd <= Math.Min(host.Points.Count - 1, span.EndIndex); segmentEnd++)
                 {
-                    continue;
+                    Point3D start = host.Points[segmentEnd - 1], end = host.Points[segmentEnd];
+                    double position;
+                    if (commandVerticesOnly)
+                    {
+                        if (!TryVertexExcursion(start, end, guestStart, guestEnd, segmentEnd,
+                                host.Points.Count, out position)) continue;
+                    }
+                    else position = MinimizeExcursion(start, end, guestStart, guestEnd);
+                    if (position <= 1e-7 && segmentEnd == 1
+                        || position >= 1 - 1e-7 && segmentEnd == host.Points.Count - 1) continue;
+                    Point3D candidate = Interpolate(start, end, position);
+                    double length = PlanarDistance(candidate, guestStart) + PlanarDistance(guestEnd, candidate);
+                    if (length >= legacyBest) continue;
+                    legacyBest = length;
+                    pause = new RoutePause(segmentEnd, position, length);
                 }
-                Point3D candidate = Interpolate(start, end, position);
-                double length = PlanarDistance(candidate, guestStart)
-                    + PlanarDistance(guestEnd, candidate);
-                if (length >= best)
-                    continue;
+            }
+            return legacyBest < double.MaxValue;
+        }
+        RoutePause selected = default;
+        double best = upperBound;
+        int bestOrdinal = int.MaxValue;
+        carrier.VisitCandidates(guestStart, guestEnd, () => best, Evaluate, diagnostics);
+        pause = selected;
+        return bestOrdinal != int.MaxValue;
 
+        void Evaluate(PreparedCarrierSegments.Segment segment)
+        {
+            Point3D start = segment.Start, end = segment.End;
+            double position;
+            if (commandVerticesOnly)
+            {
+                if (!TryVertexExcursion(start, end, guestStart, guestEnd, segment.EndIndex,
+                        host.Points.Count, out position)) return;
+            }
+            else position = MinimizeExcursion(start, end, guestStart, guestEnd);
+            if (position <= 1e-7 && segment.EndIndex == 1
+                || position >= 1 - 1e-7 && segment.EndIndex == host.Points.Count - 1)
+                return;
+            Point3D candidate = Interpolate(start, end, position);
+            double length = PlanarDistance(candidate, guestStart) + PlanarDistance(guestEnd, candidate);
+            if (length < best || length == best && segment.Ordinal < bestOrdinal)
+            {
                 best = length;
-                pause = new RoutePause(segmentEnd, position, length);
+                bestOrdinal = segment.Ordinal;
+                selected = new RoutePause(segment.EndIndex, position, length);
             }
         }
-        return best < double.MaxValue;
+    }
+
+    private static bool TryVertexExcursion(Point3D start, Point3D end, Point3D guestStart,
+        Point3D guestEnd, int segmentEndIndex, int pointCount, out double position)
+    {
+        bool allowStart = segmentEndIndex != 1, allowEnd = segmentEndIndex != pointCount - 1;
+        position = allowStart && (!allowEnd || PlanarDistance(start, guestStart) + PlanarDistance(guestEnd, start)
+            <= PlanarDistance(end, guestStart) + PlanarDistance(guestEnd, end)) ? 0 : 1;
+        return allowStart || allowEnd;
     }
 
     private static double MinimizeExcursion(
@@ -947,6 +1344,7 @@ public static class PocketToolpaths
         bool requireEntry,
         PocketOptions options,
         ToolGeometry tool,
+        CancellationToken cancellationToken,
         ref int linkLifts,
         ref int linkCandidatesTested,
         ref int alternativeLinks,
@@ -957,7 +1355,8 @@ public static class PocketToolpaths
         var clearance = options.LinkClearance ?? LinkClearance.Unrestricted;
         var paths = new List<ChainPath>(1);
 
-        var firstRing = RingOffsetEngine.Orient(rings[chain.RingIndices[0]].Points, options.Direction);
+        bool firstClosed = rings[chain.RingIndices[0]].IsClosed;
+        var firstRing = RingOffsetEngine.Orient(rings[chain.RingIndices[0]], options.Direction);
         bool hasEntry = true;
         bool linkAtDepth = false;
         bool continuesFromPreviousPass = false;
@@ -968,22 +1367,21 @@ public static class PocketToolpaths
             if (requireEntry)
             {
                 linkLifts++;
-                firstRing = PathUtils.RebaseNear(
-                    firstRing,
-                    new PointD(target.X, target.Y));
+                firstRing = RebaseFillPath(firstRing, firstClosed, target);
             }
             else
             {
                 bool continuesPreviousPass = Math.Abs(target.Z - topZ) <= 1e-6;
                 double entryZ = continuesPreviousPass ? topZ : bottomZ;
-                if (TryFindSafeRebase(
+                if (TryFindSafeFillEntry(
                         firstRing,
+                        firstClosed,
                         target,
                         entryZ,
                         clearance,
                         tool.Radius,
                         out var entryRing,
-                        out int candidatesTested))
+                        out int candidatesTested, options.PreserveCommandVertices))
                 {
                     firstRing = entryRing;
                     linkAtDepth = !continuesPreviousPass;
@@ -1012,17 +1410,12 @@ public static class PocketToolpaths
                 {
                     linkCandidatesTested += candidatesTested;
                     linkLifts++;
-                    firstRing = PathUtils.RebaseNear(
-                        firstRing,
-                        new PointD(target.X, target.Y));
+                    firstRing = RebaseFillPath(firstRing, firstClosed, target);
                 }
             }
         }
-        var entry = RampPlanner.PlanClosedRing(
-            firstRing,
-            linkAtDepth ? bottomZ : ringEntryZ,
-            bottomZ,
-            options.Ramp);
+        var entry = PlanFillEntry(firstRing, firstClosed,
+            linkAtDepth ? bottomZ : ringEntryZ, bottomZ, options.Ramp, options.PreserveCommandVertices, cancellationToken);
 
         var points = entry.Points;
         var spans = entry.Spans;
@@ -1043,19 +1436,21 @@ public static class PocketToolpaths
 
         for (int i = 1; i < chain.RingIndices.Count; i++)
         {
-            var ring = RingOffsetEngine.Orient(rings[chain.RingIndices[i]].Points, options.Direction);
+            bool closed = rings[chain.RingIndices[i]].IsClosed;
+            var ring = RingOffsetEngine.Orient(rings[chain.RingIndices[i]], options.Direction);
 
             if (points.Count > 0)
             {
                 var last = points[^1];
-                if (TryFindSafeRebase(
+                if (TryFindSafeFillEntry(
                         ring,
+                        closed,
                         last,
                         bottomZ,
                         clearance,
                         tool.Radius,
                         out var rebased,
-                        out int candidatesTested))
+                        out int candidatesTested, options.PreserveCommandVertices))
                 {
                     linkCandidatesTested += candidatesTested;
                     if (candidatesTested > 1)
@@ -1068,17 +1463,18 @@ public static class PocketToolpaths
                         clearance,
                         tool.Radius,
                         ref planarRingTransitions,
-                        ref straightTransitionFallbacks);
+                        ref straightTransitionFallbacks, isClosed: closed);
                     continue;
                 }
 
                 linkCandidatesTested += candidatesTested;
-                rebased = PathUtils.RebaseNear(ring, new PointD(last.X, last.Y));
+                rebased = RebaseFillPath(ring, closed, last);
 
                 linkLifts++;
                 paths.Add(new ChainPath(points, spans, strategy, hasEntry));
 
-                var reentry = RampPlanner.PlanClosedRing(rebased, topZ, bottomZ, options.Ramp);
+                var reentry = PlanFillEntry(rebased, closed, topZ, bottomZ, options.Ramp,
+                    options.PreserveCommandVertices, cancellationToken);
                 points = reentry.Points;
                 spans = reentry.Spans;
                 strategy = reentry.Strategy;
@@ -1094,11 +1490,60 @@ public static class PocketToolpaths
                 clearance,
                 tool.Radius,
                 ref planarRingTransitions,
-                ref straightTransitionFallbacks);
+                ref straightTransitionFallbacks, isClosed: closed);
         }
 
         paths.Add(new ChainPath(points, spans, strategy, hasEntry));
         return paths;
+    }
+
+    private static RampedPath PlanFillEntry(IReadOnlyList<PointD> path, bool closed,
+        double topZ, double bottomZ, RampSettings settings, bool commandVerticesOnly = false,
+        CancellationToken cancellationToken = default)
+    {
+        if (closed) return commandVerticesOnly
+            ? RampPlanner.PlanClosedRingAtCommandVertices(path, topZ, bottomZ, settings,
+                cancellationToken,
+                diagnostic: message => Console.WriteLine($"[PocketToolpaths.CommandVertexEntry] {message}"))
+            : RampPlanner.PlanClosedRing(path, topZ, bottomZ, settings);
+        var trace = path.Select(p => new Point3D(p.x, p.y, bottomZ)).ToList();
+        if (topZ <= bottomZ + 1e-9)
+            return new RampedPath(trace, new List<ToolpathSpan> { new(0, trace.Count - 1, ToolpathSpanKind.Cut) }, RampStrategy.Plunge, 0);
+        if (settings.Strategy == RampStrategy.Plunge || settings.AngleRadians <= 0)
+        {
+            trace.Insert(0, new Point3D(trace[0].X, trace[0].Y, topZ));
+            return new RampedPath(trace, new List<ToolpathSpan>
+            {
+                new(0, 1, ToolpathSpanKind.Ramp), new(1, trace.Count - 1, ToolpathSpanKind.Cut)
+            }, RampStrategy.Plunge, 0);
+        }
+        return RampPlanner.PlanPathEntry(trace, topZ, settings,
+            cancellationToken,
+            diagnostic: message => Console.WriteLine($"[PocketToolpaths.TerminalEntry] {message}"),
+            landAtSourceVertex: commandVerticesOnly);
+    }
+
+    private static List<PointD> RebaseFillPath(List<PointD> path, bool closed, Point3D from)
+    {
+        if (closed) return PathUtils.RebaseNear(path, new PointD(from.X, from.Y));
+        var result = new List<PointD>(path);
+        if (PlanarDistance(from, new Point3D(path[^1].x, path[^1].y, from.Z))
+            < PlanarDistance(from, new Point3D(path[0].x, path[0].y, from.Z))) result.Reverse();
+        return result;
+    }
+
+    private static bool TryFindSafeFillEntry(IReadOnlyList<PointD> path, bool closed, Point3D from,
+        double bottomZ, ILinkClearance clearance, double radius, out List<PointD> entry, out int tested,
+        bool commandVerticesOnly = false)
+    {
+        if (closed) return TryFindSafeRebase(path, from, bottomZ, clearance, radius, out entry, out tested, commandVerticesOnly,
+            localEntriesOnly:true);
+        entry = RebaseFillPath(path.ToList(), false, from);
+        tested = 1;
+        if (clearance.IsTravelSafe(from, new Point3D(entry[0].x, entry[0].y, bottomZ), radius)) return true;
+        tested++;
+        entry.Reverse();
+        return clearance.IsTravelSafe(from, new Point3D(entry[0].x, entry[0].y, bottomZ), radius);
     }
 
     private static void PrependTransition(
@@ -1192,7 +1637,7 @@ public static class PocketToolpaths
         ILinkClearance clearance,
         double toolRadius,
         out List<PointD> rebased,
-        out int candidatesTested)
+        out int candidatesTested, bool commandVerticesOnly = false, bool localEntriesOnly = false)
     {
         var loop = RampPlanner.Normalize(ring);
         rebased = loop;
@@ -1207,6 +1652,7 @@ public static class PocketToolpaths
             PointD start = loop[segmentIndex];
             PointD end = loop[(segmentIndex + 1) % loop.Count];
             AddCandidate(start, segmentIndex, 0);
+            if (commandVerticesOnly) continue;
 
             double dx = end.x - start.x;
             double dy = end.y - start.y;
@@ -1235,8 +1681,14 @@ public static class PocketToolpaths
                 : first.SegmentPosition.CompareTo(second.SegmentPosition);
         });
 
+        // Do not orbit a whole contour looking for a distant legal bridge when
+        // its nearby entry is blocked. The normal re-entry retains every cut.
+        // This also bounds expensive physical proofs to a local neighbourhood.
+        double localLimit = !localEntriesOnly ? double.PositiveInfinity : candidates.Count == 0 ? 0
+            : Math.Sqrt(candidates[0].DistanceSquared) + 8 * toolRadius;
         foreach (LinkCandidate candidate in candidates)
         {
+            if (candidate.DistanceSquared > localLimit * localLimit + 1e-12) break;
             candidatesTested++;
             if (!clearance.IsTravelSafe(
                     from,
@@ -1308,7 +1760,8 @@ public static class PocketToolpaths
         ILinkClearance clearance,
         double toolRadius,
         ref int planarRingTransitions,
-        ref int straightTransitionFallbacks)
+        ref int straightTransitionFallbacks,
+        bool isClosed = true)
     {
         if (ring.Count == 0)
             return;
@@ -1354,7 +1807,7 @@ public static class PocketToolpaths
             PointD point = ring[pointIndex];
             points.Add(new Point3D(point.x, point.y, bottomZ));
         }
-        points.Add(new Point3D(ring[0].x, ring[0].y, bottomZ));
+        if (isClosed) points.Add(new Point3D(ring[0].x, ring[0].y, bottomZ));
 
         spans.Add(new ToolpathSpan(cutStart, points.Count - 1, ToolpathSpanKind.Cut));
     }
@@ -1362,11 +1815,21 @@ public static class PocketToolpaths
     /// <summary>Trims rings to a boundary, preserving each ring's level and region.</summary>
     private static List<OffsetRing> ClipRings(
         IReadOnlyList<OffsetRing> rings,
-        IReadOnlyList<PointD> boundary)
+        IReadOnlyList<PointD> boundary, CancellationToken cancellationToken = default)
     {
         var clipped = new List<OffsetRing>(rings.Count);
         foreach (var ring in rings)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!ring.IsClosed)
+            {
+                var open = CheckedOpenClip.Require(new[] { ring.Points }, new[] { boundary }, ClipType.Intersection,
+                    cancellationToken, "pocket-final-open-commands");
+                foreach (var fragment in open)
+                    if (fragment.Count >= 2) clipped.Add(RingOffsetEngine.CreateRing(fragment,
+                        ring.Level, ring.RegionIndex, isHole: false, isClosed: false));
+                continue;
+            }
             foreach (var fragment in PolygonOps.Clip(new[] { ring.Points }, boundary))
             {
                 if (fragment.Count >= 3)
@@ -1375,6 +1838,88 @@ public static class PocketToolpaths
             }
         }
         return clipped;
+    }
+
+    internal sealed class FillSourceClearance : ILinkClearance
+    {
+        private readonly List<(PolygonOps.BoundarySegmentIndex Index, double MinX, double MinY, double MaxX, double MaxY)> _sources;
+        private readonly double _radius;
+        private readonly ILinkClearance? _caller;
+        private readonly ILinkClearance? _clip;
+        private long _queries, _sourceRefusals, _callerRefusals, _clipRefusals;
+        private readonly double _requestedRadius;
+        private readonly object _sourceMemoLock=new();
+        private readonly Dictionary<(double,double,double,double),bool> _sourceMemo=new();
+        private readonly Queue<(double,double,double,double)> _sourceMemoOrder=new();
+        internal long SourceMemoHits;
+        private long _sourceMemoMisses,_sourceMemoEvictions;
+
+        internal FillSourceClearance(IReadOnlyList<MillingRegion> regions, double radius,
+            ILinkClearance? caller, IReadOnlyList<PointD>? clip)
+        {
+            long started = PerfLog.Start();
+            _sources = regions.Where(region => region.Outer.Count >= 3).Select(region =>
+                (new PolygonOps.BoundarySegmentIndex(PathUtils.ToClipper(
+                    PolygonOps.Difference(new[] { region.Outer }, region.Holes))),
+                    region.Outer.Min(p => p.x) - .001, region.Outer.Min(p => p.y) - .001,
+                    region.Outer.Max(p => p.x) + .001, region.Outer.Max(p => p.y) + .001)).ToList();
+            // ContainsCapsule adds four native ticks. Subtract eight here so
+            // the net commanded chord contract is radius minus four ticks,
+            // exactly the existing original first-front wall proof. The .001
+            // source approximation allowance never authorizes a link to shave
+            // stock-to-leave. F3 displacement has its separate posted-wall band.
+            _radius = Math.Max(0, radius * PathUtils.Scale - 8);
+            _requestedRadius = radius;
+            _caller = caller;
+            _clip = clip is { Count: >= 3 } ? LinkClearance.WithinRegion(new[] { clip }) : null;
+            PerfLog.Stop("PocketToolpaths.SourceTravelClearance", started,
+                $"sourceRegions={_sources.Count} requestedRadius={radius:R} "
+                + $"nativeChordRadius={(_radius + 4) / PathUtils.Scale:R} "
+                + "sourceApproximationCredited=False owner=original-source-with-protected-holes");
+        }
+
+        public bool IsTravelSafe(Point3D from, Point3D to, double toolRadius)
+        {
+            Interlocked.Increment(ref _queries);
+            if (!(_caller?.IsTravelSafe(from, to, toolRadius) ?? true))
+            { Interlocked.Increment(ref _callerRefusals); return false; }
+            if (!(_clip?.IsTravelSafe(from, to, 0) ?? true))
+            { Interlocked.Increment(ref _clipRefusals); return false; }
+            // Only the immutable source capsule is independent of depth.
+            // The caller's potentially changing stock/XYZ restriction and clip
+            // have ALREADY run, even for a repeated source-safe XY chord.
+            var key=(from.X,from.Y,to.X,to.Y);
+            lock(_sourceMemoLock)
+                if(_sourceMemo.TryGetValue(key,out bool cached))
+                {Interlocked.Increment(ref SourceMemoHits);return cached;}
+            Interlocked.Increment(ref _sourceMemoMisses);
+            var a = new Point64((long)Math.Round(from.X * PathUtils.Scale), (long)Math.Round(from.Y * PathUtils.Scale));
+            var b = new Point64((long)Math.Round(to.X * PathUtils.Scale), (long)Math.Round(to.Y * PathUtils.Scale));
+            bool safe=false;
+            foreach(var source in _sources)
+            if(from.X >= source.MinX && from.X <= source.MaxX
+                && from.Y >= source.MinY && from.Y <= source.MaxY
+                && to.X >= source.MinX && to.X <= source.MaxX && to.Y >= source.MinY && to.Y <= source.MaxY
+                && source.Index.ContainsCapsule(a, b, _radius)){safe=true;break;}
+            lock(_sourceMemoLock)
+            if(!_sourceMemo.ContainsKey(key))
+            {
+                if(_sourceMemo.Count==65536){_sourceMemo.Remove(_sourceMemoOrder.Dequeue());_sourceMemoEvictions++;}
+                _sourceMemo.Add(key,safe);_sourceMemoOrder.Enqueue(key);
+            }
+            if (!safe && Interlocked.Increment(ref _sourceRefusals) <= 4)
+                Console.WriteLine($"[Pocket.SourceTravel] event=refuse from=({from.X:R},{from.Y:R},{from.Z:R}) "
+                    + $"to=({to.X:R},{to.Y:R},{to.Z:R}) requestedRadius={_requestedRadius:R} "
+                    + $"nativeChordRadius={(_radius + 4) / PathUtils.Scale:R} "
+                    + "sourceApproximationCredited=False proof=complete-original-source-capsule");
+            return safe;
+        }
+
+        internal void Report() => Console.WriteLine($"[Pocket.SourceTravel] event=complete queries={_queries} "
+            + $"sourceRefusals={_sourceRefusals} callerRefusals={_callerRefusals} clipRefusals={_clipRefusals} "
+            + $"requestedRadius={_requestedRadius:R} nativeChordRadius={(_radius + 4) / PathUtils.Scale:R} "
+            + $"sourceMemoHits={SourceMemoHits} sourceMemoMisses={_sourceMemoMisses} sourceMemoEvictions={_sourceMemoEvictions} sourceMemoLimit=65536 "
+            + "scope=all-offset-links sourceApproximationCredited=False");
     }
 
     private static double CutLength(IReadOnlyList<Point3D> points, IReadOnlyList<ToolpathSpan> spans)

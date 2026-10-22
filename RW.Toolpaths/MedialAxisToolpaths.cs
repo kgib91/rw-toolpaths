@@ -1,5 +1,7 @@
-﻿using System.Runtime.CompilerServices;
+using System.Runtime.CompilerServices;
 using Clipper2Lib;
+using RW.Toolpaths.Milling;
+using RW.Toolpaths.Geometry;
 
 [assembly: InternalsVisibleTo("RW.Toolpaths.Tests")]
 
@@ -83,7 +85,7 @@ public readonly record struct TaggedToolpath
     {
         Points = points;
         Moves = detectCurves ? ToolpathCurveDetector.DetectMoves(points)
-            : Enumerable.Range(1, Math.Max(0, points.Count - 1)).Select(i => ToolMove.Line(points[i - 1], points[i])).ToArray();
+            : new LineToolMoves(points);
         RegionIndex = regionIndex;
         Category = category;
         DepthPassIndex = depthPassIndex;
@@ -94,6 +96,13 @@ public readonly record struct TaggedToolpath
 
     private readonly IReadOnlyList<ToolpathSpan>? _spans;
     internal bool DetectCurves { get; }
+    /// <summary>Transient execution component, proved before depth scheduling.
+    /// Source region, cut category and visit identity retain their own meanings.</summary>
+    internal int? ContinuationComponentIndex { get; init; } = null;
+    internal ToolpathContinuationComponents.Plan? ContinuationPlan {get;init;}=null;
+    internal int? ContinuationSourceOrdinal {get;init;}=null;
+    internal bool ContinuationCircuit {get;init;}=false;
+    internal ToolpathCircuitBuilder.Definition? ContinuationCircuitDefinition {get;init;}=null;
 
     public IReadOnlyList<Point3D> Points { get; init; }
 
@@ -166,6 +175,27 @@ public interface IMedialAxisProvider
         double maxRadius,
         double filteringAngle = 3 * Math.PI / 4,
         bool   useBigIntegers = true);
+
+    /// <summary>Cancelable, observable overload; older providers remain compatible.</summary>
+    IReadOnlyList<MedialSegment> ConstructMedialAxis(
+        IReadOnlyList<PointD> boundary,
+        IReadOnlyList<IReadOnlyList<PointD>> holes,
+        double tolerance,
+        double maxRadius,
+        double filteringAngle,
+        bool useBigIntegers,
+        CancellationToken cancellationToken,
+        Action<string>? diagnostic = null,
+        Action<double, string, bool>? progress = null)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        diagnostic?.Invoke("stage=voronoi-construction event=start provider-progress=opaque");
+        progress?.Invoke(0, "Computing medial axis...", true);
+        var result = ConstructMedialAxis(boundary, holes, tolerance, maxRadius, filteringAngle, useBigIntegers);
+        cancellationToken.ThrowIfCancellationRequested();
+        progress?.Invoke(1, "Medial axis complete", false);
+        return result;
+    }
 }
 
 // --- Main algorithm -----------------------------------------------------------
@@ -319,9 +349,41 @@ public static class MedialAxisToolpaths
         double? topRadiusOverride = null,
         double? coneLengthOverride = null,
         CancellationToken cancellationToken = default,
-        bool includeInteriorFill = true)
+        bool includeInteriorFill = true,
+        Action<string>? diagnostic = null,
+        VCarveCutterProfile? cutterProfile = null,
+        Action<double, string, bool>? progress = null,
+        double outputSurfaceZ = 0,
+        IReadOnlyList<MedialSegment>? preparedMedialGraph = null)
+        => GenerateCore(provider, boundary, startDepth, endDepth, radianTipAngle, depthPerPass,
+            tolerance, rdpTolerance, bottomRadiusOverride, topRadiusOverride, coneLengthOverride,
+            cancellationToken, includeInteriorFill, diagnostic, cutterProfile, progress, outputSurfaceZ,
+            preparedMedialGraph, null);
+
+    private static List<List<Point3D>>? GenerateCore(
+        IMedialAxisProvider provider,
+        IReadOnlyList<IReadOnlyList<PointD>> boundary,
+        double startDepth,
+        double endDepth,
+        double radianTipAngle,
+        double depthPerPass,
+        double tolerance,
+        double rdpTolerance,
+        double? bottomRadiusOverride,
+        double? topRadiusOverride,
+        double? coneLengthOverride,
+        CancellationToken cancellationToken = default,
+        bool includeInteriorFill = true,
+        Action<string>? diagnostic = null,
+        VCarveCutterProfile? cutterProfile = null,
+        Action<double, string, bool>? progress = null,
+        double outputSurfaceZ = 0,
+        IReadOnlyList<MedialSegment>? preparedMedialGraph = null,
+        CertifiedInsetReuse? insetReuse = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        diagnostic?.Invoke("stage=medial-axis event=start");
+        progress?.Invoke(0, "Computing medial detail...", true);
         double endZ   = -endDepth;
         var    result = GenerateMedialAxisToolpaths(
             provider,
@@ -334,12 +396,21 @@ public static class MedialAxisToolpaths
             bottomRadiusOverride,
             topRadiusOverride,
             coneLengthOverride,
-            cancellationToken);
+            cancellationToken, cutterProfile, diagnostic,
+            (fraction, stage, indeterminate) => progress?.Invoke(4.0 / 7 * fraction, stage, indeterminate),
+            outputSurfaceZ, preparedMedialGraph, insetReuse, includeInteriorFill);
 
-        if (result is null) return null;
+        if (result is null)
+        {
+            diagnostic?.Invoke("stage=medial-axis event=complete result=empty");
+            return null;
+        }
         var (medialAxis, flatAreaRegion) = result.Value;
+        diagnostic?.Invoke($"stage=medial-axis event=complete segments={medialAxis.Count} flatRings={flatAreaRegion.Count}");
 
         // Trim segments to final depth and collect flat-area strokes
+        diagnostic?.Invoke("stage=trim-and-flat-fill event=start");
+        progress?.Invoke(4.0 / 7, "Trimming medial detail...", true);
         var flatStrokes  = new List<(PointD A, PointD B)>();
         var trimmed      = medialAxis
             .Select(seg => TrimSegment(seg, endZ, flatStrokes))
@@ -351,13 +422,24 @@ public static class MedialAxisToolpaths
         {
             // Join adjacent flat-area segments and fill the flat bottom area.
             var joinedFlat = JoinSegments(flatStrokes);
-            var flatFill = GenerateFlatAreaFill(joinedFlat, flatAreaRegion, endZ);
+            var flatFill = GenerateFlatAreaFill(joinedFlat, flatAreaRegion, endZ,
+                cancellationToken, diagnostic,
+                (fraction, stage, indeterminate) => progress?.Invoke(4.0 / 7 + 1.5 / 7 * fraction, stage, indeterminate));
             trimmed.AddRange(flatFill);
         }
+        diagnostic?.Invoke($"stage=trim-and-flat-fill event=complete interiorFill={includeInteriorFill} " +
+            $"flatStrokes={flatStrokes.Count} resultingSegments={trimmed.Count}");
 
         // Connect segments into continuous polylines.
+        diagnostic?.Invoke("stage=join event=start");
+        progress?.Invoke(5.5 / 7, "Connecting medial detail...", true);
         var polylines = JoinIntoPolylines(trimmed);
-        if (polylines is null) return null;
+        if (polylines is null)
+        {
+            diagnostic?.Invoke("stage=join event=complete result=empty");
+            return null;
+        }
+        diagnostic?.Invoke($"stage=join event=complete paths={polylines.Count} points={polylines.Sum(path => (long)path.Count)}");
 
         if (rdpTolerance > 0)
         {
@@ -370,15 +452,25 @@ public static class MedialAxisToolpaths
         // surviving vertices.  Recomputes Z at vertices and bisects any chord
         // whose linear-Z interpolation drifts from the analytical depth curve
         // by more than zTolerance.  See EnsureZFidelityFromBoundary.
+        diagnostic?.Invoke("stage=depth-fidelity event=start");
         var zProfile = ResolveToolProfile(
             startDepth, endDepth, radianTipAngle, depthPerPass,
             bottomRadiusOverride, topRadiusOverride, coneLengthOverride);
         var boundarySegs = BuildBoundarySegments(NormalizeBoundaryRings(boundary));
         double zTolerance = Math.Max(tolerance * 0.1, 1e-6);
         var spatialIndex = new SpatialSegmentIndex(boundarySegs);
+        long sourcePointCount = polylines.Sum(path => (long)path.Count);
+        long lastProgress = 0;
         for (int i = 0; i < polylines.Count; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            long now = Environment.TickCount64;
+            if (i == 0 || now - lastProgress >= 100)
+            {
+                progress?.Invoke(5.5 / 7 + 1.5 / 7 * i / polylines.Count,
+                    $"Refining depth: path {i + 1}/{polylines.Count}", false);
+                lastProgress = now;
+            }
             polylines[i] = EnsureZFidelityFromBoundary(
                 polylines[i],
                 spatialIndex,
@@ -386,8 +478,13 @@ public static class MedialAxisToolpaths
                 zProfile.BottomRadius,
                 Math.Max(1e-9, zProfile.RadiusSlope),
                 endZ,
-                zTolerance);
+                zTolerance, cutterProfile, diagnostic);
         }
+        diagnostic?.Invoke($"stage=depth-fidelity event=complete paths={polylines.Count} " +
+            $"sourcePoints={sourcePointCount} outputPoints={polylines.Sum(path => (long)path.Count)} " +
+            $"boundarySegments={boundarySegs.Count} zTolerance={zTolerance:R}");
+        spatialIndex.LogDiagnostics(diagnostic);
+        progress?.Invoke(1, "Medial detail complete", false);
         return polylines;
     }
 
@@ -420,7 +517,9 @@ public static class MedialAxisToolpaths
     ///   Step-over fraction of effective bit diameter. Default 0.4.
     /// </param>
     /// <param name="includeInteriorFill">
-    ///   When <c>false</c>, emits only the outer ring of each depth layer.
+    ///   When <c>false</c>, retains each depth layer's perimeter and limits additional
+    ///   ring centers to <paramref name="edgeFillWidth"/> from the supplied boundary.
+    ///   The cutoff follows the existing polygon normalization and offset tolerances.
     /// </param>
     public static List<List<Point3D>> GenerateClearingPasses(
         IReadOnlyList<IReadOnlyList<PointD>> boundary,
@@ -432,7 +531,11 @@ public static class MedialAxisToolpaths
         double? bottomRadiusOverride = null,
         double? topRadiusOverride = null,
         double? coneLengthOverride = null,
-        bool includeInteriorFill = true)
+        bool includeInteriorFill = true,
+        VCarveCutterProfile? cutterProfile = null,
+        double edgeFillWidth = 0,
+        Action<double, string, bool>? progress = null,
+        double outputSurfaceZ = 0)
     {
         return GenerateClearingPassGeometries(
             boundary,
@@ -444,7 +547,8 @@ public static class MedialAxisToolpaths
             bottomRadiusOverride,
             topRadiusOverride,
             coneLengthOverride,
-            includeInteriorFill)
+            includeInteriorFill, cutterProfile: cutterProfile, edgeFillWidth: edgeFillWidth, progress: progress,
+            outputSurfaceZ: outputSurfaceZ)
             .Select(pass => pass.Points)
             .ToList();
     }
@@ -464,7 +568,46 @@ public static class MedialAxisToolpaths
         double? bottomRadiusOverride = null,
         double? topRadiusOverride = null,
         double? coneLengthOverride = null,
-        bool includeInteriorFill = true)
+        bool includeInteriorFill = true,
+        bool detectCurves = true,
+        Action<string>? diagnostic = null,
+        VCarveCutterProfile? cutterProfile = null,
+        CancellationToken cancellationToken = default,
+        double edgeFillWidth = 0,
+        Action<double, string, bool>? progress = null,
+        double outputSurfaceZ = 0,
+        int skipDepthPasses = 0,
+        double startingDepth = 0)
+        => GenerateClearingPassesTaggedCore(boundary, startDepth, endDepth, radianTipAngle,
+            depthPerPass, stepOver, regionIndex, bottomRadiusOverride, topRadiusOverride,
+            coneLengthOverride, includeInteriorFill, detectCurves, diagnostic, cutterProfile,
+            cancellationToken, edgeFillWidth, progress, outputSurfaceZ, skipDepthPasses, startingDepth, null);
+
+    private static List<TaggedToolpath> GenerateClearingPassesTaggedCore(
+        IReadOnlyList<IReadOnlyList<PointD>> boundary,
+        double startDepth,
+        double endDepth,
+        double radianTipAngle,
+        double depthPerPass,
+        double stepOver,
+        int regionIndex,
+        double? bottomRadiusOverride,
+        double? topRadiusOverride,
+        double? coneLengthOverride,
+        bool includeInteriorFill = true,
+        bool detectCurves = true,
+        Action<string>? diagnostic = null,
+        VCarveCutterProfile? cutterProfile = null,
+        CancellationToken cancellationToken = default,
+        double edgeFillWidth = 0,
+        Action<double, string, bool>? progress = null,
+        double outputSurfaceZ = 0,
+        int skipDepthPasses = 0,
+        double startingDepth = 0,
+        CertifiedInsetReuse? insetReuse = null,
+        RW.Toolpaths.Milling.Acceleration.RawInitialClearingInsetNomination? initialInsetNomination = null,
+        bool retainRawFirst = true, bool retainRawCore = true, bool retainRawMiddle = true,
+        Action<bool>? selectedRawRolesCompleted = null)
     {
         var geometries = GenerateClearingPassGeometries(
             boundary,
@@ -476,17 +619,20 @@ public static class MedialAxisToolpaths
             bottomRadiusOverride,
             topRadiusOverride,
             coneLengthOverride,
-            includeInteriorFill);
+            includeInteriorFill,
+            diagnostic, cutterProfile, cancellationToken, edgeFillWidth, progress, outputSurfaceZ, skipDepthPasses, startingDepth, insetReuse, initialInsetNomination,
+            retainRawFirst, retainRawCore, retainRawMiddle, selectedRawRolesCompleted);
 
         var result = new List<TaggedToolpath>(geometries.Count);
         foreach (var (points, depthPassIndex) in geometries)
         {
-            result.Add(new TaggedToolpath(
-                points,
-                ToolpathCurveDetector.DetectMoves(points, closePath: true),
-                regionIndex,
-                "clearing",
-                depthPassIndex));
+            bool closed = points.Count > 1 && points[0].X == points[^1].X
+                && points[0].Y == points[^1].Y && points[0].Z == points[^1].Z;
+            result.Add(detectCurves
+                ? new TaggedToolpath(points, ToolpathCurveDetector.DetectMoves(points, closePath: closed),
+                    regionIndex, "clearing", depthPassIndex)
+                : new TaggedToolpath(points, Array.Empty<ToolpathSpan>(),
+                    regionIndex, "clearing", depthPassIndex, detectCurves: false));
         }
 
         return result;
@@ -502,8 +648,26 @@ public static class MedialAxisToolpaths
         double? bottomRadiusOverride,
         double? topRadiusOverride,
         double? coneLengthOverride,
-        bool includeInteriorFill)
+        bool includeInteriorFill,
+        Action<string>? diagnostic = null,
+        VCarveCutterProfile? cutterProfile = null,
+        CancellationToken cancellationToken = default,
+        double edgeFillWidth = 0,
+        Action<double, string, bool>? progress = null,
+        double outputSurfaceZ = 0,
+        int skipDepthPasses = 0,
+        double startingDepth = 0,
+        CertifiedInsetReuse? insetReuse = null,
+        RW.Toolpaths.Milling.Acceleration.RawInitialClearingInsetNomination? initialInsetNomination = null,
+        bool retainRawFirst = true, bool retainRawCore = true, bool retainRawMiddle = true,
+        Action<bool>? selectedRawRolesCompleted = null)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+        ArgumentOutOfRangeException.ThrowIfNegative(skipDepthPasses);
+        if (!double.IsFinite(startingDepth) || startingDepth < 0 || startingDepth > endDepth)
+            throw new ArgumentOutOfRangeException(nameof(startingDepth));
+        if (!double.IsFinite(edgeFillWidth) || edgeFillWidth < 0)
+            throw new ArgumentOutOfRangeException(nameof(edgeFillWidth));
         if (endDepth <= startDepth) return new();
 
         var normalizedBoundary = NormalizeBoundaryRings(boundary);
@@ -524,49 +688,97 @@ public static class MedialAxisToolpaths
             topRadiusOverride,
             coneLengthOverride);
 
-        double bitDiameter = 2.0 * profile.FinalRadius;
+        double finalRadius = cutterProfile?.RadiusAtDepth(endDepth - startDepth) ?? profile.FinalRadius;
+        double finalCommandRadius = CommandedCuttingRadius(cutterProfile, profile.BottomRadius,
+            profile.RadiusSlope, startDepth, endDepth, outputSurfaceZ, coneLengthOverride);
+        double bitDiameter = 2.0 * finalRadius;
         if (bitDiameter <= 0) return new();
 
         double T = stepOver * bitDiameter;
         double M = 0.05 * bitDiameter;
-        const double B = 2.0;
-        double _t = B * M;
 
-        double firstDepth = Math.Floor(startDepth / depthPerPass) * depthPerPass;
+        // startDepth is the physical geometry origin. The independently authored
+        // cleared floor controls scheduling only; it must not shrink the cutter's
+        // footprint against the unchanged original stock boundary.
+        double firstDepth = startingDepth > 0 ? Math.Max(startDepth, startingDepth)
+            : Math.Floor(startDepth / depthPerPass) * depthPerPass;
+        int nominalLayers = Math.Max(1, (int)Math.Ceiling((endDepth - firstDepth) / depthPerPass - 1e-9));
+        int effectiveSkipped = Math.Min(skipDepthPasses, nominalLayers - 1);
+        diagnostic?.Invoke($"stage=depth-schedule nominalPasses={nominalLayers} " +
+            $"startingDepth={startingDepth:R} physicalGeometryOrigin={startDepth:R} " +
+            $"skipDepthPasses={skipDepthPasses} effectiveSkipped={effectiveSkipped} " +
+            $"remainingPasses={nominalLayers - effectiveSkipped} finalTargetRetained=True " +
+            $"firstDepth={Math.Min(endDepth, firstDepth + (effectiveSkipped + 1d) * depthPerPass):R}");
 
         // layers: (z, zTop, rings, isBottomLayer, effectiveRadiusAtLayer)
-        var layers = new List<(double z, double zTop, List<List<PointD>> rings, bool isBottom, double layerRadius)>();
+        var layers = new List<(double z, double zTop, List<List<PointD>> rings, bool isBottom,
+            double layerRadius, double nominalRadius, int nominalPassIndex)>();
 
         double N = firstDepth;
-        double k = firstDepth + depthPerPass;
+        double k = Math.Min(endDepth, firstDepth + (effectiveSkipped + 1d) * depthPerPass);
         double b = endDepth;
+        int nominalPassIndex = effectiveSkipped;
 
 
         const double Eps = 1e-5;
         bool CloseTo(double a, double x) => Math.Abs(a - x) < Eps;
+        int plannedLayers = nominalLayers - effectiveSkipped;
+        int preparationIndex = 0;
+
+        HashSet<double>? rawNominationDepths = initialInsetNomination?.CollectorNominationCaptured == true ? new() : null;
+
+        List<List<PointD>> ContractLayer(double layerDepth, double radius)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            progress?.Invoke(.25 * preparationIndex / plannedLayers,
+                $"Preparing clearing pass {++preparationIndex}/{plannedLayers} at {layerDepth:0.###} mm", true);
+            double commandedDepth = CommandedMachineDepth(layerDepth, outputSurfaceZ);
+            double nominalRadius = cutterProfile?.RadiusAtDepth(Math.Max(0, layerDepth - startDepth))
+                ?? profile.BottomRadius + profile.RadiusSlope * Math.Max(0, layerDepth - startDepth);
+            diagnostic?.Invoke($"stage=clearing-inset event=start depth={layerDepth:R} " +
+                $"commandedDepth={commandedDepth:R} radius={radius:R} nominalRadius={nominalRadius:R} " +
+                $"surfaceZ={outputSurfaceZ:R} zDecimals=3 sourceRings={clearingBoundary.Count}");
+            List<List<PointD>> rings;
+            if(initialInsetNomination is not null&&initialInsetNomination.TryNominate(clearingBoundary,radius,cancellationToken,diagnostic,out var rawNomination,out string rawReason))
+            {
+                rings=rawNomination!;
+                rawNominationDepths?.Add(layerDepth);
+            }
+            else
+                rings=Contract(clearingBoundary,radius,cancellationToken,insetReuse);
+            diagnostic?.Invoke($"stage=clearing-inset event=complete depth={layerDepth:R} " +
+                $"radius={radius:R} resultRings={rings.Count} " +
+                $"result={(rings.Count == 0 ? "unreachable-at-depth" : "reachable")}");
+            return rings;
+        }
 
         // Intermediate depth layers (depths strictly before endDepth)
         while (k < b && !CloseTo(k, b))
         {
             double depthFromStart = Math.Max(0.0, k - startDepth);
-            double contractAmount = profile.BottomRadius + profile.RadiusSlope * depthFromStart;
-            var layer = Contract(clearingBoundary, contractAmount);
+            double nominalRadius = cutterProfile?.RadiusAtDepth(depthFromStart)
+                ?? (profile.BottomRadius + profile.RadiusSlope * depthFromStart);
+            double contractAmount = CommandedCuttingRadius(cutterProfile, profile.BottomRadius,
+                profile.RadiusSlope, startDepth, k, outputSurfaceZ, coneLengthOverride);
+            var layer = ContractLayer(k, contractAmount);
             if (layer.Count > 0)
-                layers.Add((-k, -N, layer, false, contractAmount));
+                layers.Add((-k, -N, layer, false, contractAmount, nominalRadius, nominalPassIndex));
 
             N = k;
             k += depthPerPass;
+            nominalPassIndex++;
         }
 
         // Bottom layer (k â‰ˆ endDepth after loop)
-        //         = boundary contracted by _t  (small clearance)
-        //         = boundary contracted to full depth
-        var bottomLayerRings = Contract(clearingBoundary, _t);
-        var contracted       = Contract(clearingBoundary, profile.FinalRadius);
+        // Use the original boundary contracted to the full-depth cutter radius.
+        var contracted       = ContractLayer(endDepth, finalCommandRadius);
 
         if (contracted.Count > 0)
         {
-            var bt = IntersectPolygons(bottomLayerRings, contracted);
+            // A deeper erosion is already a subset of every shallower erosion.
+            // Intersecting independently rounded offsets adds seam lobes without
+            // adding a cutter-clearance constraint.
+            var bt = contracted;
 
             if (CloseTo(k, b))
             {
@@ -575,46 +787,400 @@ public static class MedialAxisToolpaths
                 // radius at endDepth == profile.FinalRadius, so any tool-centre path
                 // closer to the boundary than that would cut outside the glyph.
                 if (bt.Count > 0)
-                    layers.Add((-k, -N, bt, true, profile.FinalRadius));
+                    layers.Add((-k, -N, bt, true, finalCommandRadius, finalRadius, nominalPassIndex));
             }
             else if (bt.Count > 0)
             {
                 // Overshot endDepth slightly â€” just add bottom layer.
-                layers.Add((-b, -N, bt, true, profile.FinalRadius));
+                layers.Add((-b, -N, bt, true, finalCommandRadius, finalRadius, nominalPassIndex));
             }
         }
 
         // Generate OffsetFill toolpaths for each layer
         var result = new List<(List<Point3D> Points, int DepthPassIndex)>();
-        int depthPassIndex = 0;
-        foreach (var (z, zTop, rings, isBottom, layerRadius) in layers)
+        List<List<PointD>>? edgeCore = null;
+        bool rawBandNominated = false;
+        if (!includeInteriorFill && edgeFillWidth > 0 && layers.Any(layer => edgeFillWidth > layer.layerRadius))
         {
-            double layerDiameter = Math.Max(0.0, 2.0 * layerRadius);
+            progress?.Invoke(.25, "Preparing edge clearing boundary...", true);
+            // Width is an authored geometric limit, not another cutter radius.
+            // Its terminal trace is validated at each layer's actual radius below.
+            double proofRadius = layers.Where(layer => edgeFillWidth > layer.layerRadius)
+                .Max(layer => layer.layerRadius);
+            if(initialInsetNomination is not null&&initialInsetNomination.TryNominateAuthoredBand(
+                clearingBoundary,edgeFillWidth,proofRadius,cancellationToken,diagnostic,out var rawBand,out _))
+            {
+                edgeCore=rawBand!;
+                rawBandNominated=true;
+            }
+            else
+            {
+                var coreFronts = PolygonOps.DifferenceToComponents(clearingBoundary, Array.Empty<IReadOnlyList<PointD>>())
+                    .SelectMany(component => PolygonOps.PrepareBoundaryOffset(component.Outer, component.Holes,
+                        arcTolerance: 1 / PathUtils.Scale, simplifyTolerance: 0,
+                        sourceConstructionSweepRadius: proofRadius > 0 ? proofRadius : null,
+                        cancellationToken: cancellationToken)
+                        .Execute(-edgeFillWidth, cancellationToken));
+                // This ONE canonical authored-inset front owns both subsequent
+                // centerline clipping and the collector's maximum-inset contour.
+                // Fold removal retains original-width clearance and physical proof.
+                edgeCore = PolygonOps.Union(coreFronts);
+            }
+            diagnostic?.Invoke($"stage=clearing-band event=prepared origin=original-boundary " +
+                $"width={edgeFillWidth:R} coreRings={edgeCore.Count} " +
+                $"physicalProofRadius={proofRadius:R} canonicalCoreOwner={(rawBandNominated?"shared-RAW-authored-band-NOM":"shared-prepared-offset")} " +
+                $"rawBandNominated={rawBandNominated} authoredWidthUnchanged=True terminalSharesSameCore={rawBandNominated} " +
+                $"physicalCredit={!rawBandNominated} downstreamOriginalProtectRequired={rawBandNominated}");
+        }
+        int depthPassIndex = 0;
+        foreach (var (z, zTop, rings, isBottom, layerRadius, nominalRadius, originalPassIndex) in layers)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            double layerDiameter = Math.Max(0.0, 2.0 * nominalRadius);
             double normalStepOver = stepOver * layerDiameter;
             double finishStepOver = 0.05 * layerDiameter;
 
-            double stepOverDist = isBottom ? finishStepOver : normalStepOver;
+            // A rounded nose sets the floor scallop spacing even when its taper has
+            // a much larger footprint at the stock surface. Shallow cuts use only
+            // the engaged portion of that nose.
+            double stepOverDist = cutterProfile?.RoundedTip == true
+                ? cutterProfile.NoseLimitedPitch(layerDiameter,stepOver)
+                : isBottom ? finishStepOver : normalStepOver;
             if (stepOverDist <= 0)
                 stepOverDist = isBottom ? M : T;
             if (stepOverDist <= 0)
                 stepOverDist = T;
 
-            var paths = OffsetFill.Generate(
-                rings,
-                z,
-                zTop,
-                stepOverDist,
-                maxIterations: includeInteriorFill ? 1_000 : 0);
+            diagnostic?.Invoke($"stage=clearing-fill event=start depth={-z:R} radius={layerRadius:R} nominalRadius={nominalRadius:R} " +
+                $"pitch={stepOverDist:R} stepOver={stepOver:R} noseDiameter={cutterProfile?.ClearingDiameter ?? 0:R} " +
+                $"roundedTip={cutterProfile?.RoundedTip ?? false} bottomLayer={isBottom} interiorFill={includeInteriorFill} " +
+                $"edgeFillWidth={edgeFillWidth:R} edgeFillOrigin=original-boundary");
+            double maximumInset = includeInteriorFill ? double.PositiveInfinity
+                : Math.Max(0, edgeFillWidth - layerRadius);
+            int maximumIterations = includeInteriorFill || maximumInset > 0 ? 1_000 : 0;
+            bool hasEdgeCore = maximumInset > 0 && edgeCore is { Count: > 0 };
+            double fillPitch = stepOverDist;
+            List<List<PointD>>? terminalCore = null;
+            if (hasEdgeCore)
+            {
+                // The authored last front belongs to the common collector. It is
+                // certified against preceding fronts there, so adaptive spacing
+                // can add coherent contours before reaching this exact cutoff.
+                // Never Boolean-clip a nearly coincident independently rounded
+                // last contour against the canonical edge core.
+                fillPitch=ConcentricBandSchedule.FitPitch(maximumInset,stepOverDist,maximumIterations);
+                // RAW band candidate is shared literally: it has no physical or
+                // filled-set credit before original Smooth Protect. The old
+                // source-index/chord constructor remains the whole fallback.
+                terminalCore = rawBandNominated ? edgeCore
+                    : PolygonOps.CutterInset(clearingBoundary, layerRadius, edgeCore!, cancellationToken);
+            }
+            diagnostic?.Invoke($"stage=clearing-band event=limit depth={-z:R} origin=original-boundary " +
+                $"width={edgeFillWidth:R} perimeterInset={layerRadius:R} maximumAdditionalInset={maximumInset:R} " +
+                $"ringLimit={maximumIterations} requestedRings={(double.IsFinite(maximumInset) ? Math.Ceiling(maximumInset / stepOverDist) : double.PositiveInfinity):R} " +
+                $"fillPitch={fillPitch:R} terminalCoreContour={terminalCore is not null} " +
+                $"terminalFrontOwner=shared-collector mandatoryPerimeter=true");
+            void ReportRing(int ring, double inset)
+            {
+                bool measured = double.IsFinite(maximumInset) && maximumInset > 0;
+                double local = measured ? Math.Min(1, inset / maximumInset) : 0;
+                progress?.Invoke(.25 + .75 * (depthPassIndex + local) / layers.Count,
+                    $"Clearing pass {depthPassIndex + 1}/{layers.Count}: ring {ring + 1}, inset {inset:0.###} mm",
+                    !measured);
+            }
+            // The normal ContractLayer is certified; the eligible RAW mode is
+            // NOM awaiting original Smooth Protect floor/wall/grade guards.
+            // Every fill level offsets this fixed boundary, never its predecessor.
+            bool collectorNomination = rawNominationDepths?.Contains(-z) == true
+                && (!hasEdgeCore || rawBandNominated);
+            bool rawCollectorRequested = collectorNomination;
+            long rawCollectorStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            int rawMiddleLevels = 0, rawMiddleRings = 0, suppressedMiddleLevels = 0;
+            bool selectiveRawRolesRequested = !retainRawFirst || !retainRawCore || !retainRawMiddle;
+            long rawMiddlePoints = 0;
+            string rawCollectorReason = "not-requested";
+            var collected = new List<OffsetRing>();
+            if (collectorNomination)
+            {
+                // These absolute offsets nominate centers from the unchanged
+                // ORIGINAL artwork, never from a previous offset or filled set.
+                // Literal first/core fronts are materialized below. Every other
+                // signed/tiny RAW ring remains until original Smooth Protect.
+                rawCollectorReason = "complete-original-source-absolute-RAW-NOM-levels";
+                if (!double.IsFinite(maximumInset) || !double.IsFinite(fillPitch)
+                    || fillPitch <= 1e-9 || maximumInset < 0)
+                {
+                    collectorNomination = false;
+                    rawCollectorReason = "unsupported-finite-NOM-inset-schedule";
+                }
+                else
+                {
+                    ReportRing(0, 0);
+                    long retainedRawPoints = rings.Sum(front => (long)front.Count)
+                        + (terminalCore?.Sum(front => (long)front.Count) ?? 0);
+                    if (retainedRawPoints > 500_000)
+                    {
+                        collectorNomination = false;
+                        rawCollectorReason = "aggregate-500000-RAW-collector-point-limit";
+                    }
+                    for (int level = 1; collectorNomination && level <= maximumIterations; level++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        double additionalInset = Math.Min(level * fillPitch, maximumInset);
+                        if (maximumInset - additionalInset <= 8 * (Math.BitIncrement(maximumInset) - maximumInset))
+                            additionalInset = maximumInset;
+                        ReportRing(level, additionalInset);
+                        if (additionalInset == maximumInset && terminalCore is not null) break;
+                        if (!retainRawMiddle) { suppressedMiddleLevels++; continue; }
+                        double absoluteNominationInset = layerRadius + additionalInset;
+                        string rawReason = "missing-captured-RAW-owner";
+                        if (initialInsetNomination is null || !initialInsetNomination.TryNominateAuthoredBand(
+                            clearingBoundary, absoluteNominationInset, layerRadius, cancellationToken,
+                            detail => diagnostic?.Invoke($"stageRole=absolute-intermediate-RAW-NOM depth={-z:R} level={level} " +
+                                $"additionalInset={additionalInset:R} absoluteNominationInset={absoluteNominationInset:R} " +
+                                "savedAuthoredSettingsUnchanged=True terminalCoreAuthority=False " +
+                                detail.Replace("authoredWidth=", "absoluteNominationInsetOperand=")
+                                    .Replace("terminalSameCoreCandidate=True", "terminalSameCoreCandidate=False")),
+                            out var rawMiddle, out rawReason))
+                        {
+                            collectorNomination = false;
+                            rawCollectorReason = "whole-original-collector-fallback:" + rawReason;
+                            break;
+                        }
+                        long points = rawMiddle!.Sum(front => (long)front.Count);
+                        if (points > 500_000 - retainedRawPoints)
+                        {
+                            collectorNomination = false;
+                            rawCollectorReason = "aggregate-500000-RAW-collector-point-limit";
+                            break;
+                        }
+                        retainedRawPoints += points;
+                        rawMiddleLevels++; rawMiddleRings += rawMiddle.Count; rawMiddlePoints += points;
+                        foreach (var front in rawMiddle)
+                            collected.Add(new OffsetRing(front, level, 0, isClosed: true, offsetDistance: additionalInset));
+                        if (additionalInset == maximumInset) break;
+                    }
+                }
+            }
+            if (!collectorNomination)
+            {
+                // Any unsupported RAW level discards the WHOLE middle proposal;
+                // the literal original collector, including its terminal proofs,
+                // constructs the complete level. No partial RAW credit survives.
+                collected.Clear();
+                var layerRegions = PolygonOps.DifferenceToComponents(rings, Array.Empty<IReadOnlyList<PointD>>())
+                    .Select(component => new MillingRegion(component.Outer,
+                        component.Holes.Select(hole => (IReadOnlyList<PointD>)hole).ToList())).ToList();
+                collected = MedialAxisGeometry.BuildConcentricFill(
+                    layerRegions,
+                    new RingOffsetOptions(0, fillPitch)
+                    {
+                        RingLimit = Math.Max(1, maximumIterations + 1),
+                        MaximumInset = maximumInset,
+                        MaximumInsetFront = terminalCore is null ? null : region =>
+                            PolygonOps.Intersect(terminalCore, new[] { region.Outer }.Concat(region.Holes)),
+                        MinimumRingArea = 0,
+                        Tolerances = GeometryTolerances.Default with
+                        {
+                            ArcTolerance = 1 / PathUtils.Scale,
+                            SimplifyTolerance = 0,
+                        },
+                        LevelProgress = ReportRing,
+                    },
+                    layerRadius,
+                    preserveTerminalPaths: true,
+                    cancellationToken: cancellationToken);
+            }
+            diagnostic?.Invoke($"stage=raw-absolute-clearing-collector depth={-z:R} requested={rawCollectorRequested} " +
+                $"enabled={collectorNomination} reason='{rawCollectorReason}' middleLevels={rawMiddleLevels} middleRings={rawMiddleRings} " +
+                $"middlePoints={rawMiddlePoints} suppressedMiddleLevels={suppressedMiddleLevels} selectiveRawRolesRequested={selectiveRawRolesRequested} " +
+                $"retainRawFirst={retainRawFirst} retainRawCore={retainRawCore} retainRawMiddle={retainRawMiddle} " +
+                $"maximumRetainedRawPoints=500000 elapsedMs={System.Diagnostics.Stopwatch.GetElapsedTime(rawCollectorStarted).TotalMilliseconds:F3} " +
+                "originalSourceAbsoluteOffsets=True preparedIntermediateOffsetsUsed=FalseWhenEnabled nativeArcTicks=1 " +
+                $"frontConditioningCaptured={initialInsetNomination?.FrontConditioningCaptured == true} partialProposalPublished=False " +
+                "allSignedTinyRawRingsRetained=True noTerminalSkeletonNominationCredit=True physicalCredit=False stockCredit=False originalProtectRequired=True");
+            bool selectedRawRolesSupported = collectorNomination
+                && (!retainRawFirst || rings.Count > 0)
+                && (!retainRawCore || terminalCore is { Count: > 0 });
+            selectedRawRolesCompleted?.Invoke(selectedRawRolesSupported);
+            var paths = new List<List<Point3D>>(collected.Count);
+            int literalFirstRings = 0, literalTerminalRings = 0;
+            if (collectorNomination)
+            {
+                void RetainLiteralFront(IEnumerable<List<PointD>> fronts, bool terminal)
+                {
+                    foreach (var front in fronts)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var trace = front.Select(p => new Point3D(p.x, p.y, z)).ToList();
+                        if (trace.Count > 1 && trace[0] != trace[^1]) trace.Add(trace[0]);
+                        if (trace.Count < 2) throw new InvalidOperationException("A bounded RAW clearing front lost its literal ring.");
+                        paths.Add(trace);
+                        if (terminal) literalTerminalRings++; else literalFirstRings++;
+                    }
+                }
+                if (retainRawFirst) RetainLiteralFront(rings, false);
+                if (retainRawCore && terminalCore is not null) RetainLiteralFront(terminalCore, true);
+            }
+            var bandCandidates = new List<List<Point3D>>();
+            foreach (OffsetRing ring in collected)
+            {
+                if (collectorNomination && (ring.Level == 0 || (terminalCore is not null
+                    && ring.IsClosed && ring.OffsetDistance == maximumInset))) continue;
+                var stroke = MaterializeClearingRing(ring, z);
+                if (stroke.Count < 2) continue;
+                // Intermediate fronts and open terminals retain the authored
+                // centerline band guard. The canonical final contour is already
+                // that guard's boundary; clipping it against an independently
+                // rounded copy would fragment the contour into microstrokes.
+                bool canonicalFinal = terminalCore is not null && ring.IsClosed
+                    && ring.OffsetDistance == maximumInset;
+                if (hasEdgeCore && ring.Level > 0 && !canonicalFinal) bandCandidates.Add(stroke);
+                else paths.Add(stroke);
+            }
+            if (bandCandidates.Count > 0)
+            {
+                var clipped = ClipClearingPathsOutsideCore(bandCandidates, edgeCore!, z);
+                paths.AddRange(clipped);
+                diagnostic?.Invoke($"stage=clearing-band event=clipped depth={-z:R} " +
+                    $"inputPaths={bandCandidates.Count} clippedPaths={clipped.Count} canonicalFinalFrontWhole=True");
+            }
+            diagnostic?.Invoke($"stage=clearing-concentric event=topology depth={-z:R} " +
+                $"closed={collected.Count(ring => ring.IsClosed)} open={collected.Count(ring => !ring.IsClosed)} " +
+                $"sharedCollector=True fixedCompensatedBoundary=True");
+            diagnostic?.Invoke($"stage=raw-clearing-collector-nomination depth={-z:R} enabled={collectorNomination} " +
+                $"capturedInitialStockCohort={initialInsetNomination?.CollectorNominationCaptured == true} literalFirstRings={literalFirstRings} " +
+                $"literalRawCoreRings={literalTerminalRings} collectedRings={collected.Count} materializedPaths={paths.Count} " +
+                $"openTerminalSkeletonNominationAbsent={collectorNomination} " +
+                $"selectedRawRolesSupported={selectedRawRolesSupported} retainRawFirst={retainRawFirst} retainRawCore={retainRawCore} retainRawMiddle={retainRawMiddle} " +
+                $"allSelectedRoleLiteralRawFrontsWhenEnabled=True allLiteralRawFrontsWhenEnabled={!selectiveRawRolesRequested} " +
+                "tinyRingAreaCutoffAdded=False originalRingWorkCaps=True " +
+                "physicalTerminalProofCredit=False originalFloorArtworkGradeRequired=True stockCredit=False unsupportedWholeOriginalCollectorFallback=True");
+            int separateCycles = paths.Count;
+            paths = JoinTouchingClearingCycles(paths);
+            if (paths.Count != separateCycles)
+                diagnostic?.Invoke($"stage=clearing-topology depth={-z:R} sourceCycles={separateCycles} " +
+                    $"connectedVisits={paths.Count} preservedCoverage=True");
             foreach (var path in paths)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var simplified = SimplifyCollinearRuns(path);
-                result.Add((simplified, depthPassIndex));
+                result.Add((simplified, originalPassIndex));
             }
 
+            diagnostic?.Invoke($"stage=clearing-fill event=complete depth={-z:R} paths={paths.Count} pitch={stepOverDist:R}");
             depthPassIndex++;
+            progress?.Invoke(.25 + .75 * depthPassIndex / layers.Count,
+                $"Clearing pass {depthPassIndex}/{layers.Count} complete", false);
         }
 
+        progress?.Invoke(1, "Clearing complete", false);
         return result;
+    }
+
+    /// <summary>Materializes one collected clearing trace without inventing an open closing chord.</summary>
+    internal static List<Point3D> MaterializeClearingRing(OffsetRing ring, double depth)
+    {
+        var points = ring.Points.Select(point => new Point3D(point.x, point.y, depth)).ToList();
+        if (ring.IsClosed && points.Count > 1 && points[0] != points[^1])
+            points.Add(points[0]);
+        return points;
+    }
+
+    // A polygon boolean may return boundary cycles pinched at a shared vertex.
+    // They are one connected cutter trace, even when one cycle is microscopic.
+    // Splice those cycles at their exact common point; retain every source chord
+    // and winding rather than inventing a link or rejecting a small contour.
+    internal static List<List<Point3D>> JoinTouchingClearingCycles(List<List<Point3D>> paths)
+    {
+        var parent = Enumerable.Range(0, paths.Count).ToArray();
+        int Root(int i) => parent[i] == i ? i : parent[i] = Root(parent[i]);
+        var owner = new Dictionary<Point3D, int>();
+        for (int i = 0; i < paths.Count; i++)
+        {
+            var path = paths[i];
+            if (path.Count < 3 || path[0] != path[^1]) continue;
+            for (int j = 0; j < path.Count - 1; j++)
+            {
+                if (owner.TryGetValue(path[j], out int previous)) parent[Root(i)] = Root(previous);
+                else owner.Add(path[j], i);
+            }
+        }
+        var groups = Enumerable.Range(0, paths.Count).GroupBy(Root).Select(group => group.ToList()).ToList();
+        if (groups.Count == paths.Count) return paths;
+        var joined = new List<List<Point3D>>(groups.Count);
+        foreach (var group in groups.OrderBy(group => group[0]))
+        {
+            var circuit = new List<Point3D>(paths[group[0]]);
+            var pending = group.Skip(1).ToList();
+            while (pending.Count > 0)
+            {
+                var positions = new Dictionary<Point3D, int>();
+                for (int j = 0; j < circuit.Count - 1; j++) positions.TryAdd(circuit[j], j);
+                bool inserted = false;
+                for (int p = 0; p < pending.Count && !inserted; p++)
+                {
+                    var cycle = paths[pending[p]];
+                    if (SameCommandCycle(circuit, cycle))
+                    {
+                        // Independently derived mandatory/terminal cycles can
+                        // resolve to the same command. They add no floor sweep.
+                        pending.RemoveAt(p);
+                        inserted = true;
+                        continue;
+                    }
+                    int count = cycle.Count - 1;
+                    for (int j = 0; j < count; j++)
+                    {
+                        if (!positions.TryGetValue(cycle[j], out int at)) continue;
+                        circuit.InsertRange(at + 1, Enumerable.Range(1, count - 1)
+                            .Select(step => cycle[(j + step) % count]).Append(cycle[j]));
+                        pending.RemoveAt(p);
+                        inserted = true;
+                        break;
+                    }
+                }
+                if (!inserted) throw new InvalidOperationException("A connected clearing boundary lost its shared vertex.");
+            }
+            joined.Add(circuit);
+        }
+        return joined;
+    }
+
+    private static bool SameCommandCycle(IReadOnlyList<Point3D> first, IReadOnlyList<Point3D> second)
+    {
+        if (first.Count != second.Count) return false;
+        static bool Same(Point3D a, Point3D b) => (float)a.X == (float)b.X
+            && (float)a.Y == (float)b.Y && (float)a.Z == (float)b.Z;
+        int count = first.Count - 1;
+        for (int start = 0; start < count; start++)
+        {
+            if (!Same(first[0], second[start])) continue;
+            bool forward = true, reverse = true;
+            for (int i = 1; i < count && (forward || reverse); i++)
+            {
+                forward &= Same(first[i], second[(start + i) % count]);
+                reverse &= Same(first[i], second[(start - i + count) % count]);
+            }
+            if (forward || reverse) return true;
+        }
+        return false;
+    }
+
+    private static List<List<Point3D>> ClipClearingPathsOutsideCore(
+        IReadOnlyList<List<Point3D>> paths, IReadOnlyList<List<PointD>> core, double depth)
+    {
+        // Clip centerlines as open strokes: subtracting closed areas would invent
+        // extra toolpaths along the core boundary. Every surviving piece keeps its Z.
+        var clipper = new Clipper64();
+        clipper.AddOpenSubject(PathUtils.ToClipper(paths.Select(path =>
+            path.Select(point => new PointD(point.X, point.Y)))));
+        clipper.AddClip(PathUtils.ToClipper(core));
+        var closed = new Paths64();
+        var open = new Paths64();
+        clipper.Execute(ClipType.Difference, FillRule.NonZero, closed, open);
+        return PathUtils.FromClipper(open).Where(path => path.Count >= 2)
+            .Select(path => path.Select(point => new Point3D(point.x, point.y, depth)).ToList()).ToList();
     }
 
     // --- generateToolpathsForObject / full V-carve (object-main) ----------------------
@@ -652,7 +1218,10 @@ public static class MedialAxisToolpaths
         double? bottomRadiusOverride = null,
         double? topRadiusOverride = null,
         double? coneLengthOverride = null,
-        bool includeInteriorFill = true)
+        bool includeInteriorFill = true,
+        VCarveCutterProfile? cutterProfile = null,
+        double edgeFillWidth = 0,
+        Action<double, string, bool>? progress = null)
     {
         var components = GenerateVCarveComponents(
             provider,
@@ -666,7 +1235,8 @@ public static class MedialAxisToolpaths
             bottomRadiusOverride: bottomRadiusOverride,
             topRadiusOverride: topRadiusOverride,
             coneLengthOverride: coneLengthOverride,
-            includeInteriorFill: includeInteriorFill);
+            includeInteriorFill: includeInteriorFill, cutterProfile: cutterProfile,
+            edgeFillWidth: edgeFillWidth, progress: progress);
 
         var result = new List<List<Point3D>>(components.ClearingPasses.Count + components.FinalPass.Count);
         result.AddRange(components.ClearingPasses);
@@ -692,14 +1262,61 @@ public static class MedialAxisToolpaths
         double? topRadiusOverride = null,
         double? coneLengthOverride = null,
         CancellationToken cancellationToken = default,
-        bool includeInteriorFill = true)
+        bool includeInteriorFill = true,
+        Action<string>? diagnostic = null,
+        bool detectCurves = true,
+        VCarveCutterProfile? cutterProfile = null,
+        double edgeFillWidth = 0,
+        Action<double, string, bool>? progress = null,
+        double outputSurfaceZ = 0,
+        int skipDepthPasses = 0,
+        double startingDepth = 0,
+        IReadOnlyList<MedialSegment>? preparedMedialGraph = null)
+        => GenerateVCarveTagged(false, provider, boundary, startDepth, endDepth,
+            radianTipAngle, depthPerPass, stepOver, tolerance, regionIndex,
+            bottomRadiusOverride, topRadiusOverride, coneLengthOverride,
+            cancellationToken, includeInteriorFill, diagnostic, detectCurves,
+            cutterProfile, edgeFillWidth, progress, outputSurfaceZ,
+            skipDepthPasses, startingDepth, preparedMedialGraph);
+
+    internal static List<TaggedToolpath> GenerateVCarveTagged(
+        bool preferOriginalFirstConstruction,
+        IMedialAxisProvider provider,
+        IReadOnlyList<IReadOnlyList<PointD>> boundary,
+        double startDepth,
+        double endDepth,
+        double radianTipAngle,
+        double depthPerPass,
+        double stepOver = 0.4,
+        double tolerance = 0.03,
+        int regionIndex = 0,
+        double? bottomRadiusOverride = null,
+        double? topRadiusOverride = null,
+        double? coneLengthOverride = null,
+        CancellationToken cancellationToken = default,
+        bool includeInteriorFill = true,
+        Action<string>? diagnostic = null,
+        bool detectCurves = true,
+        VCarveCutterProfile? cutterProfile = null,
+        double edgeFillWidth = 0,
+        Action<double, string, bool>? progress = null,
+        double outputSurfaceZ = 0,
+        int skipDepthPasses = 0,
+        double startingDepth = 0,
+        IReadOnlyList<MedialSegment>? preparedMedialGraph = null,
+        RW.Toolpaths.Milling.Acceleration.RawInitialClearingInsetNomination? initialInsetNomination = null,
+        bool supplementalInitialBand = true)
     {
         cancellationToken.ThrowIfCancellationRequested();
         long t0 = PerfLog.Start();
+        using var insetReuse = new CertifiedInsetReuse(diagnostic, preferOriginalFirstConstruction);
         var result = new List<TaggedToolpath>();
 
         // Clearing passes (clear-main)
-        var clearing = GenerateClearingPassesTagged(
+        diagnostic?.Invoke($"stage=clearing event=start interiorFill={includeInteriorFill} detectCurves={detectCurves} " +
+            $"mode={(includeInteriorFill ? "interior-and-perimeters" : edgeFillWidth > 0 ? "edge-band" : "perimeters-only")} " +
+            $"edgeFillWidth={edgeFillWidth:R} edgeFillOrigin=original-boundary");
+        var clearing = GenerateClearingPassesTaggedCore(
             boundary,
             startDepth,
             endDepth,
@@ -710,11 +1327,108 @@ public static class MedialAxisToolpaths
             bottomRadiusOverride,
             topRadiusOverride,
             coneLengthOverride,
-            includeInteriorFill);
+            includeInteriorFill,
+            detectCurves,
+            diagnostic, cutterProfile, cancellationToken, edgeFillWidth,
+            (fraction, stage, indeterminate) => progress?.Invoke(.3 * fraction, stage, indeterminate),
+            outputSurfaceZ, skipDepthPasses, startingDepth, insetReuse, initialInsetNomination);
+        diagnostic?.Invoke($"stage=clearing event=complete paths={clearing.Count} points={clearing.Sum(path => (long)path.Points.Count)}");
+        cancellationToken.ThrowIfCancellationRequested();
         result.AddRange(clearing);
 
+        // One extra lateral NOM at half the original requested depth. The
+        // original medial generation/floor, full-depth visit and authored
+        // stepdown remain unchanged; original Smooth Protect owns all cuts.
+        if (supplementalInitialBand && initialInsetNomination?.SupplementalInitialBandCaptured == true
+            && startDepth == 0 && double.IsFinite(endDepth) && endDepth / 2 > 0)
+        {
+            double supplementalDepth = endDepth / 2;
+            long supplementalStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            diagnostic?.Invoke($"stage=supplemental-initial-clearing-band event=start originalDepth={endDepth:R} " +
+                $"supplementalDepth={supplementalDepth:R} commandedDepth={CommandedMachineDepth(supplementalDepth,outputSurfaceZ):R} " +
+                $"radius={cutterProfile?.RadiusAtDepth(supplementalDepth):R} authoredWidth={edgeFillWidth:R} " +
+                "capturedOnce=True originalFullDepthNomFirst=True originalMedialFloorUnchanged=True physicalCredit=False stockCredit=False");
+            var supplemental = new List<TaggedToolpath>();
+            bool boundedLadder = !includeInteriorFill && cutterProfile is not null;
+            long aggregateNominationPoints = 0;
+            string nominationFallback = "none";
+            if (boundedLadder)
+            {
+                double fullRadius = cutterProfile!.PhysicalRadiusAtDepth(CommandedMachineDepth(endDepth, outputSurfaceZ));
+                foreach (int divisor in new[] { 2, 4, 8 })
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    double levelDepth = endDepth / divisor;
+                    double levelRadius = cutterProfile.PhysicalRadiusAtDepth(CommandedMachineDepth(levelDepth, outputSurfaceZ));
+                    double nominationWidth = edgeFillWidth + fullRadius - levelRadius;
+                    if (!double.IsFinite(nominationWidth) || nominationWidth <= 0 || nominationWidth > 100)
+                    { boundedLadder = false; nominationFallback = "derived-width-domain"; break; }
+                    diagnostic?.Invoke($"stage=supplemental-initial-reach-level divisor={divisor} nominalDepth={levelDepth:R} " +
+                        $"commandedDepth={CommandedMachineDepth(levelDepth, outputSurfaceZ):R} physicalRadius={levelRadius:R} " +
+                        $"savedAuthoredWidth={edgeFillWidth:R} nominationDerivedWidth={nominationWidth:R} widthRole=untrusted-center-NOM " +
+                        "wholeOriginalArtwork=True physicalCredit=False stockCredit=False");
+                    bool selectedRoleCompleted = false;
+                    bool retainFirst = divisor == 4, retainCore = divisor != 4, retainMiddle = false;
+                    string selectedRole = retainFirst ? "outer-first" : "inner-core";
+                    diagnostic?.Invoke($"stage=supplemental-initial-selected-roles divisor={divisor} nominalDepth={levelDepth:R} " +
+                        $"selectedRole={selectedRole} retainOuter={retainFirst} retainCore={retainCore} retainMiddle={retainMiddle} " +
+                        "originalFullBandUnchanged=True originalMedialFloorUnchanged=True physicalCredit=False stockCredit=False");
+                    var level = GenerateClearingPassesTaggedCore(boundary, startDepth, levelDepth,
+                        radianTipAngle, depthPerPass, stepOver, regionIndex, bottomRadiusOverride,
+                        topRadiusOverride, coneLengthOverride, includeInteriorFill, detectCurves,
+                        detail => diagnostic?.Invoke($"savedAuthoredWidth={edgeFillWidth:R} nominationDerivedWidth={nominationWidth:R} " +
+                            "localWidthRole=untrusted-center-NOM " + detail.Replace("authoredWidth=", "nominationWidth=")),
+                        cutterProfile, cancellationToken, nominationWidth, progress: null,
+                        outputSurfaceZ: outputSurfaceZ, skipDepthPasses: skipDepthPasses,
+                        startingDepth: levelDepth, insetReuse: null, initialInsetNomination: initialInsetNomination,
+                        retainRawFirst: retainFirst, retainRawCore: retainCore, retainRawMiddle: retainMiddle,
+                        selectedRawRolesCompleted: complete => selectedRoleCompleted = complete);
+                    if (!selectedRoleCompleted)
+                    { boundedLadder = false; nominationFallback = "selected-RAW-role-unsupported-whole-original-half-band-fallback"; break; }
+                    long points = level.Sum(path => (long)path.Points.Count);
+                    if (points > 500_000 - aggregateNominationPoints)
+                    { boundedLadder = false; nominationFallback = "aggregate-500000-materialized-point-limit"; break; }
+                    aggregateNominationPoints += points;
+                    if (divisor == 2)
+                        level = level.Select(path => path with { Category = VCarveInitialReachSelection.HalfCoreMarkerCategory }).ToList();
+                    else if (divisor == 4)
+                        level = level.Select(path => path with { Category = VCarveInitialReachSelection.QuarterOuterMarkerCategory }).ToList();
+                    else if (divisor == 8)
+                        level = level.Select(path => path with { Category = VCarveInitialReachSelection.EighthCoreMarkerCategory }).ToList();
+                    supplemental.AddRange(level);
+                }
+            }
+            else nominationFallback = "unsupported-edge-band-profile";
+            if (!boundedLadder)
+            {
+                supplemental.Clear();
+                supplemental.AddRange(GenerateClearingPassesTaggedCore(boundary, startDepth,
+                    supplementalDepth, radianTipAngle, depthPerPass, stepOver, regionIndex,
+                    bottomRadiusOverride, topRadiusOverride, coneLengthOverride, includeInteriorFill,
+                    detectCurves, diagnostic, cutterProfile, cancellationToken, edgeFillWidth,
+                    progress: null, outputSurfaceZ: outputSurfaceZ, skipDepthPasses: skipDepthPasses,
+                    startingDepth: supplementalDepth, insetReuse: null,
+                    initialInsetNomination: initialInsetNomination.OriginalCollectorFallback()));
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+            // Preserve role custody for the common finishing-depth request,
+            // including whole-band fallback nominations.
+            if (!boundedLadder)
+                supplemental = supplemental.Select(path => path with { Category = VCarveInitialReachSelection.HalfCoreMarkerCategory }).ToList();
+            result.AddRange(supplemental);
+            diagnostic?.Invoke($"stage=supplemental-initial-clearing-band event=complete depth={supplementalDepth:R} " +
+                $"paths={supplemental.Count} points={supplemental.Sum(path => (long)path.Points.Count)} " +
+                $"elapsedMs={System.Diagnostics.Stopwatch.GetElapsedTime(supplementalStarted).TotalMilliseconds:F3} " +
+                $"constructor={(boundedLadder ? "whole-RAW-NOM-band-ladder-v4" : "whole-original-half-band-fallback")} " +
+                $"levelDivisors=2,4,8 aggregateNominationPoints={aggregateNominationPoints} maximumAggregateNominationPoints=500000 " +
+                $"nominationFallback='{nominationFallback}' adaptiveXYMovement=FalseAtConstructor halfCoreSlopeSelectionRequested=False floorAwareOuterNominationRequested=True partialLadderPublished=False " +
+                "selectedRoles=half-inner-core,quarter-outer-first,eighth-inner-core supplementalMiddleRoles=none " +
+                "savedAuthoredWidthUnchanged=True originalStepdownUnchanged=True originalMedialGeneratedOnce=True insetProofCacheNotUsed=True " +
+                "combinedSourceOriginalProtectRequired=True physicalCredit=False stockCredit=False");
+        }
+
         // Final V-carve pass (carve-main)
-        var finalPass = Generate(
+        var finalPass = GenerateCore(
             provider,
             boundary,
             startDepth,
@@ -727,12 +1441,16 @@ public static class MedialAxisToolpaths
             topRadiusOverride,
             coneLengthOverride,
             cancellationToken,
-            includeInteriorFill);
+            includeInteriorFill,
+            diagnostic, cutterProfile,
+            (fraction, stage, indeterminate) => progress?.Invoke(.3 + .7 * fraction, stage, indeterminate),
+            outputSurfaceZ, preparedMedialGraph, insetReuse);
         cancellationToken.ThrowIfCancellationRequested();
         if (finalPass is not null)
         {
             foreach (var path in finalPass)
-                result.Add(new TaggedToolpath(path, regionIndex, "final-carve", null));
+                result.Add(new TaggedToolpath(path, Array.Empty<ToolpathSpan>(),
+                    regionIndex, "final-carve", null, detectCurves: detectCurves));
         }
 
         PerfLog.Stop(
@@ -761,10 +1479,14 @@ public static class MedialAxisToolpaths
             double? bottomRadiusOverride = null,
             double? topRadiusOverride = null,
             double? coneLengthOverride = null,
-            bool includeInteriorFill = true)
+            bool includeInteriorFill = true,
+            VCarveCutterProfile? cutterProfile = null,
+            double edgeFillWidth = 0,
+            Action<double, string, bool>? progress = null)
     {
         long t0 = PerfLog.Start();
-        var clearing = GenerateClearingPasses(
+        using var insetReuse = new CertifiedInsetReuse();
+        var clearing = GenerateClearingPassGeometries(
             boundary,
             startDepth,
             endDepth,
@@ -774,8 +1496,10 @@ public static class MedialAxisToolpaths
             bottomRadiusOverride,
             topRadiusOverride,
             coneLengthOverride,
-            includeInteriorFill);
-        var final = Generate(
+            includeInteriorFill, cutterProfile: cutterProfile, edgeFillWidth: edgeFillWidth,
+            progress: (fraction, stage, indeterminate) => progress?.Invoke(.3 * fraction, stage, indeterminate),
+            insetReuse: insetReuse).Select(pass => pass.Points).ToList();
+        var final = GenerateCore(
             provider,
             boundary,
             startDepth,
@@ -787,7 +1511,9 @@ public static class MedialAxisToolpaths
             bottomRadiusOverride,
             topRadiusOverride,
             coneLengthOverride,
-            includeInteriorFill: includeInteriorFill)
+            includeInteriorFill: includeInteriorFill, cutterProfile: cutterProfile,
+            progress: (fraction, stage, indeterminate) => progress?.Invoke(.3 + .7 * fraction, stage, indeterminate),
+            insetReuse: insetReuse)
             ?? new List<List<Point3D>>();
 
         PerfLog.Stop(
@@ -816,10 +1542,14 @@ public static class MedialAxisToolpaths
             double? bottomRadiusOverride = null,
             double? topRadiusOverride = null,
             double? coneLengthOverride = null,
-            bool includeInteriorFill = true)
+            bool includeInteriorFill = true,
+            VCarveCutterProfile? cutterProfile = null,
+            double edgeFillWidth = 0,
+            Action<double, string, bool>? progress = null)
     {
         long t0 = PerfLog.Start();
-        var clearing = GenerateClearingPassesTagged(
+        using var insetReuse = new CertifiedInsetReuse();
+        var clearing = GenerateClearingPassesTaggedCore(
             boundary,
             startDepth,
             endDepth,
@@ -830,8 +1560,10 @@ public static class MedialAxisToolpaths
             bottomRadiusOverride,
             topRadiusOverride,
             coneLengthOverride,
-            includeInteriorFill);
-        var finalGeometry = Generate(
+            includeInteriorFill, cutterProfile: cutterProfile, edgeFillWidth: edgeFillWidth,
+            progress: (fraction, stage, indeterminate) => progress?.Invoke(.3 * fraction, stage, indeterminate),
+            insetReuse: insetReuse);
+        var finalGeometry = GenerateCore(
             provider,
             boundary,
             startDepth,
@@ -843,7 +1575,9 @@ public static class MedialAxisToolpaths
             bottomRadiusOverride,
             topRadiusOverride,
             coneLengthOverride,
-            includeInteriorFill: includeInteriorFill)
+            includeInteriorFill: includeInteriorFill, cutterProfile: cutterProfile,
+            progress: (fraction, stage, indeterminate) => progress?.Invoke(.3 + .7 * fraction, stage, indeterminate),
+            insetReuse: insetReuse)
             ?? new List<List<Point3D>>();
         var final = finalGeometry
             .Select(path => new TaggedToolpath(path, regionIndex, "final-carve", null))
@@ -873,7 +1607,10 @@ public static class MedialAxisToolpaths
         double? bottomRadiusOverride = null,
         double? topRadiusOverride = null,
         double? coneLengthOverride = null,
-        bool includeInteriorFill = true)
+        bool includeInteriorFill = true,
+        VCarveCutterProfile? cutterProfile = null,
+        double edgeFillWidth = 0,
+        Action<double, string, bool>? progress = null)
     {
         if (provider is null) throw new ArgumentNullException(nameof(provider));
         if (regions is null) throw new ArgumentNullException(nameof(regions));
@@ -881,7 +1618,8 @@ public static class MedialAxisToolpaths
         var result = new List<TaggedToolpath>();
         int regionIndex = 0;
 
-        foreach (var region in regions)
+        var regionList = regions.ToList();
+        foreach (var region in regionList)
         {
             var tagged = GenerateVCarveTagged(
                 provider,
@@ -896,7 +1634,10 @@ public static class MedialAxisToolpaths
                 bottomRadiusOverride,
                 topRadiusOverride,
                 coneLengthOverride,
-                includeInteriorFill: includeInteriorFill);
+                includeInteriorFill: includeInteriorFill, cutterProfile: cutterProfile,
+                edgeFillWidth: edgeFillWidth,
+                progress: (fraction, stage, indeterminate) => progress?.Invoke(
+                    (regionIndex + fraction) / regionList.Count, stage, indeterminate));
 
             result.AddRange(tagged);
             regionIndex++;
@@ -925,7 +1666,14 @@ public static class MedialAxisToolpaths
             double? bottomRadiusOverride,
             double? topRadiusOverride,
             double? coneLengthOverride,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            VCarveCutterProfile? cutterProfile = null,
+            Action<string>? diagnostic = null,
+            Action<double, string, bool>? progress = null,
+            double outputSurfaceZ = 0,
+            IReadOnlyList<MedialSegment>? preparedMedialGraph = null,
+            CertifiedInsetReuse? insetReuse = null,
+            bool includeInteriorFill = true)
     {
         cancellationToken.ThrowIfCancellationRequested();
         long t0 = PerfLog.Start();
@@ -945,9 +1693,31 @@ public static class MedialAxisToolpaths
             topRadiusOverride,
             coneLengthOverride);
 
-        double maxRadius = profile.FinalRadius;
-        double invSlope = 1.0 / profile.RadiusSlope;
-
+        double maxRadius = cutterProfile?.RadiusAtDepth(endDepth - startDepth) ?? profile.FinalRadius;
+        if (preparedMedialGraph is not null)
+        {
+            var converted = preparedMedialGraph.Select(segment => new MedialSegment(
+                new MedialPoint(segment.Point0.X, segment.Point0.Y,
+                    -startDepth - RadiusToClippingDepth(segment.Point0.Radius, endDepth - startDepth,
+                        profile.BottomRadius, profile.RadiusSlope, cutterProfile)),
+                new MedialPoint(segment.Point1.X, segment.Point1.Y,
+                    -startDepth - RadiusToClippingDepth(segment.Point1.Radius, endDepth - startDepth,
+                        profile.BottomRadius, profile.RadiusSlope, cutterProfile)))).ToArray();
+            double commandRadius = CommandedCuttingRadius(cutterProfile, profile.BottomRadius,
+                profile.RadiusSlope, startDepth, endDepth, outputSurfaceZ, coneLengthOverride);
+            // Only GenerateCore's actual interior-fill branch consumes this
+            // region. Retain the original Contract call/cache on that branch.
+            var preparedFlat = includeInteriorFill
+                ? Contract(normalizedBoundary, commandRadius, cancellationToken, insetReuse)
+                : new List<List<PointD>>();
+            diagnostic?.Invoke($"stage=flat-area-work branch=prepared-medial computed={includeInteriorFill} "
+                + $"reason={(includeInteriorFill ? "interior-fill-consumer" : "no-interior-fill-consumer")} "
+                + $"radius={commandRadius:R} rings={preparedFlat.Count} medialConversionUnchanged=True");
+            diagnostic?.Invoke($"stage=medial-axis event=reused originalGraphEdges={preparedMedialGraph.Count} " +
+                "sourceClearancePreserved=True originalArtworkBoundary=True");
+            cancellationToken.ThrowIfCancellationRequested();
+            return (converted, preparedFlat);
+        }
         double scale    = InitialScale;
         string? lastErr  = null;
 
@@ -958,6 +1728,7 @@ public static class MedialAxisToolpaths
         {
             cancellationToken.ThrowIfCancellationRequested();
             long tAttempt = PerfLog.Start();
+            progress?.Invoke(0, $"Preparing medial geometry (attempt {attempt + 1}/4)...", true);
             // Simplify/scale the polygon layer
             simplifiedLayer = GenerateSimplifiedLayer(normalizedBoundary, scale);
             if (simplifiedLayer is null || simplifiedLayer.Count == 0)
@@ -974,7 +1745,8 @@ public static class MedialAxisToolpaths
                 maxRadius,
                 scale,
                 tolerance,
-                cancellationToken);
+                cancellationToken, diagnostic,
+                (fraction, stage, indeterminate) => progress?.Invoke(.95 * fraction, stage, indeterminate));
 
             double maxR    = 0;
             medialAxis.Clear();
@@ -985,8 +1757,10 @@ public static class MedialAxisToolpaths
                 if (r > maxR) maxR = r;
 
                 // Convert radius to Z depth: z = -startDepth - radius / halfTan
-                double d0 = Math.Max(0.0, (seg.Point0.Radius - profile.BottomRadius) * invSlope);
-                double d1 = Math.Max(0.0, (seg.Point1.Radius - profile.BottomRadius) * invSlope);
+                double d0 = RadiusToClippingDepth(seg.Point0.Radius, endDepth - startDepth,
+                    profile.BottomRadius, profile.RadiusSlope, cutterProfile);
+                double d1 = RadiusToClippingDepth(seg.Point1.Radius, endDepth - startDepth,
+                    profile.BottomRadius, profile.RadiusSlope, cutterProfile);
                 medialAxis.Add(new MedialSegment(
                     new MedialPoint(seg.Point0.X, seg.Point0.Y,
                         -startDepth - d0),
@@ -1017,7 +1791,20 @@ public static class MedialAxisToolpaths
         // matches exactly the area the clearing passes fill at endZ; otherwise the Difference
         // clip in GenerateFlatAreaFill removes medial-axis flat strokes from sub-regions that
         // are not covered by clearing rings, producing a visible toolpath gap.
-        var flatArea = Contract(normalizedBoundary, profile.FinalRadius);
+        double flatCommandRadius = CommandedCuttingRadius(cutterProfile, profile.BottomRadius,
+            profile.RadiusSlope, startDepth, endDepth, outputSurfaceZ, coneLengthOverride);
+        progress?.Invoke(.95, "Preparing flat-area boundary...", true);
+        // Contract's original entry check also applies when its unused work is skipped.
+        cancellationToken.ThrowIfCancellationRequested();
+        List<List<PointD>> flatArea = includeInteriorFill
+            ? Contract(normalizedBoundary, flatCommandRadius, cancellationToken, insetReuse)
+            : new List<List<PointD>>();
+        diagnostic?.Invoke($"stage=flat-area-work branch=constructed-medial computed={includeInteriorFill} "
+            + $"reason={(includeInteriorFill ? "interior-fill-consumer" : "no-interior-fill-consumer")} "
+            + $"radius={flatCommandRadius:R} rings={flatArea.Count} medialConversionUnchanged=True");
+        diagnostic?.Invoke($"stage=flat-area-inset depth={endDepth:R} commandedDepth={CommandedMachineDepth(endDepth, outputSurfaceZ):R} nominalRadius={maxRadius:R} " +
+            $"commandRadius={flatCommandRadius:R} surfaceZ={outputSurfaceZ:R} zDecimals=3");
+        progress?.Invoke(1, "Medial geometry complete", false);
 
         PerfLog.Stop(
             "MedialAxisToolpaths.GenerateMedialAxisToolpaths",
@@ -1025,6 +1812,49 @@ public static class MedialAxisToolpaths
             $"rings={boundary.Count} segments={medialAxis.Count} flatRings={flatArea.Count}");
 
         return (medialAxis, flatArea);
+    }
+
+    // TrimSegment interpolates its depth coordinate to locate the XY floor crossing.
+    // Before the physical Z pass, this coordinate must be affine in clearance radius:
+    // interpolating the nonlinear spherical inverse (or a capped cone inverse) would
+    // move that crossing and drop otherwise reachable corner detail.
+    internal static double RadiusToClippingDepth(double radius, double depthSpan,
+        double legacyBottomRadius, double legacySlope, VCarveCutterProfile? cutterProfile)
+    {
+        if (cutterProfile is null)
+            return Math.Max(0, (radius - legacyBottomRadius) * (1.0 / legacySlope));
+        var first = cutterProfile.Sections[0];
+        if (first.Kind == CarvingCutterSectionKind.Linear
+            && cutterProfile.MaximumDepth <= first.Height && first.TopRadius > first.BottomRadius)
+        {
+            double slope = (first.TopRadius - first.BottomRadius) / first.Height;
+            return Math.Max(0, (radius - first.BottomRadius) * (1.0 / slope));
+        }
+        return depthSpan + radius - cutterProfile.RadiusAtDepth(depthSpan);
+    }
+
+    // The post stores workspace Z as float, subtracts the float stock surface,
+    // then formats stock-relative Z with F3. Compensation follows whichever is
+    // deeper: the authored depth or the actual rounded command. Pitch and target
+    // Z remain nominal. Physical lookup deliberately extends beyond the nominal
+    // operation cap when the represented nose/taper continues above it.
+    internal static double CommandedCuttingRadius(VCarveCutterProfile? cutterProfile,
+        double bottomRadius, double radiusSlope, double startDepth, double layerDepth,
+        double outputSurfaceZ, double? coneLength = null)
+    {
+        double commandedDepth = CommandedMachineDepth(layerDepth, outputSurfaceZ);
+        double penetration = Math.Max(0, Math.Max(layerDepth, commandedDepth) - startDepth);
+        return cutterProfile?.PhysicalRadiusAtDepth(penetration)
+            ?? bottomRadius + radiusSlope * Math.Min(penetration, coneLength ?? double.PositiveInfinity);
+    }
+
+    private static double CommandedMachineDepth(double depth, double surfaceZ)
+    {
+        // Match the actual post's numeric formatting, including its runtime's
+        // midpoint rule. Compensation must not invent an extra quantum at ties.
+        float relativeZ = (float)(surfaceZ - depth) - (float)surfaceZ;
+        return -double.Parse(relativeZ.ToString("F3", System.Globalization.CultureInfo.InvariantCulture),
+            System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private static (double BottomRadius, double RadiusSlope, double PassRadius, double FinalRadius)
@@ -1186,95 +2016,33 @@ public static class MedialAxisToolpaths
         double maxRadius,
         double scale,
         double tolerance,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<string>? diagnostic = null,
+        Action<double, string, bool>? progress = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         long t0 = PerfLog.Start();
         // Group into boundary + holes via NonIntersectingPathGroups
-        var groups = NonIntersectingPathGroups(simplifiedLayer);
+        var groups = NonIntersectingPathGroups(simplifiedLayer).ToList();
         var result = new List<MedialSegment>();
         int groupCount = 0;
-        double scaleInv = 1.0 / scale;
-
         foreach (var (outerBoundary, holes) in groups)
         {
             cancellationToken.ThrowIfCancellationRequested();
             groupCount++;
             long tGroup = PerfLog.Start();
-            var scaledBoundary = new List<PointD>(outerBoundary.Count);
-            for (int i = 0; i < outerBoundary.Count; i++)
-            {
-                var p = outerBoundary[i];
-                scaledBoundary.Add(new PointD(p.x * scale, p.y * scale));
-            }
 
-            var scaledHoles = new List<IReadOnlyList<PointD>>(holes.Count);
-            for (int h = 0; h < holes.Count; h++)
-            {
-                var hole = holes[h];
-                var scaledHole = new List<PointD>(hole.Count);
-                for (int i = 0; i < hole.Count; i++)
-                {
-                    var p = hole[i];
-                    scaledHole.Add(new PointD(p.x * scale, p.y * scale));
-                }
-
-                scaledHoles.Add(scaledHole);
-            }
-
-            // A negative maxRadius signals "no limit" (preview mode).
-            // Keep the value finite and within 32-bit signed range because the
-            // WASM bridge may coerce this argument into an int-like path.
-            var bb = BoundingBox(outerBoundary);
-            double width = Math.Max(0, bb.maxX - bb.minX);
-            double height = Math.Max(0, bb.maxY - bb.minY);
-            double noLimitRadius = Math.Sqrt(width * width + height * height);
-            if (noLimitRadius <= 0) noLimitRadius = Math.Max(width, height);
-            if (noLimitRadius <= 0) noLimitRadius = 1.0;
-
-            double requestedRadius = maxRadius > 0 ? maxRadius : noLimitRadius;
-            double providerMaxRadius = scale * requestedRadius;
-
-            var segments = provider.ConstructMedialAxis(
-                scaledBoundary,
-                scaledHoles,
-                tolerance:      tolerance,
-                maxRadius:      providerMaxRadius,
-                filteringAngle: 3.0 * Math.PI / 4.0,
-                useBigIntegers: true);
-            cancellationToken.ThrowIfCancellationRequested();
+            var segments = MedialAxisGeometry.Build(outerBoundary,
+                holes.Select(hole => (IReadOnlyList<PointD>)hole).ToList(), provider,
+                tolerance, maxRadius, 3.0 * Math.PI / 4.0, cancellationToken, diagnostic,
+                (fraction, stage, indeterminate) => progress?.Invoke(
+                    (groupCount - 1 + fraction) / groups.Count,
+                    $"Medial group {groupCount}/{groups.Count}: {stage}", indeterminate),
+                coordinateScale: scale);
 
             if (segments.Count > 0)
                 result.Capacity = Math.Max(result.Capacity, result.Count + segments.Count);
-
-            foreach (var seg in segments)
-            {
-                result.Add(new MedialSegment(
-                    new MedialPoint(seg.Point0.X * scaleInv, seg.Point0.Y * scaleInv,
-                                    seg.Point0.Radius * scaleInv),
-                    new MedialPoint(seg.Point1.X * scaleInv, seg.Point1.Y * scaleInv,
-                                    seg.Point1.Radius * scaleInv)));
-            }
-
-            if (IsMedialBoundsValidationEnabled())
-            {
-                // Optional debug validation, disabled by default for perf-sensitive runs.
-                int oob = 0;
-                for (int s = 0; s < segments.Count; s++)
-                {
-                    var seg = segments[s];
-                    double x0 = seg.Point0.X * scaleInv;
-                    double y0 = seg.Point0.Y * scaleInv;
-                    double x1 = seg.Point1.X * scaleInv;
-                    double y1 = seg.Point1.Y * scaleInv;
-                    bool outside = x0 < bb.minX - 1e-6 || x0 > bb.maxX + 1e-6 || y0 < bb.minY - 1e-6 || y0 > bb.maxY + 1e-6
-                                || x1 < bb.minX - 1e-6 || x1 > bb.maxX + 1e-6 || y1 < bb.minY - 1e-6 || y1 > bb.maxY + 1e-6;
-                    if (outside) oob++;
-                }
-
-                if (oob > 0)
-                    Console.Error.WriteLine($"[medial-axis] {oob}/{segments.Count} segments have endpoints outside polygon bbox ({bb.minX:F4},{bb.minY:F4})-({bb.maxX:F4},{bb.maxY:F4}) pts={outerBoundary.Count}");
-            }
+            result.AddRange(segments);
 
             PerfLog.Stop(
                 "MedialAxisToolpaths.GenerateMedialAxis.Group",
@@ -1402,40 +2170,108 @@ public static class MedialAxisToolpaths
     internal static IEnumerable<MedialSegment> GenerateFlatAreaFill(
         IEnumerable<List<PointD>> flatStrokes,
         IEnumerable<List<PointD>> flatAreaRegion,
-        double endZ)
+        double endZ,
+        CancellationToken cancellationToken = default,
+        Action<string>? diagnostic = null,
+        Action<double, string, bool>? progress = null)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var regionList = flatAreaRegion as IList<List<PointD>> ?? flatAreaRegion.ToList();
+        var strokeList = flatStrokes as IList<List<PointD>> ?? flatStrokes.ToList();
+        long processed = 0, emitted = 0, selectedVertices = 0, cacheHits = 0;
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        long lastReportMs = 0;
+        void Report(bool complete = false)
+        {
+            if (!complete && processed != 0 && timer.ElapsedMilliseconds - lastReportMs < 250)
+                return;
+            lastReportMs = timer.ElapsedMilliseconds;
+            diagnostic?.Invoke($"stage=flat-area-clip event={(complete ? "complete" : "progress")} " +
+                $"strokes={processed}/{strokeList.Count} clipRings={regionList.Count} " +
+                $"selectedVertices={selectedVertices} cacheHits={cacheHits} emitted={emitted} " +
+                $"elapsedMs={timer.Elapsed.TotalMilliseconds:F1}");
+            progress?.Invoke(strokeList.Count == 0 ? 1 : (double)processed / strokeList.Count,
+                $"Clipping flat strokes {processed}/{strokeList.Count}", false);
+        }
+        Report();
 
         // When the flat area is empty every stroke lies "outside" it -> return all unchanged.
         if (regionList.Count == 0)
         {
-            foreach (var polyline in flatStrokes)
+            foreach (var polyline in strokeList)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 PointD? prev = null;
                 foreach (var pt in polyline)
                 {
                     if (prev is not null)
+                    {
+                        emitted++;
                         yield return new MedialSegment(
                             new MedialPoint(prev.Value.x, prev.Value.y, endZ),
                             new MedialPoint(pt.x, pt.y, endZ));
+                    }
                     prev = pt;
                 }
+                processed++;
+                Report();
             }
+            Report(complete: true);
             yield break;
         }
 
         // Non-empty flat area: clip each stroke to OUTSIDE the flat-area polygon
         // (Clipper Difference: subject = open stroke, clip = closed flat area).
         var clipPaths = PathUtils.ToClipper(regionList.Select(r => r.Select(p => p)));
+        var clipBounds = clipPaths.Select(Clipper.GetBounds).ToArray();
+        // A ring disjoint from the stroke's integer bounding box has zero winding
+        // everywhere on that stroke. Enclosing rings (including holes/islands) have
+        // intersecting boxes and remain in their original order and orientation.
+        // Unlike clipping polygons to a local rectangle, this introduces no new
+        // rounded vertices and preserves the original integer clipping geometry.
+        var reusable = new Dictionary<string, ReuseableDataContainer64>();
+        long cachedVertices = 0;
+        const long cacheVertexBudget = 1_000_000;
 
-        foreach (var polyline in flatStrokes)
+        foreach (var polyline in strokeList)
         {
-            if (polyline.Count < 2) continue;
+            cancellationToken.ThrowIfCancellationRequested();
+            if (polyline.Count < 2)
+            {
+                processed++;
+                Report();
+                continue;
+            }
+            var subject = PathUtils.ToClipper(new[] { polyline })[0];
+            var bounds = Clipper.GetBounds(subject);
+            var selected = new List<int>();
+            int vertexCount = 0;
+            for (int i = 0; i < clipPaths.Count; i++)
+            {
+                var candidate = clipBounds[i];
+                if (candidate.left > bounds.right || candidate.right < bounds.left ||
+                    candidate.top > bounds.bottom || candidate.bottom < bounds.top)
+                    continue;
+                selected.Add(i);
+                vertexCount += clipPaths[i].Count;
+            }
+            selectedVertices += vertexCount;
+            string key = string.Join(",", selected);
+            if (!reusable.TryGetValue(key, out var prepared))
+            {
+                prepared = new ReuseableDataContainer64();
+                prepared.AddPaths(new Paths64(selected.Select(i => clipPaths[i])), PathType.Clip, false);
+                if (reusable.Count < 256 && cachedVertices + vertexCount <= cacheVertexBudget)
+                {
+                    reusable.Add(key, prepared);
+                    cachedVertices += vertexCount;
+                }
+            }
+            else cacheHits++;
 
             var clipper = new Clipper64();
-            clipper.AddOpenSubject(PathUtils.ToClipper(new[] { polyline })[0]);
-            foreach (var cp in clipPaths)
-                clipper.AddClip(cp);
+            clipper.AddOpenSubject(subject);
+            clipper.AddReuseableData(prepared);
 
             var openResult   = new Paths64();
             var closedResult = new Paths64();
@@ -1449,13 +2285,19 @@ public static class MedialAxisToolpaths
                 foreach (var pt in clipped)
                 {
                     if (prev is not null)
+                    {
+                        emitted++;
                         yield return new MedialSegment(
                             new MedialPoint(prev.Value.x, prev.Value.y, endZ),
                             new MedialPoint(pt.x, pt.y, endZ));
+                    }
                     prev = pt;
                 }
             }
+            processed++;
+            Report();
         }
+        Report(complete: true);
     }
 
     // --- joinIntoPolylines -----------------------------------------------
@@ -1579,33 +2421,116 @@ public static class MedialAxisToolpaths
         }
     }
 
-    private static bool IsMedialBoundsValidationEnabled() =>
-        string.Equals(
-            Environment.GetEnvironmentVariable("RW_TOOLPATHS_MEDIAL_VALIDATE"),
-            "1",
-            StringComparison.Ordinal);
-
     /// <summary>Contract (inward offset) all rings by <paramref name="amount"/>.</summary>
     private static List<List<PointD>> Contract(
-        IEnumerable<IEnumerable<PointD>> rings, double amount)
+        IEnumerable<IEnumerable<PointD>> rings, double amount,
+        CancellationToken cancellationToken = default,
+        CertifiedInsetReuse? insetReuse = null)
     {
-        var paths  = PathUtils.ToClipper(rings);
-        var result = Clipper2Lib.Clipper.InflatePaths(
-            paths, -amount * PathUtils.Scale,
-            JoinType.Round, EndType.Polygon);
-        return PathUtils.FromClipper(result);
+        // Clearing perimeters and flat-area exclusions share the same original-
+        // source contraction and complete commanded-chord clearance contract.
+        var source = rings.Select(ring => (IReadOnlyList<PointD>)ring.ToArray()).ToArray();
+        return insetReuse is null
+            ? PolygonOps.CutterInset(source, amount, cancellationToken: cancellationToken)
+            : insetReuse.Contract(source, amount, cancellationToken);
     }
 
-    /// <summary>Returns the intersection of two polygon sets.</summary>
-    private static List<List<PointD>> IntersectPolygons(
-        IEnumerable<IEnumerable<PointD>> a, IEnumerable<IEnumerable<PointD>> b)
+    /// <summary>
+    /// One region invocation's last certified Contract result. Only the fixed
+    /// CutterInset defaults used by Contract enter this cache; candidate fronts
+    /// and edge-band clipping never do. Keeping one entry bounds retained data
+    /// while preserving the bottom clearing inset for the final flat-area query.
+    /// </summary>
+    internal sealed class CertifiedInsetReuse : IDisposable
     {
-        var pathsA = PathUtils.ToClipper(a);
-        var pathsB = PathUtils.ToClipper(b);
-        if (pathsA.Count == 0 || pathsB.Count == 0) return new();
-        var result = Clipper2Lib.Clipper.BooleanOp(
-            ClipType.Intersection, pathsA, pathsB, FillRule.NonZero);
-        return PathUtils.FromClipper(result);
+        private readonly Action<string>? _diagnostic;
+        private readonly bool _preferOriginalFirstConstruction;
+        private PointD[][]? _source;
+        private PointD[][]? _result;
+        private long _radiusBits;
+        private int _sourceMismatches;
+        private int _radiusMismatches;
+        private double _computeMilliseconds;
+        internal int PreparedCount { get; private set; }
+        internal int ReuseCount { get; private set; }
+
+        internal CertifiedInsetReuse(Action<string>? diagnostic = null,
+            bool preferOriginalFirstConstruction = false)
+        {
+            _diagnostic = diagnostic;
+            _preferOriginalFirstConstruction = preferOriginalFirstConstruction;
+        }
+
+        internal List<List<PointD>> Contract(
+            IReadOnlyList<IReadOnlyList<PointD>> source, double radius,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            long radiusBits = BitConverter.DoubleToInt64Bits(radius);
+            if (_source is not null)
+            {
+                if (_radiusBits != radiusBits)
+                    _radiusMismatches++;
+                else if (MatchesSource(source, cancellationToken))
+                {
+                    ReuseCount++;
+                    // No caller receives the arrays held by the cache, including
+                    // the first caller whose returned lists may later be edited.
+                    var reused = _result!.Select(ring => ring.ToList()).ToList();
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return reused;
+                }
+                else
+                    _sourceMismatches++;
+            }
+
+            // Exact ordered original coordinates are stricter than a quantized
+            // hash: holes, winding, order and sub-grid changes cannot collide.
+            var sourceSnapshot = source.Select(ring => ring.ToArray()).ToArray();
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            var computed = PolygonOps.CutterInset(sourceSnapshot, radius,
+                cancellationToken: cancellationToken,
+                preferOriginalFirstConstruction: _preferOriginalFirstConstruction,
+                useOriginalHoleErosion: false);
+            _computeMilliseconds += System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            cancellationToken.ThrowIfCancellationRequested();
+            _source = sourceSnapshot;
+            _result = computed.Select(ring => ring.ToArray()).ToArray();
+            _radiusBits = radiusBits;
+            PreparedCount++;
+            return computed;
+        }
+
+        private bool MatchesSource(IReadOnlyList<IReadOnlyList<PointD>> source,
+            CancellationToken cancellationToken)
+        {
+            if (_source!.Length != source.Count) return false;
+            for (int ringIndex = 0; ringIndex < source.Count; ringIndex++)
+            {
+                var saved = _source[ringIndex];
+                var candidate = source[ringIndex];
+                if (saved.Length != candidate.Count) return false;
+                for (int i = 0; i < saved.Length; i++)
+                {
+                    if ((i & 1023) == 0) cancellationToken.ThrowIfCancellationRequested();
+                    if (BitConverter.DoubleToInt64Bits(saved[i].x) != BitConverter.DoubleToInt64Bits(candidate[i].x)
+                        || BitConverter.DoubleToInt64Bits(saved[i].y) != BitConverter.DoubleToInt64Bits(candidate[i].y))
+                        return false;
+                }
+            }
+            return true;
+        }
+
+        public void Dispose()
+        {
+            _diagnostic?.Invoke($"stage=certified-inset-reuse event=complete capacity=1 " +
+                $"prepared={PreparedCount} reused={ReuseCount} sourceMismatches={_sourceMismatches} " +
+                $"radiusMismatches={_radiusMismatches} computeMs={_computeMilliseconds:F1} " +
+                $"preferOriginalFirstConstruction={_preferOriginalFirstConstruction} " +
+                "identity=exact-ordered-source-and-command-radius policy=Contract-defaults");
+            _source = null;
+            _result = null;
+        }
     }
 
     /// <summary>Returns the difference of two polygon sets (subject minus clip).</summary>
@@ -1654,7 +2579,8 @@ public static class MedialAxisToolpaths
         double depthPerPass,
         double? bottomRadiusOverride = null,
         double? topRadiusOverride = null,
-        double? coneLengthOverride = null)
+        double? coneLengthOverride = null,
+        VCarveCutterProfile? cutterProfile = null)
     {
         var profile = ResolveToolProfile(
             startDepth, endDepth, radianTipAngle, depthPerPass,
@@ -1665,7 +2591,7 @@ public static class MedialAxisToolpaths
         double invSlope = 1.0 / Math.Max(1e-9, profile.RadiusSlope);
         double bottomR  = profile.BottomRadius;
         var spatialIndex = new SpatialSegmentIndex(segments);
-        return (x, y) => AnalyticalZ(x, y, spatialIndex, startZ, bottomR, invSlope, endZ);
+        return (x, y) => AnalyticalZ(x, y, spatialIndex, startZ, bottomR, invSlope, endZ, cutterProfile);
     }
 
     /// <summary>
@@ -1687,7 +2613,9 @@ public static class MedialAxisToolpaths
         double bottomRadius,
         double radiusSlope,
         double endZ,
-        double zTolerance)
+        double zTolerance,
+        VCarveCutterProfile? cutterProfile = null,
+        Action<string>? diagnostic = null)
     {
         if (path.Count < 2 || zTolerance <= 0)
             return path;
@@ -1699,23 +2627,55 @@ public static class MedialAxisToolpaths
         var snapped = new List<Point3D>(path.Count);
         foreach (var p in path)
         {
-            double z = AnalyticalZ(p.X, p.Y, spatialIndex, startZ, bottomRadius, invSlope, endZ);
+            double z = AnalyticalZ(p.X, p.Y, spatialIndex, startZ, bottomRadius, invSlope, endZ, cutterProfile);
             snapped.Add(new Point3D(p.X, p.Y, z));
         }
 
+        var refinement = cutterProfile is not null && diagnostic is not null
+            ? new ZRefinementDiagnostics() : null;
         var output = new List<Point3D>(snapped.Count * 2);
         output.Add(snapped[0]);
         for (int i = 0; i < snapped.Count - 1; i++)
         {
-            BisectChordForZ(
-                snapped[i], snapped[i + 1], spatialIndex,
-                startZ, bottomRadius, invSlope, endZ, zTolerance,
-                output, depth: 0);
+            try
+            {
+                BisectChordForZ(
+                    snapped[i], snapped[i + 1], spatialIndex,
+                    startZ, bottomRadius, invSlope, endZ, zTolerance,
+                    output, depth: 0, cutterProfile, refinement);
+            }
+            catch (InvalidOperationException error)
+            {
+                throw new InvalidOperationException($"V-carve source chord {i}/{snapped.Count - 1}: " +
+                    $"({snapped[i].X:R},{snapped[i].Y:R},{snapped[i].Z:R})->" +
+                    $"({snapped[i + 1].X:R},{snapped[i + 1].Y:R},{snapped[i + 1].Z:R}). {error.Message}", error);
+            }
         }
+        if (refinement?.MaximumDepth > MaxZFidelityBisectDepth)
+            diagnostic?.Invoke($"stage=depth-fidelity event=extended-refinement " +
+                $"recursionDepth={refinement.MaximumDepth} budget={MaxRoundedZFidelityBisectDepth} " +
+                $"extendedBranches={refinement.ExtendedBranches} sourcePoints={path.Count} outputPoints={output.Count} " +
+                $"zTolerance={zTolerance:R} noseDiameter={cutterProfile!.ClearingDiameter:R}");
+        if (refinement?.CylinderWithdrawals > 0)
+            diagnostic?.Invoke($"stage=depth-fidelity event=cylinder-withdrawal count={refinement.CylinderWithdrawals} "
+                + $"sourcePoints={path.Count} outputPoints={output.Count} zTolerance={zTolerance:R} "
+                + "physicalRadiusPreserved=True verticalTransition=True");
         return output;
     }
 
     private const int MaxZFidelityBisectDepth = 14;
+    // At a hemisphere's equator its inverse depth has a square-root cusp. Halving
+    // XY converges at half the cone's exponent, so permit twice the recursion
+    // budget for rounded tools. Every accepted chord still needs the exact guard.
+    private const int MaxRoundedZFidelityBisectDepth = 28;
+
+    private sealed class ZRefinementDiagnostics
+    {
+        public int MaximumDepth;
+        public int ExtendedBranches;
+        public int CylinderWithdrawals;
+    }
+
 
     /// <summary>
     /// Splits any path segment whose |dz| exceeds the given cap, inserting
@@ -1789,11 +2749,20 @@ public static class MedialAxisToolpaths
         double endZ,
         double zTolerance,
         List<Point3D> output,
-        int depth)
+        int depth,
+        VCarveCutterProfile? cutterProfile = null,
+        ZRefinementDiagnostics? refinement = null)
     {
+        int maximumDepth = cutterProfile?.RoundedTip == true
+            ? MaxRoundedZFidelityBisectDepth : MaxZFidelityBisectDepth;
+        if (refinement is not null)
+        {
+            refinement.MaximumDepth = Math.Max(refinement.MaximumDepth, depth);
+            if (depth == MaxZFidelityBisectDepth + 1) refinement.ExtendedBranches++;
+        }
         double dx = b.X - a.X;
         double dy = b.Y - a.Y;
-        if (depth >= MaxZFidelityBisectDepth || (dx * dx + dy * dy) < 1e-18)
+        if ((dx * dx + dy * dy) < 1e-18)
         {
             output.Add(b);
             return;
@@ -1802,17 +2771,73 @@ public static class MedialAxisToolpaths
         double mx = 0.5 * (a.X + b.X);
         double my = 0.5 * (a.Y + b.Y);
         double zChord = 0.5 * (a.Z + b.Z);
-        double zAnalytical = AnalyticalZ(mx, my, spatialIndex, startZ, bottomRadius, invSlope, endZ);
+        double zAnalytical = AnalyticalZ(mx, my, spatialIndex, startZ, bottomRadius, invSlope, endZ, cutterProfile);
 
-        if (Math.Abs(zChord - zAnalytical) <= zTolerance)
+        bool midpointFits = Math.Abs(zChord - zAnalytical) <= zTolerance;
+        double split = 0.5;
+        // Both an off-center depth minimum and the surface clamp of a finite tip can
+        // escape a midpoint test. Certify the entire cutting interval against the
+        // original boundary before accepting it.
+        bool overcuts = (midpointFits || depth >= maximumDepth)
+            && spatialIndex.TryFindDepthViolation(a, b, startZ, bottomRadius,
+                1.0 / invSlope, zTolerance, out split, cutterProfile);
+        if (midpointFits && !overcuts)
         {
             output.Add(b);
             return;
         }
 
+        if (depth >= maximumDepth)
+        {
+            // A constant-radius section creates a real jump in the inverse
+            // clearance function. Lift at the fitting endpoint, rather than
+            // interpolating a tilted cylinder into the retained corner. This
+            // final dyadic XY interval is already below geometric tolerance.
+            if (overcuts && cutterProfile is not null)
+            {
+                double sectionStart = 0;
+                foreach (var section in cutterProfile.Sections)
+                {
+                    if (section.Kind == CarvingCutterSectionKind.Linear
+                        && section.BottomRadius == section.TopRadius)
+                    {
+                        double liftZ = startZ - sectionStart;
+                        var raisedA = new Point3D(a.X, a.Y, Math.Max(a.Z, liftZ));
+                        var raisedB = new Point3D(b.X, b.Y, Math.Max(b.Z, liftZ));
+                        if ((raisedA.Z > a.Z || raisedB.Z > b.Z)
+                            && !spatialIndex.TryFindDepthViolation(raisedA, raisedB, startZ,
+                                bottomRadius, 1.0 / invSlope, zTolerance, out _, cutterProfile))
+                        {
+                            output.Add(raisedA); output.Add(raisedB); output.Add(b);
+                            if (refinement is not null) refinement.CylinderWithdrawals++;
+                            return;
+                        }
+                    }
+                    sectionStart += section.Height;
+                }
+            }
+            if (overcuts)
+                throw new InvalidOperationException($"V-carve depth refinement could not certify boundary clearance " +
+                    $"within {zTolerance:R} mm at ({a.X:R},{a.Y:R},{a.Z:R})->({b.X:R},{b.Y:R},{b.Z:R}); " +
+                    $"recursionDepth={depth} budget={maximumDepth} roundedTip={cutterProfile?.RoundedTip ?? false} " +
+                    $"noseDiameter={cutterProfile?.ClearingDiameter ?? 0:R} profileDepth={cutterProfile?.MaximumDepth ?? 0:R}.");
+            output.Add(b);
+            return;
+        }
+
+        if (overcuts)
+        {
+            // Avoid repeatedly splitting at an endpoint when the minimum lies at the
+            // open depth-tolerance boundary. Interior extrema are inserted directly.
+            if (split < 0.01 || split > 0.99) split = 0.5;
+            mx = a.X + split * dx;
+            my = a.Y + split * dy;
+            zAnalytical = AnalyticalZ(mx, my, spatialIndex, startZ, bottomRadius, invSlope, endZ, cutterProfile);
+        }
+
         var mid = new Point3D(mx, my, zAnalytical);
-        BisectChordForZ(a, mid, spatialIndex, startZ, bottomRadius, invSlope, endZ, zTolerance, output, depth + 1);
-        BisectChordForZ(mid, b, spatialIndex, startZ, bottomRadius, invSlope, endZ, zTolerance, output, depth + 1);
+        BisectChordForZ(a, mid, spatialIndex, startZ, bottomRadius, invSlope, endZ, zTolerance, output, depth + 1, cutterProfile, refinement);
+        BisectChordForZ(mid, b, spatialIndex, startZ, bottomRadius, invSlope, endZ, zTolerance, output, depth + 1, cutterProfile, refinement);
     }
 
     private static double AnalyticalZ(
@@ -1822,10 +2847,17 @@ public static class MedialAxisToolpaths
         double startZ,
         double bottomRadius,
         double invSlope,
-        double endZ)
+        double endZ,
+        VCarveCutterProfile? cutterProfile = null)
     {
         double r = spatialIndex.QueryDistance(x, y);
-        double depthBelowStart = Math.Max(0.0, r - bottomRadius) * invSlope;
+        // F3 XY rounding must not push a full-radius cylinder off its fitting
+        // side of a depth jump. Reserve this in the clearance domain, where
+        // the straight ball's inverse has unbounded slope at its equator.
+        if (cutterProfile is not null && cutterProfile.FirstCylinderHeight < startZ - endZ)
+            r = Math.Max(0, r - .002);
+        double depthBelowStart = cutterProfile?.DepthAtRadius(r)
+            ?? (Math.Max(0.0, r - bottomRadius) * invSlope);
         double z = startZ - depthBelowStart;
         if (z < endZ) z = endZ;
         return z;
@@ -1856,157 +2888,560 @@ public static class MedialAxisToolpaths
         return bestSq < double.PositiveInfinity ? Math.Sqrt(bestSq) : 0.0;
     }
 
-    internal class SpatialSegmentIndex
+    /// <summary>
+    /// Immutable double-coordinate BVH for analytical wall distance and continuous
+    /// cutter clearance. Virtual cell extents retain the old grid's first-seen
+    /// order without allocating cells or repeating segment references.
+    /// </summary>
+    internal sealed class SpatialSegmentIndex
     {
-        private readonly IReadOnlyList<(PointD A, PointD B)> _segments;
+        private const int LeafCapacity = 8;
+        private const double ArithmeticReserve = 16 * 2.2204460492503131e-16;
+        private readonly (PointD A, PointD B)[] _segments;
+        private readonly Box[] _bounds;
+        private readonly CellRange[] _cells;
+        private readonly int[] _order;
+        private readonly Node[] _nodes;
         private readonly double _minX, _minY;
         private readonly double _cellSizeX, _cellSizeY;
         private readonly int _cols, _rows;
-        private readonly List<int>[,] _grid;
+        private readonly QueryDiagnostics? _diagnostics;
 
-        public SpatialSegmentIndex(IReadOnlyList<(PointD A, PointD B)> segments)
+        [ThreadStatic] private static QueryScratch? _scratch;
+        private static QueryScratch Scratch => _scratch ??= new QueryScratch();
+
+        private sealed class QueryScratch
         {
-            _segments = segments;
-            if (segments.Count == 0)
+            internal readonly List<OrderedCandidate> Candidates = new();
+            internal readonly List<RadiusInterval> Intervals = new();
+            internal WeakReference<SpatialSegmentIndex>? NearestOwner;
+            internal int NearestOrdinal;
+        }
+
+        private readonly record struct Box(double MinX, double MinY, double MaxX, double MaxY)
+        {
+            internal bool Intersects(Box other) => MinX <= other.MaxX && MaxX >= other.MinX
+                && MinY <= other.MaxY && MaxY >= other.MinY;
+        }
+        private readonly record struct CellRange(int MinC, int MinR, int MaxC, int MaxR)
+        {
+            internal bool Intersects(CellRange other) => MinC <= other.MaxC && MaxC >= other.MinC
+                && MinR <= other.MaxR && MaxR >= other.MinR;
+        }
+        private readonly record struct Node(Box Bounds, CellRange Cells,
+            int First, int Count, int Left, int Right);
+        private readonly record struct OrderedCandidate(int Ordinal, int FirstCell) : IComparable<OrderedCandidate>
+        {
+            public int CompareTo(OrderedCandidate other)
             {
-                _grid = new List<int>[0, 0];
+                int result = FirstCell.CompareTo(other.FirstCell);
+                return result != 0 ? result : Ordinal.CompareTo(other.Ordinal);
+            }
+        }
+
+        internal sealed class QueryDiagnostics
+        {
+            internal long NearestQueries, NearestNodes, DistanceTests, NearestSeedTrials, NearestSeedWins;
+            internal long CandidateQueries, CandidateNodes, CandidateLeafTests, Candidates;
+            internal long ScratchGrowths, PartitionFallbacks;
+            internal int NodeCount;
+            internal double BuildMilliseconds;
+        }
+        internal QueryDiagnostics? Diagnostics => _diagnostics;
+
+        public SpatialSegmentIndex(IReadOnlyList<(PointD A, PointD B)> segments, bool enableDiagnostics = false)
+        {
+            string? diagnosticSwitch = Environment.GetEnvironmentVariable("RW_TOOLPATHS_WALL_INDEX_DIAGNOSTICS");
+            if (enableDiagnostics || diagnosticSwitch == "1") _diagnostics = new();
+            long started = _diagnostics is null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
+            _segments = segments.ToArray();
+            _bounds = new Box[_segments.Length];
+            _cells = new CellRange[_segments.Length];
+            _order = new int[_segments.Length];
+            if (_segments.Length == 0)
+            {
+                _nodes = Array.Empty<Node>();
                 return;
             }
 
             double minX = double.MaxValue, minY = double.MaxValue;
             double maxX = -double.MaxValue, maxY = -double.MaxValue;
-            foreach (var seg in segments)
+            foreach (var seg in _segments)
             {
                 minX = Math.Min(minX, Math.Min(seg.A.x, seg.B.x));
                 maxX = Math.Max(maxX, Math.Max(seg.A.x, seg.B.x));
                 minY = Math.Min(minY, Math.Min(seg.A.y, seg.B.y));
                 maxY = Math.Max(maxY, Math.Max(seg.A.y, seg.B.y));
             }
+            _minX = minX; _minY = minY;
+            int dims = Math.Clamp((int)Math.Sqrt(_segments.Length), 8, 64);
+            _cols = dims; _rows = dims;
+            _cellSizeX = Math.Max(1e-9, maxX - minX) / _cols;
+            _cellSizeY = Math.Max(1e-9, maxY - minY) / _rows;
 
-            _minX = minX;
-            _minY = minY;
-
-            int n = segments.Count;
-            int dims = Math.Clamp((int)Math.Sqrt(n), 8, 64);
-            _cols = dims;
-            _rows = dims;
-
-            double width = Math.Max(1e-9, maxX - minX);
-            double height = Math.Max(1e-9, maxY - minY);
-
-            _cellSizeX = width / _cols;
-            _cellSizeY = height / _rows;
-
-            _grid = new List<int>[_cols, _rows];
-
-            for (int i = 0; i < segments.Count; i++)
+            for (int i = 0; i < _segments.Length; i++)
             {
-                var seg = segments[i];
-                double segMinX = Math.Min(seg.A.x, seg.B.x);
-                double segMaxX = Math.Max(seg.A.x, seg.B.x);
-                double segMinY = Math.Min(seg.A.y, seg.B.y);
-                double segMaxY = Math.Max(seg.A.y, seg.B.y);
-
-                int c1 = Math.Clamp((int)((segMinX - _minX) / _cellSizeX), 0, _cols - 1);
-                int c2 = Math.Clamp((int)((segMaxX - _minX) / _cellSizeX), 0, _cols - 1);
-                int r1 = Math.Clamp((int)((segMinY - _minY) / _cellSizeY), 0, _rows - 1);
-                int r2 = Math.Clamp((int)((segMaxY - _minY) / _cellSizeY), 0, _rows - 1);
-
-                for (int c = c1; c <= c2; c++)
-                {
-                    for (int r = r1; r <= r2; r++)
-                    {
-                        _grid[c, r] ??= new List<int>();
-                        _grid[c, r].Add(i);
-                    }
-                }
+                var seg = _segments[i];
+                double x0 = Math.Min(seg.A.x, seg.B.x), x1 = Math.Max(seg.A.x, seg.B.x);
+                double y0 = Math.Min(seg.A.y, seg.B.y), y1 = Math.Max(seg.A.y, seg.B.y);
+                // These casts intentionally match the old grid insertion arithmetic.
+                // Reconstructing cell bounds in world coordinates introduces a
+                // roundoff-sensitive disagreement at exact cell boundaries.
+                _cells[i] = new(
+                    Math.Clamp((int)((x0 - _minX) / _cellSizeX), 0, _cols - 1),
+                    Math.Clamp((int)((y0 - _minY) / _cellSizeY), 0, _rows - 1),
+                    Math.Clamp((int)((x1 - _minX) / _cellSizeX), 0, _cols - 1),
+                    Math.Clamp((int)((y1 - _minY) / _cellSizeY), 0, _rows - 1));
+                _bounds[i] = ExpandedBox(x0, y0, x1, y1);
+                _order[i] = i;
             }
+            _nodes = new Node[CountNodes(_segments.Length)];
+            int nextNode = 0;
+            Build(0, _segments.Length, ref nextNode);
+            if (_diagnostics is not null)
+            {
+                _diagnostics.NodeCount = _nodes.Length;
+                _diagnostics.BuildMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            }
+        }
+
+        internal void LogDiagnostics(Action<string>? diagnostic)
+        {
+            if (_diagnostics is not { } counters) return;
+            string message = $"stage=wall-index event=queries segments={_segments.Length} nodes={counters.NodeCount} " +
+                $"buildMs={counters.BuildMilliseconds:F3} nearestQueries={counters.NearestQueries} " +
+                $"nearestNodes={counters.NearestNodes} distanceTests={counters.DistanceTests} " +
+                $"nearestSeedTrials={counters.NearestSeedTrials} nearestSeedWins={counters.NearestSeedWins} " +
+                $"candidateQueries={counters.CandidateQueries} candidateNodes={counters.CandidateNodes} " +
+                $"candidateLeafTests={counters.CandidateLeafTests} candidates={counters.Candidates} " +
+                $"scratchGrowths={counters.ScratchGrowths} partitionFallbacks={counters.PartitionFallbacks}";
+            if (diagnostic is not null) diagnostic(message);
+            else Console.Error.WriteLine(message);
+        }
+
+        private static int CountNodes(int count)
+            => count <= LeafCapacity ? 1 : 1 + CountNodes(count / 2) + CountNodes(count - count / 2);
+
+        private int Build(int first, int count, ref int nextNode)
+        {
+            double x0 = double.PositiveInfinity, y0 = x0, x1 = double.NegativeInfinity, y1 = x1;
+            int c0 = int.MaxValue, r0 = c0, c1 = int.MinValue, r1 = c1;
+            for (int i = first; i < first + count; i++)
+            {
+                int ordinal = _order[i];
+                Box bounds = _bounds[ordinal]; CellRange cells = _cells[ordinal];
+                x0 = Math.Min(x0, bounds.MinX); y0 = Math.Min(y0, bounds.MinY);
+                x1 = Math.Max(x1, bounds.MaxX); y1 = Math.Max(y1, bounds.MaxY);
+                c0 = Math.Min(c0, cells.MinC); r0 = Math.Min(r0, cells.MinR);
+                c1 = Math.Max(c1, cells.MaxC); r1 = Math.Max(r1, cells.MaxR);
+            }
+            int node = nextNode++;
+            int left = -1, right = -1;
+            if (count > LeafCapacity)
+            {
+                int half = count / 2;
+                Partition(first, first + count - 1, first + half, x1 - x0 >= y1 - y0);
+                left = Build(first, half, ref nextNode);
+                right = Build(first + half, count - half, ref nextNode);
+            }
+            _nodes[node] = new(new(x0, y0, x1, y1), new(c0, r0, c1, r1), first, count, left, right);
+            return node;
+        }
+
+        private void Partition(int lo, int hi, int middle, bool xAxis)
+        {
+            int remaining = 2 * (int)Math.Log2(hi - lo + 1) + 4;
+            while (lo < hi)
+            {
+                // Bound adversarial quickselect work; the fallback is restricted to
+                // the unresolved partition rather than sorting every tree level.
+                if (remaining-- == 0)
+                {
+                    Array.Sort(_order, lo, hi - lo + 1,
+                        Comparer<int>.Create((a, b) => CompareCentroid(a, b, xAxis)));
+                    if (_diagnostics is not null) Interlocked.Increment(ref _diagnostics.PartitionFallbacks);
+                    return;
+                }
+                int pivot = _order[lo + (hi - lo) / 2];
+                int i = lo, j = hi;
+                while (i <= j)
+                {
+                    while (CompareCentroid(_order[i], pivot, xAxis) < 0) i++;
+                    while (CompareCentroid(_order[j], pivot, xAxis) > 0) j--;
+                    if (i <= j) { (_order[i], _order[j]) = (_order[j], _order[i]); i++; j--; }
+                }
+                if (middle <= j) hi = j;
+                else if (middle >= i) lo = i;
+                else return;
+            }
+        }
+
+        private int CompareCentroid(int first, int second, bool xAxis)
+        {
+            var a = _segments[first]; var b = _segments[second];
+            double ac = xAxis ? a.A.x / 2 + a.B.x / 2 : a.A.y / 2 + a.B.y / 2;
+            double bc = xAxis ? b.A.x / 2 + b.B.x / 2 : b.A.y / 2 + b.B.y / 2;
+            int result = ac.CompareTo(bc);
+            return result != 0 ? result : first.CompareTo(second);
+        }
+
+        private static Box ExpandedBox(double x0, double y0, double x1, double y1)
+        {
+            double reserveX = ArithmeticReserve * Math.Max(1, Math.Max(Math.Abs(x0), Math.Abs(x1)));
+            double reserveY = ArithmeticReserve * Math.Max(1, Math.Max(Math.Abs(y0), Math.Abs(y1)));
+            return new(Math.BitDecrement(x0 - reserveX), Math.BitDecrement(y0 - reserveY),
+                Math.BitIncrement(x1 + reserveX), Math.BitIncrement(y1 + reserveY));
+        }
+
+        private static double BoxDistanceSquared(double x, double y, Box bounds)
+        {
+            double dx = Math.Max(0, Math.Max(bounds.MinX - x, x - bounds.MaxX));
+            double dy = Math.Max(0, Math.Max(bounds.MinY - y, y - bounds.MaxY));
+            // Round the broad-phase bound down; terminal distance arithmetic remains
+            // unchanged, including the old degenerate-segment cutoff.
+            dx = Math.Max(0, Math.BitDecrement(dx)); dy = Math.Max(0, Math.BitDecrement(dy));
+            return Math.Max(0, Math.BitDecrement(dx * dx + dy * dy));
         }
 
         public double QueryDistance(double x, double y)
         {
-            if (_segments.Count == 0) return 0.0;
-
-            int targetC = Math.Clamp((int)((x - _minX) / _cellSizeX), 0, _cols - 1);
-            int targetR = Math.Clamp((int)((y - _minY) / _cellSizeY), 0, _rows - 1);
-
+            if (_segments.Length == 0) return 0.0;
             double bestSq = double.PositiveInfinity;
-
-            // 1. First, check the target cell and its immediate 8 neighbors to get a good initial upper bound.
-            for (int dc = -1; dc <= 1; dc++)
+            long visits = 0, tests = 0;
+            var scratch=Scratch;int winner=-1,seed=-1;
+            if(scratch.NearestOwner is { } prior && prior.TryGetTarget(out var owner)&&ReferenceEquals(owner,this))
             {
-                int c = targetC + dc;
-                if (c < 0 || c >= _cols) continue;
-                for (int dr = -1; dr <= 1; dr++)
-                {
-                    int r = targetR + dr;
-                    if (r < 0 || r >= _rows) continue;
-                    CheckCell(c, r, x, y, ref bestSq);
-                }
+                seed=scratch.NearestOrdinal;
+                double nominee=DistanceToSegmentSq(x,y,_segments[seed]);
+                if(double.IsFinite(nominee)){bestSq=nominee;winner=seed;}
+                if(_diagnostics is not null)Interlocked.Increment(ref _diagnostics.NearestSeedTrials);
             }
-
-            // Expanding ring search
-            int maxR = Math.Max(_cols, _rows);
-            for (int ring = 2; ring <= maxR; ring++)
+            // A balanced median tree over an int-sized array has depth below 32.
+            Span<int> pending = stackalloc int[64];
+            int count = 1; pending[0] = 0;
+            while (count > 0)
             {
-                double minCellSize = Math.Min(_cellSizeX, _cellSizeY);
-                double minDistToRing = (ring - 1) * minCellSize;
-                if (minDistToRing * minDistToRing >= bestSq)
+                Node node = _nodes[pending[--count]];
+                if (_diagnostics is not null) visits++;
+                if (BoxDistanceSquared(x, y, node.Bounds) > bestSq) continue;
+                if (node.Left < 0)
                 {
-                    break;
-                }
-
-                int cMin = targetC - ring;
-                int cMax = targetC + ring;
-                int rMin = targetR - ring;
-                int rMax = targetR + ring;
-
-                // Check cells on the boundary of the ring
-                // Top & Bottom rows
-                for (int c = cMin; c <= cMax; c++)
-                {
-                    if (c >= 0 && c < _cols)
+                    for (int i = node.First; i < node.First + node.Count; i++)
                     {
-                        if (rMin >= 0 && rMin < _rows) CheckCell(c, rMin, x, y, ref bestSq);
-                        if (rMax >= 0 && rMax < _rows) CheckCell(c, rMax, x, y, ref bestSq);
+                        double d2 = DistanceToSegmentSq(x, y, _segments[_order[i]]);
+                        if (_diagnostics is not null) tests++;
+                        if (d2 < bestSq) {bestSq = d2;winner=_order[i];}
                     }
                 }
-                // Left & Right columns
-                for (int r = rMin + 1; r < rMax; r++)
+                else
                 {
-                    if (r >= 0 && r < _rows)
-                    {
-                        if (cMin >= 0 && cMin < _cols) CheckCell(cMin, r, x, y, ref bestSq);
-                        if (cMax >= 0 && cMax < _cols) CheckCell(cMax, r, x, y, ref bestSq);
-                    }
+                    double left = BoxDistanceSquared(x, y, _nodes[node.Left].Bounds);
+                    double right = BoxDistanceSquared(x, y, _nodes[node.Right].Bounds);
+                    if (left <= right) { pending[count++] = node.Right; pending[count++] = node.Left; }
+                    else { pending[count++] = node.Left; pending[count++] = node.Right; }
                 }
             }
-
-            // Fallback
-            if (bestSq == double.PositiveInfinity)
+            if (_diagnostics is not null)
             {
-                for (int i = 0; i < _segments.Count; i++)
-                {
-                    double d2 = DistanceToSegmentSq(x, y, _segments[i]);
-                    if (d2 < bestSq) bestSq = d2;
-                }
+                Interlocked.Increment(ref _diagnostics.NearestQueries);
+                Interlocked.Add(ref _diagnostics.NearestNodes, visits);
+                Interlocked.Add(ref _diagnostics.DistanceTests, tests);
+                if(winner>=0&&winner==seed)Interlocked.Increment(ref _diagnostics.NearestSeedWins);
             }
-
+            if(winner>=0)
+            {
+                // Neighbouring queries often share the closest original wall.
+                // Re-evaluate that literal segment at the NEW query, then run
+                // the unchanged complete conservative tree. Only a candidate
+                // ordinal is reused; never a distance or wall permission.
+                if(scratch.NearestOwner is null)scratch.NearestOwner=new(this);
+                else scratch.NearestOwner.SetTarget(this);
+                scratch.NearestOrdinal=winner;
+            }
             return bestSq < double.PositiveInfinity ? Math.Sqrt(bestSq) : 0.0;
         }
 
-        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-        private void CheckCell(int c, int r, double x, double y, ref double bestSq)
+        // Endpoints must already have analytical Z from this boundary. This permits the
+        // endpoint-distance lower bound used by the Lipschitz shortcut below.
+        internal bool TryFindDepthViolation(Point3D a, Point3D b, double startZ,
+            double bottomRadius, double radiusSlope, double zTolerance, out double parameter,
+            VCarveCutterProfile? cutterProfile = null)
         {
-            var cellSegs = _grid[c, r];
-            if (cellSegs == null) return;
-            int count = cellSegs.Count;
-            for (int i = 0; i < count; i++)
+            if (cutterProfile is not null)
+                return TryFindProfileDepthViolation(a, b, startZ, cutterProfile, zTolerance, out parameter);
+            parameter = 0.5;
+            double depthA = startZ - a.Z, depthB = startZ - b.Z;
+            if (_segments.Length == 0 || Math.Max(depthA, depthB) <= zTolerance) return false;
+            double dx = b.X - a.X, dy = b.Y - a.Y;
+            double depthDelta = depthB - depthA;
+            double length = Math.Sqrt(dx * dx + dy * dy);
+            double endpointRadiusDelta = radiusSlope * depthDelta;
+            // Boundary distance is 1-Lipschitz. Positive-depth endpoints provide lower
+            // bounds even at the maximum-depth clamp; very short chords need no index query.
+            if (Math.Min(depthA, depthB) > zTolerance
+                && length * length - endpointRadiusDelta * endpointRadiusDelta
+                    <= 2 * length * radiusSlope * zTolerance) return false;
+
+            double lo = 0, hi = 1;
+            if (depthA <= zTolerance) lo = (zTolerance - depthA) / depthDelta;
+            if (depthB <= zTolerance) hi = (zTolerance - depthA) / depthDelta;
+            double radius0 = bottomRadius + radiusSlope * (depthA - zTolerance);
+            double radiusDelta = radiusSlope * depthDelta;
+            double radius = Math.Max(radius0 + radiusDelta * lo, radius0 + radiusDelta * hi);
+            double x0 = a.X + lo * dx, x1 = a.X + hi * dx;
+            double y0 = a.Y + lo * dy, y1 = a.Y + hi * dy;
+            var candidates = GatherCandidates(x0, y0, x1, y1, radius);
+
+            double minimum = -1e-12;
+            double witness = 0.5;
+            bool violated = false;
+            Span<double> cuts = stackalloc double[4];
+            foreach (var candidate in candidates)
             {
-                double d2 = DistanceToSegmentSq(x, y, _segments[cellSegs[i]]);
-                if (d2 < bestSq) bestSq = d2;
+                var edge = _segments[candidate.Ordinal];
+                double ex = edge.B.x - edge.A.x, ey = edge.B.y - edge.A.y;
+                double edgeLengthSquared = ex * ex + ey * ey;
+                double ax = a.X - edge.A.x, ay = a.Y - edge.A.y;
+                double projection0 = edgeLengthSquared > 0 ? (ax * ex + ay * ey) / edgeLengthSquared : 0;
+                double projectionDelta = edgeLengthSquared > 0 ? (dx * ex + dy * ey) / edgeLengthSquared : 0;
+                int count = 2;
+                cuts[0] = lo; cuts[1] = hi;
+                if (projectionDelta != 0)
+                {
+                    double first = -projection0 / projectionDelta;
+                    double last = (1 - projection0) / projectionDelta;
+                    if (first > lo && first < hi) cuts[count++] = first;
+                    if (last > lo && last < hi) cuts[count++] = last;
+                }
+                cuts[..count].Sort();
+                for (int i = 1; i < count; i++)
+                {
+                    double low = cuts[i - 1], high = cuts[i];
+                    double projection = projection0 + projectionDelta * (low + high) / 2;
+                    double qx = ax, qy = ay, vx = dx, vy = dy;
+                    if (projection >= 1) { qx -= ex; qy -= ey; }
+                    else if (projection > 0)
+                    {
+                        qx -= projection0 * ex; qy -= projection0 * ey;
+                        vx -= projectionDelta * ex; vy -= projectionDelta * ey;
+                    }
+                    // distance^2 - requiredRadius^2 is quadratic on this projection
+                    // interval. Its minimum is at an endpoint or its stationary point.
+                    double quadratic = vx * vx + vy * vy - radiusDelta * radiusDelta;
+                    double linear = 2 * (qx * vx + qy * vy - radius0 * radiusDelta);
+                    void Check(double t)
+                    {
+                        double x = qx + vx * t, y = qy + vy * t;
+                        double required = radius0 + radiusDelta * t;
+                        double value = x * x + y * y - required * required;
+                        if (value < minimum) { minimum = value; witness = t; violated = true; }
+                    }
+                    Check(low); Check(high);
+                    if (quadratic > 0)
+                    {
+                        double stationary = -linear / (2 * quadratic);
+                        if (stationary > low && stationary < high) Check(stationary);
+                    }
+                }
+            }
+            parameter = witness;
+            return violated;
+        }
+
+        // On each physical section, radius squared is a quadratic of axial depth.
+        // This lets the same all-chord proof cover a hemisphere, its taper and a
+        // cylindrical plateau without sampling past a section transition.
+        private readonly record struct RadiusInterval(double Low, double High,
+            double Depth0, double DepthDelta, double BottomRadius, double Slope, double BallRadius)
+        {
+            public double Quadratic => BallRadius > 0 ? -DepthDelta * DepthDelta
+                : Slope * Slope * DepthDelta * DepthDelta;
+            public double Linear => BallRadius > 0 ? 2 * (BallRadius - Depth0) * DepthDelta
+                : 2 * (BottomRadius + Slope * Depth0) * Slope * DepthDelta;
+            public double RadiusSquared(double t)
+            {
+                double h = Depth0 + DepthDelta * t;
+                if (BallRadius > 0) return h * (2 * BallRadius - h);
+                double radius = BottomRadius + Slope * h;
+                return radius * radius;
             }
         }
+
+        private bool TryFindProfileDepthViolation(Point3D a, Point3D b, double startZ,
+            VCarveCutterProfile profile, double zTolerance, out double parameter)
+        {
+            parameter = 0.5;
+            double depthA = startZ - a.Z, depthB = startZ - b.Z;
+            double minDepth = Math.Min(depthA, depthB), maxDepth = Math.Max(depthA, depthB);
+            if (_segments.Length == 0 || maxDepth <= zTolerance) return false;
+
+            // Retain the proven short-chord shortcut and exact cone arithmetic when
+            // the entire depth interval (including its tolerance reserve) is linear.
+            double sectionStart = 0;
+            foreach (var section in profile.Sections)
+            {
+                double sectionEnd = Math.Min(profile.MaximumDepth, sectionStart + section.Height);
+                if (section.Kind == CarvingCutterSectionKind.Linear
+                    && minDepth - zTolerance >= sectionStart && maxDepth <= sectionEnd)
+                {
+                    double slope = (section.TopRadius - section.BottomRadius) / section.Height;
+                    return TryFindDepthViolation(a, b, startZ,
+                        section.BottomRadius - slope * sectionStart, slope, zTolerance, out parameter);
+                }
+                sectionStart = sectionEnd;
+                if (sectionStart >= profile.MaximumDepth) break;
+            }
+
+            double depthDelta = depthB - depthA;
+            double lo = 0, hi = 1;
+            if (depthA <= zTolerance) lo = (zTolerance - depthA) / depthDelta;
+            if (depthB <= zTolerance) hi = (zTolerance - depthA) / depthDelta;
+            var intervals = Scratch.Intervals;
+            intervals.Clear();
+            sectionStart = 0;
+            foreach (var section in profile.Sections)
+            {
+                double sectionEnd = Math.Min(profile.MaximumDepth, sectionStart + section.Height);
+                double low = lo, high = hi;
+                if (depthDelta == 0)
+                {
+                    if (depthA - zTolerance < sectionStart || depthA - zTolerance > sectionEnd)
+                    {
+                        sectionStart = sectionEnd;
+                        if (sectionStart >= profile.MaximumDepth) break;
+                        continue;
+                    }
+                }
+                else
+                {
+                    double t0 = (sectionStart + zTolerance - depthA) / depthDelta;
+                    double t1 = (sectionEnd + zTolerance - depthA) / depthDelta;
+                    low = Math.Max(low, Math.Min(t0, t1));
+                    high = Math.Min(high, Math.Max(t0, t1));
+                }
+                if (high >= low)
+                    intervals.Add(new RadiusInterval(low, high, depthA - zTolerance - sectionStart,
+                        depthDelta, section.BottomRadius,
+                        (section.TopRadius - section.BottomRadius) / section.Height,
+                        section.Kind == CarvingCutterSectionKind.Hemisphere ? section.TopRadius : 0));
+                sectionStart = sectionEnd;
+                if (sectionStart >= profile.MaximumDepth) break;
+            }
+
+            double dx = b.X - a.X, dy = b.Y - a.Y;
+            double radius = profile.RadiusAtDepth(maxDepth - zTolerance);
+            double x0 = a.X + lo * dx, x1 = a.X + hi * dx;
+            double y0 = a.Y + lo * dy, y1 = a.Y + hi * dy;
+            var candidates = GatherCandidates(x0, y0, x1, y1, radius);
+
+            double minimum = -1e-12, witness = 0.5;
+            bool violated = false;
+            Span<double> cuts = stackalloc double[4];
+            foreach (var candidate in candidates)
+            {
+                var edge = _segments[candidate.Ordinal];
+                double ex = edge.B.x - edge.A.x, ey = edge.B.y - edge.A.y;
+                double edgeLengthSquared = ex * ex + ey * ey;
+                double ax = a.X - edge.A.x, ay = a.Y - edge.A.y;
+                double projection0 = edgeLengthSquared > 0 ? (ax * ex + ay * ey) / edgeLengthSquared : 0;
+                double projectionDelta = edgeLengthSquared > 0 ? (dx * ex + dy * ey) / edgeLengthSquared : 0;
+                foreach (var interval in intervals)
+                {
+                    int count = 2;
+                    cuts[0] = interval.Low; cuts[1] = interval.High;
+                    if (projectionDelta != 0)
+                    {
+                        double first = -projection0 / projectionDelta;
+                        double last = (1 - projection0) / projectionDelta;
+                        if (first > interval.Low && first < interval.High) cuts[count++] = first;
+                        if (last > interval.Low && last < interval.High) cuts[count++] = last;
+                    }
+                    cuts[..count].Sort();
+                    for (int i = 1; i < count; i++)
+                    {
+                        double low = cuts[i - 1], high = cuts[i];
+                        double projection = projection0 + projectionDelta * (low + high) / 2;
+                        double qx = ax, qy = ay, vx = dx, vy = dy;
+                        if (projection >= 1) { qx -= ex; qy -= ey; }
+                        else if (projection > 0)
+                        {
+                            qx -= projection0 * ex; qy -= projection0 * ey;
+                            vx -= projectionDelta * ex; vy -= projectionDelta * ey;
+                        }
+                        double quadratic = vx * vx + vy * vy - interval.Quadratic;
+                        double linear = 2 * (qx * vx + qy * vy) - interval.Linear;
+                        void Check(double t)
+                        {
+                            double x = qx + vx * t, y = qy + vy * t;
+                            double value = x * x + y * y - interval.RadiusSquared(t);
+                            if (value < minimum) { minimum = value; witness = t; violated = true; }
+                        }
+                        Check(low); Check(high);
+                        if (quadratic > 0)
+                        {
+                            double stationary = -linear / (2 * quadratic);
+                            if (stationary > low && stationary < high) Check(stationary);
+                        }
+                    }
+                }
+            }
+            parameter = witness;
+            return violated;
+        }
+
+        private List<OrderedCandidate> GatherCandidates(double x0, double y0, double x1, double y1, double radius)
+        {
+            var candidates = Scratch.Candidates;
+            candidates.Clear();
+            if (_nodes.Length == 0) return candidates;
+            int initialCapacity = candidates.Capacity;
+            int c0 = Math.Clamp((int)Math.Floor((Math.Min(x0, x1) - radius - _minX) / _cellSizeX), 0, _cols - 1);
+            int c1 = Math.Clamp((int)Math.Floor((Math.Max(x0, x1) + radius - _minX) / _cellSizeX), 0, _cols - 1);
+            int r0 = Math.Clamp((int)Math.Floor((Math.Min(y0, y1) - radius - _minY) / _cellSizeY), 0, _rows - 1);
+            int r1 = Math.Clamp((int)Math.Floor((Math.Max(y0, y1) + radius - _minY) / _cellSizeY), 0, _rows - 1);
+            var cells = new CellRange(c0, r0, c1, r1);
+            Box reach = ExpandedBox(Math.Min(x0, x1) - radius, Math.Min(y0, y1) - radius,
+                Math.Max(x0, x1) + radius, Math.Max(y0, y1) + radius);
+            long visits = 0, tests = 0;
+            Span<int> pending = stackalloc int[64];
+            int count = 1; pending[0] = 0;
+            while (count > 0)
+            {
+                Node node = _nodes[pending[--count]];
+                if (_diagnostics is not null) visits++;
+                if (!node.Bounds.Intersects(reach) || !node.Cells.Intersects(cells)) continue;
+                if (node.Left < 0)
+                {
+                    for (int i = node.First; i < node.First + node.Count; i++)
+                    {
+                        int ordinal = _order[i]; CellRange segmentCells = _cells[ordinal];
+                        if (_diagnostics is not null) tests++;
+                        if (!_bounds[ordinal].Intersects(reach) || !segmentCells.Intersects(cells)) continue;
+                        // Grid loops visit columns, then rows, then original segment
+                        // ordinals. A segment first appears at the earliest overlap
+                        // of its cell rectangle with the query rectangle.
+                        int firstCell = Math.Max(c0, segmentCells.MinC) * _rows + Math.Max(r0, segmentCells.MinR);
+                        candidates.Add(new(ordinal, firstCell));
+                    }
+                }
+                else { pending[count++] = node.Right; pending[count++] = node.Left; }
+            }
+            candidates.Sort();
+            if (_diagnostics is not null)
+            {
+                Interlocked.Increment(ref _diagnostics.CandidateQueries);
+                Interlocked.Add(ref _diagnostics.CandidateNodes, visits);
+                Interlocked.Add(ref _diagnostics.CandidateLeafTests, tests);
+                Interlocked.Add(ref _diagnostics.Candidates, candidates.Count);
+                if (candidates.Capacity != initialCapacity) Interlocked.Increment(ref _diagnostics.ScratchGrowths);
+            }
+            return candidates;
+        }
+
+        // Snapshot used by exact reference-oracle diagnostics; production queries
+        // consume worker-local scratch directly and do not allocate this array.
+        internal int[] CandidateOrdinals(double x0, double y0, double x1, double y1, double radius)
+            => GatherCandidates(x0, y0, x1, y1, radius).Select(candidate => candidate.Ordinal).ToArray();
 
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
         private static double DistanceToSegmentSq(double x, double y, (PointD A, PointD B) seg)
@@ -2054,7 +3489,7 @@ public static class MedialAxisToolpaths
     /// Removes points whose perpendicular distance from the chord is less than
     /// <paramref name="tolerance"/> (workspace units).
     /// </summary>
-    internal static List<Point3D> RdpSimplify3D(List<Point3D> path, double tolerance)
+    internal static List<Point3D> RdpSimplify3D(List<Point3D> path, double tolerance, bool preserveSharpCorners=true)
     {
         if (path.Count <= 2 || tolerance <= 0) return path;
 
@@ -2067,7 +3502,7 @@ public static class MedialAxisToolpaths
         keep[path.Count - 1] = true;
         for (int i = 1; i < path.Count - 1; i++)
         {
-            if (IsSharpCornerXY(path[i - 1], path[i], path[i + 1], minTurnRad))
+            if (preserveSharpCorners && IsSharpCornerXY(path[i - 1], path[i], path[i + 1], minTurnRad))
                 keep[i] = true;
         }
 
@@ -2080,7 +3515,7 @@ public static class MedialAxisToolpaths
             while (end < path.Count && !keep[end]) end++;
             if (end >= path.Count) end = path.Count - 1;
 
-            RdpMark(path, start, end, tolSq, keep);
+            RdpMark(path, start, end, tolSq, keep, boundedSegments:!preserveSharpCorners);
             start = end;
         }
 
@@ -2091,7 +3526,7 @@ public static class MedialAxisToolpaths
     }
 
     private static void RdpMark(
-        List<Point3D> path, int start, int end, double tolSq, bool[] keep)
+        List<Point3D> path, int start, int end, double tolSq, bool[] keep, bool boundedSegments=false)
     {
         if (end - start <= 1) return;
 
@@ -2113,6 +3548,12 @@ public static class MedialAxisToolpaths
             {
                 dist2 = apx * apx + apy * apy + apz * apz;
             }
+            else if(boundedSegments)
+            {
+                double t=Math.Clamp((apx*abx+apy*aby+apz*abz)/ab2,0,1);
+                double x=apx-t*abx,y=apy-t*aby,z=apz-t*abz;
+                dist2=x*x+y*y+z*z;
+            }
             else
             {
                 // Cross product AP x AB, divided by |AB|^2
@@ -2128,8 +3569,8 @@ public static class MedialAxisToolpaths
         if (maxDist2 > tolSq)
         {
             keep[split] = true;
-            RdpMark(path, start, split, tolSq, keep);
-            RdpMark(path, split, end,   tolSq, keep);
+            RdpMark(path, start, split, tolSq, keep,boundedSegments);
+            RdpMark(path, split, end,   tolSq, keep,boundedSegments);
         }
     }
 
@@ -2186,6 +3627,15 @@ public static class MedialAxisToolpaths
 
         double cross2 = cx * cx + cy * cy + cz * cz;
         double ac2    = acx * acx + acy * acy + acz * acz;
+
+        // Native terminal trails revisit branch junctions. Removing a reversal
+        // would delete its entire cutting excursion, even when the points lie
+        // on one line. B must project onto the segment from A through C.
+        if (ac2 == 0)
+            return abx == 0 && aby == 0 && abz == 0;
+        double projection = abx * acx + aby * acy + abz * acz;
+        if (projection < 0 || projection > ac2)
+            return false;
 
         const double eps = 1e-9;
         return cross2 <= eps * eps * ac2;

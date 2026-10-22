@@ -113,11 +113,11 @@ public class MedialAxisCallContractTests
             return new[]
             {
                 new MedialSegment(
-                    new MedialPoint(0.00 * scale, 0.000 * scale, radius),
-                    new MedialPoint(0.10 * scale, 0.001 * scale, radius)),
+                    new MedialPoint(-0.50 * scale, -0.500 * scale, radius),
+                    new MedialPoint(-0.40 * scale, -0.499 * scale, radius)),
                 new MedialSegment(
-                    new MedialPoint(0.10 * scale, 0.001 * scale, radius),
-                    new MedialPoint(0.20 * scale, 0.000 * scale, radius)),
+                    new MedialPoint(-0.40 * scale, -0.499 * scale, radius),
+                    new MedialPoint(-0.30 * scale, -0.500 * scale, radius)),
             };
         }
     }

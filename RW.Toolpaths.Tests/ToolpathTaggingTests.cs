@@ -257,4 +257,135 @@ public class ToolpathTaggingTests
             Assert.InRange(point.Z, 6 - 1e-6, 10 + 1e-6);
         });
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void VCarveSweptAreaOptOutPreservesCuttingGeometryAndVisits(bool includeInteriorFill)
+    {
+        var regions = CurveDetectionRegions();
+        var tool = new ToolGeometry(0.3)
+        {
+            TipAngleRadians = Math.PI / 2, BottomRadius = 0,
+            TopRadius = 1, ConeLength = 1
+        };
+        var depth = new DepthSchedule(0.25, 0.1) { SurfaceZ = 2 };
+        var options = new VCarveOptions
+        {
+            IncludeInteriorFill = includeInteriorFill, DetectCurves = false
+        };
+        Assert.True(options.CalculateSweptArea);
+        var accounted = VCarveToolpaths.Generate(regions, tool, depth, options,
+            BoostVoronoiProvider.CreateDefault());
+        var physicalOnly = VCarveToolpaths.Generate(regions, tool, depth,
+            options with { CalculateSweptArea = false }, BoostVoronoiProvider.CreateDefault());
+
+        Assert.NotEmpty(accounted.SweptArea);
+        Assert.Empty(physicalOnly.SweptArea);
+        Assert.Equal(accounted.Diagnostics, physicalOnly.Diagnostics);
+        Assert.Equal(accounted.Toolpaths.Count, physicalOnly.Toolpaths.Count);
+        for (int index = 0; index < accounted.Toolpaths.Count; index++)
+        {
+            var expected = accounted.Toolpaths[index];
+            var actual = physicalOnly.Toolpaths[index];
+            Assert.Equal(expected.Points, actual.Points);
+            Assert.Equal(expected.Spans, actual.Spans);
+            Assert.Equal(expected.RegionIndex, actual.RegionIndex);
+            Assert.Equal(expected.DepthPassIndex, actual.DepthPassIndex);
+            Assert.Equal(expected.VisitIdentity, actual.VisitIdentity);
+            Assert.Equal(expected.Category, actual.Category);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void VCarveCurveDetectionOptOutPreservesGeometryAndRouting(bool includeInteriorFill)
+    {
+        var regions = CurveDetectionRegions();
+        var tool = new ToolGeometry(0.3)
+        {
+            TipAngleRadians = Math.PI / 2,
+            BottomRadius = 0,
+            TopRadius = 1,
+            ConeLength = 1
+        };
+        var depth = new DepthSchedule(0.25, 0.1) { SurfaceZ = 2 };
+        var options = new VCarveOptions { IncludeInteriorFill = includeInteriorFill };
+        Assert.True(options.DetectCurves);
+
+        var fitted = VCarveToolpaths.Generate(regions, tool, depth, options,
+            BoostVoronoiProvider.CreateDefault());
+        var linear = VCarveToolpaths.Generate(regions, tool, depth,
+            options with { DetectCurves = false }, BoostVoronoiProvider.CreateDefault());
+
+        Assert.NotEmpty(fitted.Toolpaths);
+        Assert.Contains(fitted.Toolpaths, path => path.Category == "clearing");
+        Assert.Contains(fitted.Toolpaths, path => path.Category == "final-carve");
+        Assert.Equal(3, fitted.Diagnostics.DepthPassCount);
+        Assert.Equal(2, fitted.Diagnostics.IslandCount);
+        Assert.Equal(fitted.Diagnostics, linear.Diagnostics);
+        Assert.Equal(fitted.Toolpaths.Count, linear.Toolpaths.Count);
+        for (int index = 0; index < fitted.Toolpaths.Count; index++)
+        {
+            var expected = fitted.Toolpaths[index];
+            var actual = linear.Toolpaths[index];
+            Assert.Equal(expected.Points, actual.Points);
+            Assert.Equal(expected.Spans, actual.Spans);
+            Assert.Equal(expected.RegionIndex, actual.RegionIndex);
+            Assert.Equal(expected.Category, actual.Category);
+            Assert.Equal(expected.DepthPassIndex, actual.DepthPassIndex);
+            Assert.Equal(expected.VisitIdentity, actual.VisitIdentity);
+            Assert.True(expected.DetectCurves);
+            Assert.False(actual.DetectCurves);
+            Assert.Equal(actual.Points.Count - 1, actual.Moves.Count);
+            for (int moveIndex = 0; moveIndex < actual.Moves.Count; moveIndex++)
+            {
+                Assert.Equal(ToolMoveKind.Line, actual.Moves[moveIndex].Kind);
+                Assert.Equal(actual.Points[moveIndex], actual.Moves[moveIndex].Start);
+                Assert.Equal(actual.Points[moveIndex + 1], actual.Moves[moveIndex].End);
+            }
+        }
+        Assert.Equal(fitted.SweptArea.Count, linear.SweptArea.Count);
+        for (int index = 0; index < fitted.SweptArea.Count; index++)
+            Assert.Equal(fitted.SweptArea[index], linear.SweptArea[index]);
+    }
+
+    [Fact]
+    public void VCarveTaggedCurveDetectionOptOutReachesClearingAndFinalPasses()
+    {
+        var boundary = new List<IReadOnlyList<PointD>> { CurveDetectionRegions()[0].Outer };
+        var paths = MedialAxisToolpaths.GenerateVCarveTagged(
+            BoostVoronoiProvider.CreateDefault(), boundary,
+            startDepth: 0, endDepth: 0.25, radianTipAngle: Math.PI / 2, depthPerPass: 0.1,
+            includeInteriorFill: false, detectCurves: false);
+
+        Assert.Contains(paths, path => path.Category == "clearing");
+        Assert.Contains(paths, path => path.Category == "final-carve");
+        Assert.All(paths, path =>
+        {
+            Assert.False(path.DetectCurves);
+            Assert.Equal(path.Points.Count - 1, path.Moves.Count);
+            Assert.All(path.Moves, move => Assert.Equal(ToolMoveKind.Line, move.Kind));
+        });
+    }
+
+    private static List<MillingRegion> CurveDetectionRegions()
+    {
+        var circle = Enumerable.Range(0, 128)
+            .Select(index =>
+            {
+                double angle = index * 2 * Math.PI / 128;
+                return new PointD(3 + 0.6 * Math.Cos(angle), 1 + 0.6 * Math.Sin(angle));
+            })
+            .ToList();
+        return new List<MillingRegion>
+        {
+            new(new List<PointD>
+            {
+                new(0, 0), new(2, 0), new(2, 0.9), new(0.9, 0.9), new(0.9, 2), new(0, 2)
+            }),
+            new(circle)
+        };
+    }
 }

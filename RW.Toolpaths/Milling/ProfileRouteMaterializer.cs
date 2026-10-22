@@ -18,6 +18,7 @@ internal static class ProfileRouteMaterializer
 
     private sealed class DepthFirstState
     {
+        internal ILinkClearance TravelClearance { get; init; } = LinkClearance.Unrestricted;
         internal HashSet<int> CompletedRings { get; } = new();
         internal int SpiralCount { get; set; }
         internal int PassesCombined { get; set; }
@@ -27,6 +28,7 @@ internal static class ProfileRouteMaterializer
         internal int LinksRejectedAboveDepth { get; set; }
         internal int LinksRejectedByDistance { get; set; }
         internal int LinksRejectedByProtection { get; set; }
+        internal int LinksRejectedByClearance { get; set; }
         internal double MinimumLinkDistance { get; set; } = double.MaxValue;
         internal double MaximumLinkDistance { get; set; }
     }
@@ -49,7 +51,10 @@ internal static class ProfileRouteMaterializer
         int emittedPointCount = 0;
         int linkLifts = 0;
         int plunges = 0, linearRamps = 0, helicals = 0;
-        var depthFirst = new DepthFirstState();
+        var depthFirst = new DepthFirstState
+        {
+            TravelClearance = options.LinkClearance ?? BuildLinkClearance(rings, options.Side),
+        };
 
         foreach (var tree in route.Trees)
         {
@@ -112,9 +117,9 @@ internal static class ProfileRouteMaterializer
         }
 
         long sweptAreaStart = PerfLog.Start();
-        var sweptCenterlines = rings
-            .Select(ring => (IReadOnlyList<PointD>)ring.Points)
-            .ToList();
+        var sweptCenterlines = options.CalculateSweptArea
+            ? rings.Select(ring => (IReadOnlyList<PointD>)ring.Points).ToList()
+            : new List<IReadOnlyList<PointD>>();
         var linkKeys = new HashSet<(long StartX, long StartY, long EndX, long EndY)>();
         int depthLinkCount = 0;
         foreach (var toolpath in toolpaths)
@@ -128,6 +133,7 @@ internal static class ProfileRouteMaterializer
                     Point3D start = toolpath.Points[pointIndex - 1];
                     Point3D end = toolpath.Points[pointIndex];
                     linkLength += PlanarDistance(start, end);
+                    if (!options.CalculateSweptArea) continue;
 
                     long startX = (long)Math.Round(start.X * PathUtils.Scale);
                     long startY = (long)Math.Round(start.Y * PathUtils.Scale);
@@ -150,7 +156,7 @@ internal static class ProfileRouteMaterializer
         }
 
         int sweptCenterlinePoints = sweptCenterlines.Sum(centerline => centerline.Count);
-        var sweptArea = toolpaths.Count > 0
+        var sweptArea = options.CalculateSweptArea && toolpaths.Count > 0
             ? PolygonOps.BufferCenterlines(
                 sweptCenterlines,
                 tool.Radius,
@@ -158,7 +164,7 @@ internal static class ProfileRouteMaterializer
             : new List<List<PointD>>();
         PerfLog.Stop("ProfileRouteMaterializer.SweptArea", sweptAreaStart,
             $"rings={rings.Count} depthLinks={depthLinkCount} emittedPoints={emittedPointCount} " +
-            $"bufferedPoints={sweptCenterlinePoints} polygons={sweptArea.Count}");
+            $"calculateSweptArea={options.CalculateSweptArea} bufferedPoints={sweptCenterlinePoints} polygons={sweptArea.Count}");
         var diagnostics = new ToolpathDiagnostics
         {
             RingCount = rings.Count,
@@ -187,9 +193,30 @@ internal static class ProfileRouteMaterializer
             $"linkRejectedDepth={depthFirst.LinksRejectedAboveDepth} " +
             $"linkRejectedDistance={depthFirst.LinksRejectedByDistance} " +
             $"linkRejectedProtection={depthFirst.LinksRejectedByProtection} " +
+            $"linkRejectedClearance={depthFirst.LinksRejectedByClearance} " +
             $"linkDistanceRange={FormatDistanceRange(depthFirst)} " +
             $"cut={cutLength:F3} linkXY={linkLength:F3}");
         return new ToolpathPlan(toolpaths, sweptArea, diagnostics);
+    }
+
+    private static ILinkClearance BuildLinkClearance(
+        IReadOnlyList<OffsetRing> rings, ProfileSide side)
+    {
+        if (side != ProfileSide.Inside)
+            return LinkClearance.Unrestricted;
+
+        // Inside contours bound the compensated cutter-center region. Nearby contour
+        // fragments can straddle a neck that collapsed during compensation; distance
+        // alone cannot prove that crossing the material between them is safe.
+        var travelRegion = rings.Select(ring =>
+        {
+            var boundary = new List<PointD>(ring.Points);
+            // Clipping treats each ring as filled geometry, so recover its polarity.
+            if ((PolygonOps.SignedArea(boundary) < 0) != ring.IsHole)
+                boundary.Reverse();
+            return (IReadOnlyList<PointD>)boundary;
+        }).ToList();
+        return LinkClearance.WithinRegion(travelRegion);
     }
 
     private static List<PreparedPath> BuildNodePaths(
@@ -258,6 +285,24 @@ internal static class ProfileRouteMaterializer
 
         if (activeBranches.Count == 0)
             return new List<PreparedPath> { prepared };
+
+        if (ReferenceEquals(depthFirst.TravelClearance, LinkClearance.AlwaysLift))
+        {
+            // A rejected stay-down policy gives no reason to interrupt the carrier
+            // at a portal. Finish it once, then service whole child contours with
+            // normal lifted transfers instead of returning to carrier fragments.
+            var separated = new List<PreparedPath> { prepared };
+            foreach (var branch in activeBranches)
+            {
+                Point3D previous = separated[^1].Points[^1];
+                var childEntry = ClosestPointOnRing(rings[branch.Child.RingIndex].Points,
+                    new PointD(previous.X, previous.Y));
+                separated.AddRange(BuildNodePaths(branch.Child, childEntry, rings,
+                    depth, pass, options, tool, cancellationToken, applyTabs, depthFirst,
+                    enterAtDepth: false, allowDepthFirst: allowDepthFirst));
+            }
+            return separated;
+        }
 
         int splitStart = spans
             .Where(span => span.Kind == ToolpathSpanKind.Cut)
@@ -453,6 +498,22 @@ internal static class ProfileRouteMaterializer
                 > maximumLinkDistance)
         {
             depthFirst.LinksRejectedByProtection++;
+            return false;
+        }
+
+        if (!depthFirst.TravelClearance.IsTravelSafe(pause, actualStart, tool.Radius)
+            || !depthFirst.TravelClearance.IsTravelSafe(actualEnd, pause, tool.Radius))
+        {
+            depthFirst.LinksRejectedByClearance++;
+            if (depthFirst.LinksRejectedByClearance <= 8)
+            {
+                Console.WriteLine($"[ProfileRouteMaterializer.LinkClearanceRejected] "
+                    + $"side={options.Side} fromRing={branch.Portal.FromRingIndex} "
+                    + $"toRing={branch.Child.RingIndex} pass={pass} "
+                    + $"from=({pause.X:R},{pause.Y:R},{pause.Z:R}) "
+                    + $"entry=({actualStart.X:R},{actualStart.Y:R},{actualStart.Z:R}) "
+                    + $"return=({actualEnd.X:R},{actualEnd.Y:R},{actualEnd.Z:R})");
+            }
             return false;
         }
 
@@ -790,7 +851,7 @@ internal static class ProfileRouteMaterializer
         double total = 0;
         foreach (var span in spans)
         {
-            if (span.Kind is not (ToolpathSpanKind.Cut or ToolpathSpanKind.Link))
+            if (span.Kind != ToolpathSpanKind.Cut)
                 continue;
             for (int index = span.StartIndex + 1;
                  index <= span.EndIndex && index < points.Count;

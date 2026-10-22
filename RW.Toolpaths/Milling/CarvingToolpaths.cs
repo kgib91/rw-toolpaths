@@ -235,6 +235,16 @@ public static class CarvingRoughingToolpaths
                     // Independent rings retain unambiguous clearance across evolving slice islands.
                     SpiralChaining = false,
                     DetectCurves = false,
+                    // Carving slices keep the established complete angular medial emitter.
+                    BoundOriginalSourceMedial = false,
+                    // Slice fills keep the established mutual raw/compact proof.
+                    AdaptiveCompactionProposals = false,
+                    TrialFilledSweepProposals = false,
+                    ParentLocalRescueProposals = false,
+                    ExactFirstCoverageProposals = false,
+                    DenseFirstArcConstruction = false,
+                    TwoOriginConstruction = false,
+                    SeparateOriginalFirstConstruction = false,
                     CalculateSweptArea = options.CalculateSweptArea,
                 }, cancellationToken, (fraction, stage) => ReportPass(pass, 0.4 + 0.59 * fraction, stage));
             if (Interlocked.Add(ref totalPoints, plan.Toolpaths.Sum(p => (long)p.Points.Count)) > 2_000_000)
@@ -266,6 +276,7 @@ public static class CarvingRoughingToolpaths
                 paths.Add(path with { Category = "carving-rough", DepthPassIndex = pass, VisitIdentity = paths.Count });
             swept.AddRange(passPlans[pass].SweptArea);
         }
+        paths = ToolpathContinuationPlanner.Reconnect(paths,"carving-rough",2*tool.Radius,cancellationToken);
         return new ToolpathPlan(paths, swept, new ToolpathDiagnostics { PathCount = paths.Count, DepthPassCount = count });
     }
 
@@ -648,6 +659,7 @@ public static class CarvingFinishingToolpaths
         Console.WriteLine($"[Carving.SourceProof] method=correlated-section-support exactPointQueries={exactPointQueries} physicalChordQueries={physicalChordQueries} " +
             $"guideRejects={guideRejects} physicalRejects={physicalRejects} failedProofs={failedProofs} rejectedValleys={rejectedValleys}");
         field?.ReportFallbacks();
+        paths = ToolpathContinuationPlanner.Reconnect(paths,"carving-finish",2*tool.Radius,cancellationToken);
         return new ToolpathPlan(paths, new List<List<PointD>>(), new ToolpathDiagnostics { PathCount = paths.Count, DepthPassCount = 1 });
     }
     internal static Point3D[] ClampRasterToSurface(IReadOnlyList<Point3D> points, double top,

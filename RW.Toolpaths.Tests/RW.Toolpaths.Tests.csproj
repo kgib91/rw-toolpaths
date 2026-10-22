@@ -19,6 +19,25 @@
 
   <ItemGroup>
     <Using Include="Xunit" />
+    <EmbeddedResource Include="Fixtures/ramp60-medial.json.gz" />
+    <EmbeddedResource Include="Fixtures/outside-edge-clipped-ramp.json" />
+    <EmbeddedResource Include="Fixtures/concentric-command-boundary.json" />
+    <EmbeddedResource Include="Fixtures/concentric-transition-corridor.json" />
+    <EmbeddedResource Include="Fixtures/concentric-source90-91-seams.json" />
+    <EmbeddedResource Include="Fixtures/concentric-interior-lattice-pairs.json" />
+    <EmbeddedResource Include="Fixtures/concentric-failed-adjacent-pairs.json" />
+    <EmbeddedResource Include="Fixtures/smooth-original-material-domains.json.gz" />
+    <EmbeddedResource Include="Fixtures/concentric-source190-rim-point.json.gz" />
+    <EmbeddedResource Include="Fixtures/concentric-source336-profile-transition.json.gz" />
+    <EmbeddedResource Include="Fixtures/concentric-source347-entry-loop.json" />
+    <EmbeddedResource Include="Fixtures/concentric-source350-entry-loop.json" />
+    <EmbeddedResource Include="Fixtures/concentric-source352-entry-loop.json" />
+    <EmbeddedResource Include="Fixtures/concentric-source355-entry-loop.json" />
+    <EmbeddedResource Include="Fixtures/concentric-source363-entry-loop.json" />
+    <EmbeddedResource Include="Fixtures/concentric-source331-entry-caps.json" />
+    <EmbeddedResource Include="Fixtures/concentric-source333-entry-loop.json" />
+    <EmbeddedResource Include="Fixtures/concentric-source288-short-preparation.json.gz" />
+    <EmbeddedResource Include="Fixtures/concentric-source239-valley-stock.json.gz" />
   </ItemGroup>
 
   <ItemGroup>
