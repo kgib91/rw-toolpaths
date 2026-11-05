@@ -21,6 +21,21 @@ public sealed class VCarveCutterProfile
     internal double NoseLimitedPitch(double engagedDiameter,double stepOver)
         =>stepOver*Math.Min(ClearingDiameter,engagedDiameter);
 
+    /// <summary>Centreline inset from the retained crest to the ramp's full-depth
+    /// floor, including support from the complete physical cutter. Depth is
+    /// stock-relative and limited by this profile's supported cutting depth.</summary>
+    public double RampFillWidth(double depth, double rampAngleDegrees)
+    {
+        if (!double.IsFinite(depth) || depth < 0)
+            throw new ArgumentOutOfRangeException(nameof(depth));
+        if (!double.IsFinite(rampAngleDegrees) || rampAngleDegrees <= 0 || rampAngleDegrees >= 90)
+            throw new ArgumentOutOfRangeException(nameof(rampAngleDegrees));
+        if (depth == 0) return 0;
+        double effectiveDepth = Math.Min(depth, MaximumDepth);
+        double grade = Math.Tan(rampAngleDegrees * Math.PI / 180);
+        return effectiveDepth / grade + Math.Max(TipRadius, _physical.SupportUpTo(grade, effectiveDepth) / grade);
+    }
+
     public VCarveCutterProfile(IEnumerable<CarvingCutterSection> sections, double maximumDepth)
     {
         ArgumentNullException.ThrowIfNull(sections);
@@ -32,7 +47,9 @@ public sealed class VCarveCutterProfile
         double height = 0, previousRadius = snapshot[0].BottomRadius;
         foreach (var section in snapshot)
         {
-            if (height >= maximumDepth) break;
+            // The section beginning exactly at the contact plane participates
+            // in MaxRadiusBelow too. An upward shoulder there cannot be ignored.
+            if (height > maximumDepth) break;
             if (section.BottomRadius != previousRadius || section.TopRadius < section.BottomRadius)
                 throw new ArgumentException("V-carving requires continuous, radially nondecreasing cutting sections.", nameof(sections));
             if (section.Kind == CarvingCutterSectionKind.Linear && section.BottomRadius == section.TopRadius

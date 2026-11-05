@@ -10,7 +10,6 @@ namespace RW.Toolpaths.Milling.Acceleration;
 internal sealed class RawInitialClearingInsetNomination
 {
     internal const string EnvironmentName="RW_TOOLPATHS_VCARVE_RAW_INITIAL_INSET_NOMINATION";
-    internal const string SupplementalBandEnvironmentName="RW_TOOLPATHS_VCARVE_SUPPLEMENTAL_INITIAL_BAND";
     internal const string Policy="full-original-source-initial-clearing-RAW-compensated-C-round-1tick-NOM-v1";
     private readonly bool _conditionInitialFront;
     private readonly bool _supplementalInitialBand;
@@ -21,7 +20,12 @@ internal sealed class RawInitialClearingInsetNomination
     internal bool CollectorNominationCaptured=>_collectorNomination;
     internal RawInitialClearingInsetNomination OriginalCollectorFallback()=>new(_conditionInitialFront,_supplementalInitialBand,false);
     internal static RawInitialClearingInsetNomination? CaptureForSmoothGeneration(bool smooth,double validatedRampAngleDegrees,bool requested,bool conditionInitialFront=false)
-        =>requested&&smooth&&double.IsFinite(validatedRampAngleDegrees)&&validatedRampAngleDegrees>0&&validatedRampAngleDegrees<90?new(conditionInitialFront,Environment.GetEnvironmentVariable(SupplementalBandEnvironmentName)=="1",Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_INITIAL_STOCK_COHORT")=="1"):null;
+    {
+        if (!requested || !smooth || !double.IsFinite(validatedRampAngleDegrees)
+            || validatedRampAngleDegrees <= 0 || validatedRampAngleDegrees >= 90) return null;
+        var policy = VCarveGenerationPolicy.Capture();
+        return new(conditionInitialFront, policy.SupplementalInitialBand, policy.InitialStockCohort);
+    }
 
     internal static RawInitialClearingInsetNomination? CaptureForStrategy(bool smooth,double validatedRampAngleDegrees,VCarveInitialStrategy strategy)
         =>strategy.RawInitialInset&&smooth&&double.IsFinite(validatedRampAngleDegrees)&&validatedRampAngleDegrees>0&&validatedRampAngleDegrees<90

@@ -37,7 +37,8 @@ public sealed class PocketIndexedCoverageTests
                 var local = new PocketContinuationRouter.TemporalClearance(LinkClearance.Unrestricted,
                     indexed, floor, following, .5, CancellationToken.None, diagnostics);
                 var control = new PocketContinuationRouter.TemporalClearance(LinkClearance.Unrestricted,
-                    legacy, floor, following, .5, CancellationToken.None, useIndexedCoverage: false);
+                    legacy, floor, following, .5, CancellationToken.None, useIndexedCoverage: false,
+                    referenceDilation:true);
                 var queries = new List<(Point3D A, Point3D B)>
                 {
                     (new(5, 0, floor), new(15, 0, floor)),

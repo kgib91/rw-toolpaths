@@ -7,6 +7,32 @@ public sealed class ToolpathContinuationPlannerTests
 {
     private static TaggedToolpath Cut(params Point3D[] p) => new(p,[],0,"clearing",0,detectCurves:false);
 
+    [Theory]
+    [InlineData(.01, 0)]
+    [InlineData(.01, .495)]
+    [InlineData(.1, 0)]
+    [InlineData(.1, .495)]
+    [InlineData(.249, 0)]
+    [InlineData(.249, .495)]
+    [InlineData(.251, 0)]
+    [InlineData(.251, .495)]
+    public void AShortGapBetweenExecutedNetworksRequiresAndUsesTheSameCutterProof(double gap, double y)
+    {
+        Point3D a=new(0,y,-1),b=new(1,y,-1),c=new(1,y+gap,-1),d=new(2,y+gap,-1);
+        var planner=new ToolpathContinuationPlanner("short-gap",2,default);
+        planner.Record(Cut(a,b));planner.Record(Cut(c,d));
+        Assert.Null(planner.Connect(a,[d],(_,_)=>false));
+        var proved=new List<(Point3D,Point3D)>();
+        var connection=planner.Connect(a,[d],(x,y)=>
+        {
+            if((x==b&&y==c)||(x==c&&y==b)){proved.Add((x,y));return true;}
+            return false;
+        });
+        Assert.True(connection is not null, $"reason={planner.LastFailure} gap={gap:R} y={y:R} proofCalls={proved.Count}");
+        Assert.Equal(new[]{a,b,c,d},connection!.Points);
+        Assert.Contains((b,c),proved);
+    }
+
     [Fact]
     public void BlockedDirectTravelRetracesOnlyExecutedNativeChords()
     {
@@ -73,9 +99,9 @@ public sealed class ToolpathContinuationPlannerTests
             0,"clearing",0,detectCurves:false);
         var result=ToolpathContinuationPlanner.Reconnect([prior,next],"test",3,default,
             (_,_,_)=>true,removeSubsumedEntries:true,diagnostic:_=>{});
-        Assert.Equal(prior.Points[^1],result[1].Points[0]);
-        Assert.DoesNotContain(result[1].Spans,s=>s.Kind==ToolpathSpanKind.Ramp);
-        Assert.Equal(next.Points.Skip(1),result[1].Points.TakeLast(3));
+        Assert.Single(result);
+        Assert.DoesNotContain(result[0].Spans,s=>s.Kind==ToolpathSpanKind.Ramp);
+        Assert.Contains(Enumerable.Range(1,result[0].Points.Count-1),i=>result[0].Points[i-1]==a&&result[0].Points[i]==b);
     }
 
     [Fact]
@@ -101,7 +127,7 @@ public sealed class ToolpathContinuationPlannerTests
         var result=VCarvePathRouter.Route(source,[new PointD[]{new(0,0),new(20,0),new(20,20),new(0,20)}],
             new ToolGeometry(2){TipAngleRadians=2*Math.Atan(.2),BottomRadius=0,TopRadius=2,ConeLength=10},
             new DepthSchedule(2,1),new VCarveOptions{SmoothVCarving=true,SmoothRampAngleDegrees=30,
-                DetectCurves=false},0,null,diagnostic:log.Add,continuationCutGuard:(_,_)=>true);
+                DetectCurves=false,StepOver=1},0,null,diagnostic:log.Add,continuationCutGuard:(_,_)=>true);
         Assert.Equal(0,result[0].Points[0].Z);
         for(int i=1;i<result.Count;i++)Assert.Equal(result[i-1].Points[^1],result[i].Points[0]);
         Assert.Contains(log,l=>l.Contains("event=complete owner=vcarve")&&l.Contains("entries=1 "));
@@ -190,7 +216,8 @@ public sealed class ToolpathContinuationPlannerTests
             new ToolGeometry(2){TipAngleRadians=2*Math.Atan(.2),BottomRadius=0,TopRadius=2,ConeLength=10},
             new DepthSchedule(2,2),new VCarveOptions{SmoothVCarving=true,DetectCurves=false,
                 CompactCollinearCommands=true,ClearedTravelCostRatio=.2,
-                RoughingRestChords=[new(new(0,0,-3),new(20,0,-3),3,columnRadius,3)]},0,null);
+                RoughingRestChords=[new(new(0,0,-3),new(20,0,-3),3,columnRadius,3)]},0,null,
+                continuationCutGuard:(_,_)=>false);
         Assert.Equal(faster,result.Any(p=>p.Spans.Any(s=>s.Kind==ToolpathSpanKind.ClearedTravel)));
     }
 
@@ -214,20 +241,18 @@ public sealed class ToolpathContinuationPlannerTests
     }
 
     [Fact]
-    public void StepdownEvidenceRequiresOneEarlierWholeChordAndBothCoordinateDomains()
+    public void AngledRampNeedsAnExecutedGuideAndBothCoordinateDomains()
     {
         var planner=new ToolpathContinuationPlanner("test",2,default);
-        Point3D a=new(0,0,-2),b=new(1,0,-2);
+        Point3D a=new(0,0,-2),b=new(2,.5,-1),guide=new(10,0,-2);
         Point3D Command(Point3D p)=>p with{Z=Math.Round(p.Z,3)};
-        Assert.False(planner.HasStepdownPrecursor(a,b,1,Command));
-        planner.Record(Cut(a with{Z=-1},b with{Z=0}));
-        planner.Record(Cut(a with{Z=0},b with{Z=-1}));
-        Assert.False(planner.HasStepdownPrecursor(a,b,1,Command));
-        planner.Record(Cut(a with{Z=-1},b with{Z=-1}));
-        Assert.True(planner.HasStepdownPrecursor(a,b,1,Command));
-        Assert.False(planner.HasStepdownPrecursor(a with{Z=-2.0004},b,1,Command));
-        Assert.False(planner.HasStepdownPrecursor(a with{X=.0001},b,1,Command));
-        Assert.False(planner.HasStepdownPrecursor(a,b,1,p=>p.Z==-2 ? p with{Z=-2.001} : p));
+        Assert.False(planner.HasLateralPrecursor(a,b,.8,1,.5,Command));
+        planner.Record(Cut(a,guide));
+        Assert.True(planner.HasLateralPrecursor(a,b,.8,1,.5,Command));
+        Assert.False(planner.HasLateralPrecursor(a,b with{Y=.9},.8,1,.5,Command));
+        Assert.False(planner.HasLateralPrecursor(a,b with{X=11},.8,1,.5,Command));
+        Assert.False(planner.HasLateralPrecursor(a,b with{Z=-3.01},.8,1,1,Command));
+        Assert.False(planner.HasLateralPrecursor(a,b,.8,1,.5,p=>p==b?p with{Y=.801}:Command(p)));
     }
 
     [Fact]
@@ -281,7 +306,7 @@ public sealed class ToolpathContinuationPlannerTests
         var adapter=new VCarveContinuationAdapter(
             new ToolGeometry(2){TipAngleRadians=2*Math.Atan(.2),BottomRadius=0,TopRadius=2,ConeLength=10},
             new DepthSchedule(2,1),new VCarveOptions{SmoothVCarving=true,DetectCurves=false},
-            (_,_)=>true,default,null,[parent,child]);
+            (a,b)=>a.X==portal.X&&b.X==childPortal.X,default,null,[parent,child]);
         // The complete shallow connector was really executed. Its parent body
         // pose at -2 shares a nomination voxel with 1.01, but remains a literal
         // graph node. The next layer can reuse it without climbing back to -1.

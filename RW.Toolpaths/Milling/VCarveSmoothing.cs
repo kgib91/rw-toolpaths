@@ -14,10 +14,10 @@ namespace RW.Toolpaths.Milling;
 internal static class VCarveSmoothing
 {
     internal const double CoverageTolerance = MachiningAccuracy.SmoothCoverage;
-    // Complete channel gaps spend only the remaining spatial surface budget.
-    // The source geometry, floor search and all cutter guards retain their
-    // finer construction tolerances. Residual erosion uses half this width.
-    private const double CompletionTolerance = MachiningAccuracy.SurfaceDeviation - 2 * MachiningAccuracy.PathChord;
+    // Channel completion uses the current operation configuration.
+    // Source construction, floor search and physical proofs retain independent
+    // numerical/physical precision; none grants an extra finish allowance.
+    // Completion is configured per operation inside ApplyCore; no hidden global finish allowance.
     private const double SweepTolerance = .00075;
     private const double FieldTolerance = MachiningAccuracy.FloorSearch;
     private const double DepthReserve = .002;
@@ -92,23 +92,14 @@ internal static class VCarveSmoothing
         Action<double, string, bool>? progress = null,
         VCarvePreparation.PreparedRegion? preparation = null, int? correctionWorkers = null,
         Action<Func<Point3D, Point3D, bool>>? captureContinuationGuard = null,
-        Action<Func<IReadOnlyList<TaggedToolpath>,List<TaggedToolpath>>>? captureClippedPathProtection=null)
+        Action<Func<IReadOnlyList<TaggedToolpath>,List<TaggedToolpath>>>? captureClippedPathProtection=null, int sourceRegionIndex=0)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ValidateCorrectionArcTolerance(options.CorrectionArcTolerance);
         options = options.WithPriorStock(cancellationToken);
-        bool useTaperedLowerSweeps = Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_TAPERED_SWEEPS") == "1";
-        bool useLowerSweepBudget = Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_LOWER_SWEEP_BUDGET") == "1";
-        bool useActualF3Compaction = Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_ACTUAL_F3_COMPACTION") == "1";
-        bool useBoxNeighborhoods = Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_BOX_NEIGHBORHOODS") == "1";
-        bool useConditionedCorrectionSource = Environment.GetEnvironmentVariable(VCarveConditionedCorrectionSource.SelectionEnvironment) == "1";
-        bool useParallelSweepUnions = options.InitialStrategy?.ParallelSweepUnions
-            ?? (Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_PARALLEL_SWEEP_UNIONS") == "1");
-        bool useArtworkFringeGoal = Environment.GetEnvironmentVariable(VCarveArtworkFringeGoal.SelectionEnvironment) == "1";
-        bool useMaterialLayerGoal = Environment.GetEnvironmentVariable(VCarveMaterialLayerGoal.SelectionEnvironment) == "1";
-        bool useConditionedReferenceOpening = Environment.GetEnvironmentVariable(VCarveConditionedReferenceOpeningGoal.SelectionEnvironment) == "1";
-        bool useInitialStockCohort = options.InitialStrategy?.InitialStockCohort
-            ?? (Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_INITIAL_STOCK_COHORT") == "1");
+        var policy = options.InitialStrategy?.GenerationPolicy ?? VCarveGenerationPolicy.Capture();
+        diagnostic?.Invoke($"stage=generation-policy signature='{policy.CacheSignature(options.InitialStrategy)}' "
+            + $"capturedWithRequest={options.InitialStrategy is not null} source=immutable-request deviceAvailabilityIsStockAuthority=False");
         long started = Stopwatch.GetTimestamp();
         double requested = options.CorrectionArcTolerance;
         diagnostic?.Invoke($"stage=correction-arc event=start requestedArc={requested:R} "
@@ -116,7 +107,7 @@ internal static class VCarveSmoothing
             + $"ordinaryCorrectionCandidates={options.UseOrdinaryCorrectionCandidates} ordinaryRounds=0..6 originalRecoveryRound=7 "
             + "maximumCurveError=0.001 stockCredit=0 originalChannelAndPhysicalGuards=unchanged");
         bool fallback = false;
-        bool useGpuFronts = Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_GPU_FRONTS") == "1";
+        bool useGpuFronts = policy.GpuFronts;
         bool gpuCompletionFallback = false;
         var gpuIntegrationControl = GpuFrontIntegrationControls.Value;
         List<TaggedToolpath> result;
@@ -125,7 +116,7 @@ internal static class VCarveSmoothing
             try
             {
                 result = ApplyCore(source, boundary, tool, schedule, options, cancellationToken,
-                    diagnostic, progress, preparation, correctionWorkers, useGpuFronts, gpuIntegrationControl, useTaperedLowerSweeps, useLowerSweepBudget, useActualF3Compaction, useBoxNeighborhoods, useConditionedCorrectionSource, useArtworkFringeGoal, useParallelSweepUnions, useMaterialLayerGoal, useConditionedReferenceOpening, useInitialStockCohort, captureContinuationGuard, captureClippedPathProtection);
+                    diagnostic, progress, preparation, correctionWorkers, useGpuFronts, gpuIntegrationControl, policy, captureContinuationGuard, captureClippedPathProtection, sourceRegionIndex);
             }
             catch (InvalidOperationException error) when (useGpuFronts
                 && error.Data.Contains("SmoothVCarvingGeometry")
@@ -140,7 +131,7 @@ internal static class VCarveSmoothing
                 // explicit false prevents recursion/re-entry into nominations.
                 result = ApplyCore(source, boundary, tool, schedule, options, cancellationToken,
                     diagnostic, progress, preparation, correctionWorkers, useGpuFronts: false, gpuIntegrationControl: gpuIntegrationControl,
-                    useTaperedLowerSweeps: useTaperedLowerSweeps, useLowerSweepBudget: useLowerSweepBudget, useActualF3Compaction: useActualF3Compaction, useBoxNeighborhoods: useBoxNeighborhoods, useConditionedCorrectionSource: useConditionedCorrectionSource, useArtworkFringeGoal: useArtworkFringeGoal, useParallelSweepUnions: useParallelSweepUnions, useMaterialLayerGoal: useMaterialLayerGoal, useConditionedReferenceOpening: useConditionedReferenceOpening, useInitialStockCohort: useInitialStockCohort, captureContinuationGuard: captureContinuationGuard, captureClippedPathProtection:captureClippedPathProtection);
+                    policy: policy, captureContinuationGuard: captureContinuationGuard, captureClippedPathProtection:captureClippedPathProtection, sourceRegionIndex:sourceRegionIndex);
             }
         }
         catch (InvalidOperationException error) when ((requested > ReferenceCorrectionArcTolerance
@@ -158,7 +149,7 @@ internal static class VCarveSmoothing
                 options with { CorrectionArcTolerance = ReferenceCorrectionArcTolerance,
                     UseOrdinaryCorrectionCandidates = false }, cancellationToken,
                 diagnostic, progress, preparation, correctionWorkers, useGpuFronts: false, gpuIntegrationControl: gpuIntegrationControl,
-                useTaperedLowerSweeps: useTaperedLowerSweeps, useLowerSweepBudget: useLowerSweepBudget, useActualF3Compaction: useActualF3Compaction, useBoxNeighborhoods: useBoxNeighborhoods, useConditionedCorrectionSource: useConditionedCorrectionSource, useArtworkFringeGoal: useArtworkFringeGoal, useParallelSweepUnions: useParallelSweepUnions, useMaterialLayerGoal: useMaterialLayerGoal, useConditionedReferenceOpening: useConditionedReferenceOpening, useInitialStockCohort: useInitialStockCohort, captureContinuationGuard: captureContinuationGuard, captureClippedPathProtection:captureClippedPathProtection);
+                policy: policy, captureContinuationGuard: captureContinuationGuard, captureClippedPathProtection:captureClippedPathProtection, sourceRegionIndex:sourceRegionIndex);
         }
         cancellationToken.ThrowIfCancellationRequested();
         diagnostic?.Invoke($"stage=correction-arc event=complete requestedArc={requested:R} "
@@ -173,27 +164,68 @@ internal static class VCarveSmoothing
         return result;
     }
 
+    // Fixed-owner guard for bounded source-construction experiments. Production
+    // below deliberately closes over its later original-channel wall owner.
+    internal static Func<Point3D,Point3D,bool> CreateContinuationGuard(FloorField? field,
+        CommandClearance wallGuard,double surfaceZ,double grade,CancellationToken token)
+    {
+        var continuationFloor=field is null?null:new ActualF3CompactionFloorProof(field,grade,token);
+        return(a,b)=>
+        {
+            var ca=CommandPoint(a,surfaceZ);var cb=CommandPoint(b,surfaceZ);
+            if(Math.Abs(a.Z-b.Z)>grade*Distance(a,b)||Math.Abs(ca.Z-cb.Z)>grade*Distance(ca,cb))return false;
+            if(continuationFloor is not null&&(!continuationFloor.Prove(a,b)||!continuationFloor.Prove(ca,cb)))return false;
+            return wallGuard.IsLegalCommandedChord(a,b);
+        };
+    }
+
     private static List<TaggedToolpath> ApplyCore(IReadOnlyList<TaggedToolpath> source,
         IReadOnlyList<IReadOnlyList<PointD>> boundary, ToolGeometry tool, DepthSchedule schedule,
         VCarveOptions options, CancellationToken cancellationToken, Action<string>? diagnostic,
         Action<double, string, bool>? progress,
-        VCarvePreparation.PreparedRegion? preparation, int? correctionWorkers, bool useGpuFronts, GpuFrontIntegrationControl? gpuIntegrationControl, bool useTaperedLowerSweeps, bool useLowerSweepBudget, bool useActualF3Compaction, bool useBoxNeighborhoods, bool useConditionedCorrectionSource, bool useArtworkFringeGoal, bool useParallelSweepUnions, bool useMaterialLayerGoal, bool useConditionedReferenceOpening, bool useInitialStockCohort, Action<Func<Point3D, Point3D, bool>>? captureContinuationGuard, Action<Func<IReadOnlyList<TaggedToolpath>,List<TaggedToolpath>>>? captureClippedPathProtection)
+        VCarvePreparation.PreparedRegion? preparation, int? correctionWorkers, bool useGpuFronts, GpuFrontIntegrationControl? gpuIntegrationControl, VCarveGenerationPolicy policy, Action<Func<Point3D, Point3D, bool>>? captureContinuationGuard, Action<Func<IReadOnlyList<TaggedToolpath>,List<TaggedToolpath>>>? captureClippedPathProtection, int sourceRegionIndex)
     {
+        if(!double.IsFinite(options.PathToleranceMm)||options.PathToleranceMm<=1e-8)throw new ArgumentOutOfRangeException(nameof(options.PathToleranceMm));
+        double CompletionTolerance=2*options.CompletionGapRadiusMm;
         cancellationToken.ThrowIfCancellationRequested();
+        bool useTaperedLowerSweeps = policy.TaperedSweeps;
+        bool useLowerSweepBudget = policy.LowerSweepBudget;
+        bool useActualF3Compaction = policy.ActualF3Compaction;
+        bool useBoxNeighborhoods = policy.BoxNeighborhoods;
+        bool useConditionedCorrectionSource = policy.ConditionedCorrectionSource;
+        bool useParallelSweepUnions = options.InitialStrategy?.ParallelSweepUnions ?? policy.ParallelSweepUnions;
+        bool useArtworkFringeGoal = policy.ArtworkFringeGoal;
+        bool useMaterialLayerGoal = policy.MaterialLayerGoal;
+        bool useConditionedReferenceOpening = policy.ConditionedReferenceOpening;
+        bool useInitialStockCohort = options.InitialStrategy?.InitialStockCohort ?? policy.InitialStockCohort;
         if (gpuIntegrationControl?.CoreEntered is { } coreEntered)
             coreEntered(new(useGpuFronts, source, boundary, tool, schedule, options, preparation, correctionWorkers));
         cancellationToken.ThrowIfCancellationRequested();
         diagnostic?.Invoke($"stage=box-correction-neighborhood event=selection enabled={useBoxNeighborhoods} "
-            + "selection=RW_TOOLPATHS_VCARVE_BOX_NEIGHBORHOODS selectionCapturedAtApply=True "
+            + "selection=RW_TOOLPATHS_VCARVE_BOX_NEIGHBORHOODS selectionFrozenForApply=True "
             + "candidateCentersOnly=True stockCredit=0 enclosureCredit=0 physicalCredit=0 "
             + "originalFloorBothWallsGradeAndWholeTargetRequired=True unsupportedUsesLiteralOffset=True");
         double grade = Math.Tan(options.SmoothRampAngleDegrees * Math.PI / 180);
         MillingGeometryTrace.Capture("smoothing-input",0,source);
+        var floorSources = VCarveRampSurface.Sources(boundary, options, cancellationToken);
+        int originalPathCount = source.Count;
+        var profile = VCarvePhysicalSweep.ProfileFor(tool, schedule.Depth);
+        VCarveMaterialSurface? stockContact = options.ClearedStock is { } remainingStock
+            ? new VCarveMaterialSurface(boundary, remainingStock, profile, schedule.Depth, schedule.SurfaceZ, cancellationToken, diagnostic) : null;
+        if(stockContact is not null) floorSources=VCarveStockContactPaths.Project(floorSources,stockContact,options.PathToleranceMm,cancellationToken);
+        if (floorSources.Count > 0)
+        {
+            var ramps = VCarveRampSurface.Contours(boundary, options, profile, schedule.Depth,
+                source.Count > 0 ? source[0].RegionIndex : preparation?.RegionIndex ?? sourceRegionIndex,
+                cancellationToken, diagnostic);
+            source = source.Concat(ramps).ToList();
+        }
+        if(stockContact is not null) source=VCarveStockContactPaths.Project(source,stockContact,options.PathToleranceMm,cancellationToken);
         long sourcePointCount = source.Sum(path => (long)path.Points.Count);
         long pointBudget = Math.Max(MaximumPoints, checked(8 * sourcePointCount));
         var medial = preparation?.OriginalMedialPaths.ToList()
             ?? source.Where(path => path.Category == "final-carve" && path.Points.Count >= 2).ToList();
-        if (medial.Count == 0 && !useInitialStockCohort)
+        if (medial.Count == 0 && floorSources.Count == 0 && !useInitialStockCohort)
         {
             source = VCarveInitialReachSelection.NormalizeMarkers(source, cancellationToken);
             bool normalizeMarker = source.Any(path => path.Category == AdaptiveInitialReachContourNominator.MarkerCategory);
@@ -201,8 +233,10 @@ internal static class VCarveSmoothing
             return normalizeMarker ? AdaptiveInitialReachContourNominator.NormalizeMarkers(source, cancellationToken) : source.ToList();
         }
         if (medial.Count == 0)
-            diagnostic?.Invoke("stage=smoothing event=no-medial-initial-physical-guards originalArtworkWallAndNominalGradeRequired=True originalFloorAvailable=False noConstructionOrStockCredit=True");
-        if (useInitialStockCohort && source.All(path => path.Category == "final-carve"))
+            diagnostic?.Invoke($"stage=smoothing event=no-medial-initial-physical-guards originalArtworkWallAndNominalGradeRequired=True originalFloorAvailable={floorSources.Count > 0} noConstructionOrStockCredit=True");
+        // New outline ramp rows must not masquerade as an original clearing
+        // band and suppress the retained medial channel's coverage recovery.
+        if (useInitialStockCohort && source.Take(originalPathCount).All(path => path.Category == "final-carve"))
         {
             useInitialStockCohort = false;
             diagnostic?.Invoke("stage=initial-stock-cohort event=coverage-repair reason=no-clearing-band "
@@ -216,11 +250,10 @@ internal static class VCarveSmoothing
         progress?.Invoke(0, "Constraining the medial depth gradient", true);
         diagnostic?.Invoke($"stage=smoothing event=analysis-reuse reused={preparation is not null} " +
             "floorOwner=continuous-retained-crest-before-routing-and-command-reserves");
-        var profile = VCarvePhysicalSweep.ProfileFor(tool, schedule.Depth);
         double goalSurfaceZ = VCarveMaterialLayerGoal.AnalysisSurface(useMaterialLayerGoal);
         double minimumCorrectionDepth = .001 - goalSurfaceZ;
         diagnostic?.Invoke($"stage=material-layer-goal event=selection enabled={useMaterialLayerGoal} goalSurfaceZ={goalSurfaceZ:R} "
-            +$"layerDepthMm={VCarveMaterialLayerGoal.LayerDepthMm:R} selectionCapturedAtApply=True "
+            +$"layerDepthMm={VCarveMaterialLayerGoal.LayerDepthMm:R} selectionFrozenForApply=True "
             +"originalPhysicalCommandsAndReferenceChannelSurfaceZ=0 originalFloorArtworkWallsAndGradeRetained=True "
             +"referenceLowerAndQUseSameAnalysisPlane=True returnedPathsNotTranslated=True QViewNotReposted=True "
             +"omittedMaterialAtMostLayerDepthOnlyOutsideProjectedRawReferenceUpper=True openingAndArtworkFringeSeparatePolicies=True globalStockAccepted=False");
@@ -228,14 +261,14 @@ internal static class VCarveSmoothing
         // coverage budget on its mesh. This changes no commanded pose, upper
         // target or physical guard; final residual and certificate owners remain.
         double lowerSweepTolerance = useLowerSweepBudget ? CoverageTolerance / 2 : SweepTolerance;
-        bool consolidateLowerSweeps = Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_GPU") == "1";
+        bool consolidateLowerSweeps = policy.GpuDiscWitnesses;
         diagnostic?.Invoke($"stage=smooth-lower-sweep event=selection hemisphereConsolidation={consolidateLowerSweeps} "
             + "selection=RW_TOOLPATHS_VCARVE_GPU experimental=True lowerOnly=True originalUpperUnchanged=True "
             + $"taperedLowerSweeps={useTaperedLowerSweeps} taperedSelection=RW_TOOLPATHS_VCARVE_TAPERED_SWEEPS "
             + $"lowerSweepBudget={useLowerSweepBudget} lowerSweepTolerance={lowerSweepTolerance:R} "
             + $"parallelLeafUnions={useParallelSweepUnions} parallelSelection=RW_TOOLPATHS_VCARVE_PARALLEL_SWEEP_UNIONS "
-            + "parallelSelectionCapturedAtApply=True physicalPrimitivesAndOrderedHierarchyUnchanged=True "
-            + "lowerBudgetSelection=RW_TOOLPATHS_VCARVE_LOWER_SWEEP_BUDGET selectionCapturedAtApply=True "
+            + "parallelSelectionFrozenForApply=True physicalPrimitivesAndOrderedHierarchyUnchanged=True "
+            + "lowerBudgetSelection=RW_TOOLPATHS_VCARVE_LOWER_SWEEP_BUDGET selectionFrozenForApply=True "
             + "guardRefusal=literal-original-pieces upperTargetAndCoverageTolerance=unchanged");
         List<List<PointD>> BuildLowerSweep(IReadOnlyList<TaggedToolpath> paths)
             => useParallelSweepUnions
@@ -251,14 +284,13 @@ internal static class VCarveSmoothing
         // Anchor every point of each retained top edge. Selecting raised medial
         // spans instead makes the surface depend on branch spacing and produces
         // separate cones along an otherwise straight crest.
-        var floorSources = VCarveRampSurface.Sources(boundary, options, cancellationToken);
         FloorField? field = floorSources.Count == 0 ? null
             : new FloorField(floorSources, profile, grade, schedule.Depth, cancellationToken);
         if(field is not null)diagnostic?.Invoke($"stage=smooth-floor event=prepared sourcePaths={floorSources.Count} "
             +$"surfaceOwner=continuous-retained-crest grade={grade:R} plateauDepth={schedule.Depth:R} medialConeAnchors=False "
             +field.SupportDominanceDiagnostics+" "+field.QueryScratchDiagnostics);
         var wallGuard = new CommandClearance(boundary, profile, schedule.SurfaceZ, cancellationToken, diagnostic,
-            maximumPoints: pointBudget);
+            maximumPoints: pointBudget, stockContact: stockContact);
         if (captureContinuationGuard is not null)
         {
             // Reuse the ORIGINAL floor and whole posted artwork chord authorities.
@@ -381,45 +413,52 @@ internal static class VCarveSmoothing
         }
         captureClippedPathProtection?.Invoke(Protect);
         wallGuard.EnableArtworkProofCapture();
-        var constrained = Protect(source);
-        if (useInitialStockCohort && options.RoughingRestWidth > 0)
+        if (field is not null && !profile.RoundedTip && source.Count > originalPathCount)
         {
-            var protectedRest = new List<TaggedToolpath>();
-            long restSourcePoints=0,restRetainedPoints=0;
-            // Posting is monotone in tip Z. These two deepest poses bound
-            // every nominal and actual F3 footprint at the operation's cap.
-            double postedMaximumDepth=-CommandPoint(new(0,0,-schedule.Depth),schedule.SurfaceZ).Z;
-            double restMaximumRadius=profile.PhysicalRadiusAtDepth(Math.Max(schedule.Depth,postedMaximumDepth));
-            IEnumerable<VCarveRampRestNominator.RestContour> RestrictRest(IReadOnlyList<PointD> ring,bool closed)
-            {
-                restSourcePoints+=ring.Count;
-                foreach(var contour in options.AccessTarget!.RestrictRestContour(ring,closed,
-                    restMaximumRadius,cancellationToken))
-                {restRetainedPoints+=contour.Points.Count;yield return contour;}
-            }
-            var rest = VCarveRampRestNominator.NominateContours(boundary, constrained, profile, schedule.Depth,
-                options.RoughingRestWidth, (x, y) => field?.CappedDepth(schedule.Depth, x, y) ?? schedule.Depth,
-                (x, y) => wallGuard.NominationArtworkDistance(x, y),
-                point => CommandPoint(point, schedule.SurfaceZ), cancellationToken, diagnostic, options.RoughingRestChords,
-                Protect, protectedRest, grade,options.StepOver,schedule.SurfaceZ,
-                options.IncludeInteriorFill?double.PositiveInfinity:Math.Max(0,options.EdgeFillWidth-VCarveToolpaths.AppliedStockAllowance(options.StockToLeave)),options.Tolerance,
-                preparation?.OriginalMedialGraph,field is null?null:field.NominateFloorContact,
-                field?.MaximumFloorContactRadius??0,options.PriorStock,
-                options.AccessTarget is null?null:RestrictRest,
-                prepareFloorQueries:field is null||!options.ParallelFloorQueryPreparation?null:points=>
-                    field.PrewarmNomination(points.SelectMany(p=>{
-                        var c=CommandPoint(new(p.x,p.y,0),schedule.SurfaceZ);
-                        return new[]{p,new PointD(c.X,c.Y)};
-                    }),diagnostic), continuousCrestSurface:true);
-            if(options.AccessTarget is not null)
-                diagnostic?.Invoke($"stage=rest-demand-reach sourcePoints={restSourcePoints} retainedPoints={restRetainedPoints} "
-                    +$"maximumPhysicalRadius={restMaximumRadius:R} nominalDepthCap={schedule.Depth:R} postedDepthCap={postedMaximumDepth:R} "
-                    +"wholeChordTargetContact=True nativeAndActualF3DepthBound=True postedXYReserve=True sourceMedialAndFloorUnchanged=True stockCredit=False");
-            if (rest.Count > 0)
-            {
-                source = source.Concat(rest).ToList();
-                constrained.AddRange(protectedRest);
-            }
+            // Sharp/flat profiles use the general Lipschitz chord proof. Give
+            // new ramp nominations its existing 2um axial preparation reserve;
+            // the finer radius-derived reserve otherwise forces thousands of
+            // subdivisions on an ordinary straight constant-depth contour.
+            source = source.Select((path, index) => index < originalPathCount ? path : path with {
+                Points = path.Points.Select(p => p with {
+                    Z = -Math.Max(0, field.Depth(p.X, p.Y) - DepthReserve)
+                }).ToArray()
+            }).ToList();
+            diagnostic?.Invoke($"stage=outline-ramps event=prepare nonroundedAxialReserve={DepthReserve:R} "
+                + "originalMedialAndFillUnchanged=True completePhysicalChordProofRequired=True");
+        }
+        var constrained = Protect(source);
+        // Full-outline ramps are new surface work, rather than a demand to
+        // restore full-depth ordinary fill. Their physically fitted poses own
+        // their reference footprint; medial and authored fill retain theirs.
+        if (source.Count > originalPathCount)
+        {
+            source = source.Take(originalPathCount).Concat(constrained.Skip(originalPathCount)).ToList();
+            diagnostic?.Invoke($"stage=outline-ramps event=protected paths={source.Count - originalPathCount} "
+                + $"points={constrained.Skip(originalPathCount).Sum(p => (long)p.Points.Count)} "
+                + "reference=physical-ramp-surface originalMedialAndFillPreserved=True");
+        }
+        diagnostic?.Invoke($"stage=source-paths event=protected sourcePaths={originalPathCount} "
+            + $"rampPaths={source.Count-originalPathCount} outputPaths={constrained.Count} "
+            + "families=original-medial-and-concentric supplementalRestFragments=False");
+        if (!options.IncludeInteriorFill)
+        {
+            // The slope is complete; Fill Limit adds a nearest-edge floor band.
+            // Keep that selected physical channel as the link domain, so a
+            // reconnect cannot bridge the untouched broad core.
+            diagnostic?.Invoke($"stage=fill-limit event=complete authoredWidth={options.EdgeFillWidth:R} "
+                + $"nearestEdgeLimit={options.EdgeFillWidth:R} roughingReachRequested={options.RoughingRestWidth:R} "
+                + $"paths={constrained.Count} slopeAdditive=True selection=post-slope-nearest-edge-band originalMedialRetained=True");
+            if (constrained.Count == 0) return constrained;
+            var channel = Timed("bounded-fill-command-channel", () => VCarvePhysicalSweep.Build(
+                CommandPaths(constrained, schedule.SurfaceZ), profile, 0, SweepTolerance,
+                cancellationToken, upperBound: true));
+            var protectedArtwork = wallGuard;
+            // New links stay within the actual selected cutting channel, so a
+            // short reconnect cannot turn a limited fill into an interior cut.
+            wallGuard = new CommandClearance(boundary, profile, schedule.SurfaceZ,
+                cancellationToken, diagnostic, channel, pointBudget, protectedArtwork);
+            return CompleteInitialStockCohort(channel, null, fillLimited: true);
         }
         var changed = new List<TaggedToolpath>();
         double largestReduction = 0;
@@ -493,12 +532,19 @@ internal static class VCarveSmoothing
 
         // Audit the same float world-Z subtraction and F3 command as the post.
         // Paths stay stock-relative here; only this sweep view is quantized.
+        // Preserve the already physically protected original detail as well as
+        // its requested channel. Re-fitting it against only the nominal sweep's
+        // polygon can erase legal shallow contact at a concave F3 boundary.
+        // All adopted poses already passed the complete floor/wall/grade guards.
+        var referencePaths = source.Concat(constrained.Take(originalPathCount)).ToList();
+        diagnostic?.Invoke($"stage=outline-ramps event=reference protectedOriginalPaths={originalPathCount} "
+            + "owner=original-request-and-physically-protected-detail artworkGuardRetained=True");
         var originalFootprint = Timed("reference-sweep", () => useParallelSweepUnions
-            ? VCarvePhysicalSweep.BuildWithParallelLeafUnions(CommandPaths(source, schedule.SurfaceZ),
+            ? VCarvePhysicalSweep.BuildWithParallelLeafUnions(CommandPaths(referencePaths, schedule.SurfaceZ),
                 VCarvePhysicalSweep.ProfileFor(tool, schedule.Depth), 0, SweepTolerance,
                 cancellationToken, upperBound: true)
             : VCarvePhysicalSweep.Build(
-                CommandPaths(source, schedule.SurfaceZ), tool, schedule.Depth, 0,
+                CommandPaths(referencePaths, schedule.SurfaceZ), tool, schedule.Depth, 0,
                 SweepTolerance, cancellationToken, upperBound: true));
         var originalTarget = PolygonOps.Intersect(originalFootprint, boundary);
         if (options.AccessTarget is { } accessTarget)
@@ -517,12 +563,13 @@ internal static class VCarveSmoothing
             $"allowedFootprintApproximation={VCarvePhysicalSweep.EffectiveTolerance(SweepTolerance):R} " +
             "allOriginalPaths=True fullCommandChordContainment=True artworkAndOriginalChannel=True");        List<TaggedToolpath> CompleteInitialStockCohort(IEnumerable<IReadOnlyList<PointD>> channelTarget,
 
-            VCarveInitialSourceChordShell.Result? shell)
+            VCarveInitialSourceChordShell.Result? shell, bool fillLimited = false)
 
         {
-            // Experimental stock candidate only. Original floor and artwork
-            // remain; channel uses literal union or ordered source custody with
-            // measured F3 shell. Neither grants stock acceptance.
+            // Audit the selected native and posted cutting source. A bounded
+            // fill adopts only authored rows, without demanding completion past
+            // its cutoff. Unbounded initial-cohort callers retain their literal
+            // union/source-shell policy; neither path grants stock acceptance.
             cancellationToken.ThrowIfCancellationRequested();
             var initialCommands = Timed("initial-stock-command-view", () => CommandPaths(constrained, schedule.SurfaceZ));
             double nominalGrade = MaximumGrade(constrained), actualGrade = MaximumGrade(initialCommands);
@@ -572,7 +619,7 @@ internal static class VCarveSmoothing
                 cancellationToken.ThrowIfCancellationRequested();
                 diagnostic?.Invoke($"stage=initial-stock-cohort event=complete enabled=True paths={constrained.Count} " +
                     $"points={constrained.Sum(path => (long)path.Points.Count)} auditedActualChords={auditedChords} " +
-                    "selectionCapturedAtApply=True originalPhysicalSurfaceZ=0 originalFloorArtworkAndGradeRetained=True " +
+                    "selectionFrozenForApply=True originalPhysicalSurfaceZ=0 originalFloorArtworkAndGradeRetained=True " +
                     "originalCommandFloorConversionAudit=True fullActualF3WallChordAudit=True " +
                     $"channelPolicy={(shell is null ? "literal-original-union" : "ordered-original-source-chord-shell")} originalChannelUnionBuilt={shell is null} " +
 
@@ -580,7 +627,7 @@ internal static class VCarveSmoothing
 
                     "openingLowerSweepWholeQAndRecoveryNotRun=True optionalActualF3CompactionNotRun=True " +
                     "coverageClaim=False wholeStockAcceptance=False candidateScope=initial-guarded-stock-cohort");
-                progress?.Invoke(1, "Initial guarded V-carve stock cohort generated", false);
+                progress?.Invoke(1, fillLimited ? "V-carve Fill Limit applied" : "Initial guarded V-carve stock cohort generated", false);
                 cancellationToken.ThrowIfCancellationRequested();
                 var ordered = constrained.OrderBy(path => path.Category == "final-carve" ? 1 : 0)
                     .ThenBy(path => path.DepthPassIndex ?? int.MaxValue).ToList();
@@ -597,6 +644,7 @@ internal static class VCarveSmoothing
                 // Lazy bounded consumer capture, preserving the original error.
                 error.Data["SmoothVCarvingGeometry"] = new {
                     basis = "float-workspace-F3-stock-relative", round = -1, spatialTolerance = CompletionTolerance,
+                    fillLimited, authoredFillWidth = options.EdgeFillWidth,
                     physicalCommandSurfaceZ = 0d, goalSurfaceZ = 0d,
                     goalScope = shell is null ? "initial-stock-cohort-no-coverage-goal-or-stock-acceptance"
 
@@ -691,7 +739,7 @@ internal static class VCarveSmoothing
                 nominal => MaximumGrade(new[] { nominal }) <= grade + 1e-12,
                 cancellationToken, diagnostic, actualFloorProof is null ? null : actualFloorProof.Diagnostics);
             diagnostic?.Invoke("stage=actual-F3-compaction event=selection enabled=True "
-                + "selection=RW_TOOLPATHS_VCARVE_ACTUAL_F3_COMPACTION selectionCapturedAtApply=True "
+                + "selection=RW_TOOLPATHS_VCARVE_ACTUAL_F3_COMPACTION selectionFrozenForApply=True "
                 + "originalFloorArtworkChannelTargetFrozen=True beforeInitialLowerSweep=True "
                 + "invocationAndSpanPostingOwner=True numericFeedAndToolUuidInvented=False returnedOriginalNominalGradeRequired=True "
                 + "trajectoryBoundMm=0.002 machiningToleranceChanged=False stockAuditPending=True");
@@ -707,11 +755,11 @@ internal static class VCarveSmoothing
         correctionBoundary.PrepareConditionedNomination(useConditionedCorrectionSource && boxNeighborhoodEligible, cancellationToken, diagnostic);
         diagnostic?.Invoke($"stage=conditioned-correction-source event=selection requested={useConditionedCorrectionSource} "
             + $"boxEligible={boxNeighborhoodEligible} active={correctionBoundary.UsesConditionedNomination} "
-            + "selectionCapturedAtApply=True nominationOnly=True originalPhysicalOwnersUnchanged=True");
+            + "selectionFrozenForApply=True nominationOnly=True originalPhysicalOwnersUnchanged=True");
         diagnostic?.Invoke($"stage=box-correction-neighborhood event=source-policy requested={useBoxNeighborhoods} eligible={boxNeighborhoodEligible} "
             + $"canonicalChannelSourcePoints={correctionBoundary.SourcePoints} minimumSourcePoints={minimumBoxSourcePoints} "
             + $"boundedInternalControl={gpuIntegrationControl?.MinimumBoxSourcePointsForControls is not null} "
-            + "selectionCapturedAtApply=True sourcePolicyFrozenOnce=True smallSourceLiteralSelector=True "
+            + "selectionFrozenForApply=True sourcePolicyFrozenOnce=True smallSourceLiteralSelector=True "
             + "observedCostDomainPolicy=True universalCrossoverClaim=False physicalGuardsUnchanged=True");
         VCarveGpuCorrectionFrontNominator? gpuFrontOwner = null;
         int gpuFrontNominatedComponents = 0;
@@ -728,7 +776,7 @@ internal static class VCarveSmoothing
                     ready = gpuFrontOwner is not null; reason = ready ? "independent-control-nomination-owner" : "control-owner-refused";
                 }
                 else ready = VCarveGpuCorrectionFrontNominator.TryCreate(correctionBoundary.OriginalBoundary,
-                    cancellationToken, diagnostic, out gpuFrontOwner, out reason);
+                    cancellationToken, diagnostic, out gpuFrontOwner, out reason, policy);
                 cancellationToken.ThrowIfCancellationRequested();
                 diagnostic?.Invoke($"stage=gpu-correction-front event=selection requested=True available={ready} reason='{reason}' "
                     + "owner=one-generation-original-channel earlyRounds=0..5 originalConstructorOnRefusal=True "
@@ -743,7 +791,7 @@ internal static class VCarveSmoothing
         // The fixed target stays identical across correction rounds. Reuse only
         // its verified exact decomposition, never physical coverage or owners.
         var triangleDomainPreparation = new VCarveCoverageCertificate.PreparedTriangleDomain();
-        bool floorAwareRamps = Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_FLOOR_AWARE_RAMPS") == "1";
+        bool floorAwareRamps = policy.FloorAwareRamps;
         int floorAwareNominatedPaths = 0;
         RW.Toolpaths.Milling.Artifacts.FloorAwareCorrectionPoseNominator? floorAwarePoseOwner = null;
         RW.Toolpaths.Milling.Artifacts.FloorAwareRampBatchMaterializer.Owners? floorAwareBatchOwners = null;
@@ -879,10 +927,11 @@ internal static class VCarveSmoothing
                     // to remove cutting rays by surface-only witnesses.
                     RecordWitnessPathIndices = !useMaterialLayerGoal && originalCertificateRequested && terminalPathIndices.Count != 0,
                     OptionalWitnessPathIndices = !useMaterialLayerGoal && originalCertificateRequested ? terminalPathIndices : null,
-                    UseGpuDiscWitnesses = Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_GPU") == "1",
-                    UseGpuTriangleDomain = Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_GPU_TRIANGLES") == "1",
-                    UseContourBoxSeeds = Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_CONTOUR_SEEDS") == "1",
-                    UseGpuBoundaryNominations = Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_GPU_BOUNDARY") == "1",
+                    GenerationPolicy = policy,
+                    UseGpuDiscWitnesses = policy.GpuDiscWitnesses,
+                    UseGpuTriangleDomain = policy.GpuTriangles,
+                    UseContourBoxSeeds = policy.ContourSeeds,
+                    UseGpuBoundaryNominations = policy.GpuBoundary,
                     TriangleDomainPreparation = triangleDomainPreparation,
                 };
                 if ((requireGpuCompletionCertificate || requireFloorAwareCompletionCertificate || requireBoxCompletionCertificate || requireConditionedReferenceCompletionCertificate)
@@ -2161,6 +2210,7 @@ internal static class VCarveSmoothing
         private readonly Dictionary<long, double> _depthReaches = new();
         private readonly VCarveCutterProfile _profile;
         private readonly double _surface;
+
         private readonly int _maximumExamined;
         private readonly bool _monotoneProfile;
         private long _examined, _queries, _coveredEndpoint, _unrepresentable, _withoutXyzArrival;
@@ -2478,6 +2528,7 @@ internal static class VCarveSmoothing
         internal string Diagnostics() => $"stage=actual-F3-compaction event=original-actual-floor queries={_queries} pieces={_pieces} endpointRefusals={_endpointRefusals} unresolvedRefusals={_unresolvedRefusals} arithmeticRefusals={_arithmeticRefusals} originalQueryBudgetRefusals={_originalQueryBudgetRefusals} firstOriginalQueryBudgetRefusal='{_firstOriginalQueryBudgetRefusal}' enclosureOperations={_enclosureOperations} totalMs={_milliseconds:R} maxDepth={MaximumDepth} maxPiecesPerChord={MaximumPiecesPerChord} originalFieldAndCurvatureBound=True nominalCapReserveTransferred=False";
         internal bool Prove(Point3D originalA, Point3D originalB)
         {
+            if (originalFloor.ProveCrestChord(originalA, originalB)) return true;
             token.ThrowIfCancellationRequested();_queries++;long started = Stopwatch.GetTimestamp(), visits = 0;
             try
             {
@@ -2563,7 +2614,8 @@ internal static class VCarveSmoothing
                 Subdivide(rawA, rawB, points[^1], Cap(rawB), 0);
             }
             result.Add(new TaggedToolpath(points, Array.Empty<ToolpathSpan>(), path.RegionIndex,
-                path.Category, path.DepthPassIndex, path.VisitIdentity, path.DetectCurves));
+                path.Category, path.DepthPassIndex, path.VisitIdentity, path.DetectCurves)
+                {ConcentricSource=path.ConcentricSource});
 
             void Subdivide(Point3D rawA, Point3D rawB, Point3D a, Point3D b, int level)
             {
@@ -2583,7 +2635,7 @@ internal static class VCarveSmoothing
                 double curveMargin = double.IsFinite(curveCost)
                     ? marginA + (marginB - marginA) * curveT - curveCost * curveT * (1 - curveT)
                     : double.NegativeInfinity;
-                if (lower + 1e-10 >= commanded || curveMargin >= 0)
+                if (lower + 1e-10 >= commanded || curveMargin >= 0 || field.ProveCrestChord(a, b))
                 {
                     if(chargePoint is not null)chargePoint(a,b);
                     else if (++pointCount > maximumPoints)
@@ -2738,7 +2790,8 @@ internal static class VCarveSmoothing
         List<TaggedToolpath> Publish(IReadOnlyList<TaggedToolpath> input)
             => input.Select((path, index) => new TaggedToolpath(path.Points.Select((point, i) =>
             new Point3D(point.X, point.Y, -depths[paths[index][i]])).ToList(), Array.Empty<ToolpathSpan>(),
-            path.RegionIndex, path.Category, path.DepthPassIndex, path.VisitIdentity, path.DetectCurves)).ToList();
+            path.RegionIndex, path.Category, path.DepthPassIndex, path.VisitIdentity, path.DetectCurves)
+                {ConcentricSource=path.ConcentricSource}).ToList();
     }
 
     /// <summary>Certifies physical wall clearance on the actual float/F3 cutting chords.</summary>
@@ -2758,6 +2811,7 @@ internal static class VCarveSmoothing
             PolygonOps.BoundarySegmentIndex Inside)> _domains = new();
         private readonly VCarveCutterProfile _profile;
         private readonly double _surface;
+        private readonly VCarveMaterialSurface? _stockContact;
         private readonly CancellationToken _token;
         private readonly Action<string>? _diagnostic;
         private readonly long _maximumPoints;
@@ -2922,23 +2976,23 @@ internal static class VCarveSmoothing
         internal CommandClearance(IReadOnlyList<IReadOnlyList<PointD>> boundary,
             VCarveCutterProfile profile, double surface, CancellationToken token, Action<string>? diagnostic,
             IReadOnlyList<IReadOnlyList<PointD>>? originalChannel = null, long maximumPoints = MaximumPoints,
-            bool useChordCache = true, int maximumCachedChords = MaximumChordCacheEntries)
+            bool useChordCache = true, int maximumCachedChords = MaximumChordCacheEntries, VCarveMaterialSurface? stockContact = null)
             : this(boundary, profile, surface, token, diagnostic, originalChannel, maximumPoints,
-                useChordCache, maximumCachedChords, null) { }
+                useChordCache, maximumCachedChords, null, stockContact) { }
 
         internal CommandClearance(IReadOnlyList<IReadOnlyList<PointD>> boundary,
             VCarveCutterProfile profile, double surface, CancellationToken token, Action<string>? diagnostic,
             IReadOnlyList<IReadOnlyList<PointD>> originalChannel, long maximumPoints,
             CommandClearance artworkProofOwner)
             : this(boundary, profile, surface, token, diagnostic, originalChannel, maximumPoints,
-                true, MaximumChordCacheEntries, artworkProofOwner) { }
+                true, MaximumChordCacheEntries, artworkProofOwner, artworkProofOwner._stockContact) { }
 
         private CommandClearance(IReadOnlyList<IReadOnlyList<PointD>> boundary,
             VCarveCutterProfile profile, double surface, CancellationToken token, Action<string>? diagnostic,
             IReadOnlyList<IReadOnlyList<PointD>>? originalChannel, long maximumPoints,
-            bool useChordCache, int maximumCachedChords, CommandClearance? artworkProofOwner)
+            bool useChordCache, int maximumCachedChords, CommandClearance? artworkProofOwner, VCarveMaterialSurface? stockContact)
         {
-            _profile = profile; _surface = surface; _token = token; _diagnostic = diagnostic;
+            _profile = profile; _surface = surface; _token = token; _diagnostic = diagnostic; _stockContact = stockContact;
             _maximumPoints = maximumPoints;
             if (maximumCachedChords < 0 || maximumCachedChords > MaximumChordCacheEntries)
                 throw new ArgumentOutOfRangeException(nameof(maximumCachedChords));
@@ -3000,12 +3054,15 @@ internal static class VCarveSmoothing
             var integer = new Point64((long)Math.Round(command.X * PathUtils.Scale),
                 (long)Math.Round(command.Y * PathUtils.Scale));
             double clearance = double.PositiveInfinity;
-            foreach (var domain in _domains)
+            for(int i=0;i<_domains.Count;i++)
             {
+                if(i==0&&_stockContact is not null)continue;
+                var domain=_domains[i];
                 if (!domain.Inside.IsInside(integer)) { clearance = 0; break; }
                 clearance = Math.Min(clearance, domain.Boundary.QueryDistance(command.X, command.Y));
             }
             allowed = _profile.DepthAtRadius(Math.Max(0, clearance - 2 / PathUtils.Scale));
+            if(_stockContact is not null)allowed=Math.Min(allowed,_stockContact.AllowedDepth(command.X,command.Y));
             _depthCaps[(command.X, command.Y)] = allowed;
             return allowed;
         }
@@ -3055,6 +3112,11 @@ internal static class VCarveSmoothing
             {
                 var domain = _domains[domainOrdinal];
                 if (domainOrdinal == 0 && _reuseThisArtworkChord) continue;
+                if(domainOrdinal==0&&_stockContact is not null)
+                {
+                    if(!_stockContact.IsLegalChord(ca,cb)){violation=true;witness=.5;break;}
+                    continue;
+                }
                 LiteralChordDomainQueries++;
                 if (domainOrdinal == 0) ArtworkLiteralChordQueries++; else ChannelLiteralChordQueries++;
                 if (domain.Boundary.TryFindDepthViolation(ca, cb, 0, 0, 1, 0, out witness, _profile))
@@ -3165,7 +3227,8 @@ internal static class VCarveSmoothing
                     points.Add(selected);
                 }
                 result.Add(new TaggedToolpath(points, Array.Empty<ToolpathSpan>(), path.RegionIndex, path.Category,
-                    path.DepthPassIndex, path.VisitIdentity, detectCurves: false));
+                    path.DepthPassIndex, path.VisitIdentity, detectCurves: false)
+                    {ConcentricSource=path.ConcentricSource});
             }
             _diagnostic?.Invoke($"stage=smooth-command-centers adjusted={adjusted} unresolved={unresolved} " +
                 $"maximumMove={maximumMove:R} expandedSearches={expandedSearches} gridStep=0.001 " +
@@ -3230,7 +3293,8 @@ internal static class VCarveSmoothing
                 // This pre-routing stage contains cutting traces only. Entries
                 // and their indexed spans are materialized by the router later.
                 result.Add(new TaggedToolpath(output, Array.Empty<ToolpathSpan>(), path.RegionIndex, path.Category,
-                    path.DepthPassIndex, path.VisitIdentity, detectCurves: false));
+                    path.DepthPassIndex, path.VisitIdentity, detectCurves: false)
+                    {ConcentricSource=path.ConcentricSource});
 
                 void Prove(Point3D a, Point3D b, int level)
                 {
@@ -3325,6 +3389,8 @@ internal static class VCarveSmoothing
         }
         private readonly record struct Work(Node? Tree, int Segment, double Lo, double Hi,bool EndpointCertificate=false);
         private readonly Segment[] _segments;
+        private readonly Lazy<PolygonOps.BoundarySegmentIndex>? _crestChordIndex;
+        private long _crestChordQueries, _crestChordAccepted;
         private readonly Lazy<Node> _root;
         private readonly int[] _originalSources;
         private readonly Node? _generalRoot,_endpointRoot;
@@ -3392,6 +3458,7 @@ internal static class VCarveSmoothing
         private readonly int _representedEndpointSources;
         private long _endpointTreeQueries,_endpointTreeFallbacks;
         internal string QueryScratchDiagnostics =>
+            $"crestChordQueries={_crestChordQueries} crestChordAccepted={_crestChordAccepted} " +
             $"floorQueryCacheHits={_queryCacheHits} floorQueryMisses={_queryMisses} " +
             $"floorQueueCreated={_queryQueueCreated} floorQueueReused={_queryQueueReused} " +
             $"floorQueueLiteralFallbacks={_queryQueueLiteralFallbacks} floorQueueOversizeDrops={_queryQueueOversizeDrops} " +
@@ -3418,6 +3485,9 @@ internal static class VCarveSmoothing
                 section.Kind == CarvingCutterSectionKind.Hemisphere || section.TopRadius == section.BottomRadius
                 || section.Height / (section.TopRadius - section.BottomRadius) >= grade);
             _segments = paths.SelectMany(path => path.Points.Zip(path.Points.Skip(1), (a, b) => new Segment(a, b))).ToArray();
+            if (_segments.All(s => s.A.Z == 0 && s.B.Z == 0 && CrestDomain(s.A) && CrestDomain(s.B)))
+                _crestChordIndex = new(() => new PolygonOps.BoundarySegmentIndex(new Paths64(_segments.Select(s =>
+                    new Path64 { CrestPoint(s.A), CrestPoint(s.B) }))));
             if (_segments.Length == 0) throw new ArgumentException("A smooth floor requires a medial cutting segment.");
             // The endpoint/general trees own every source in the admitted
             // query domain. Keep the complete original tree available without
@@ -3516,6 +3586,7 @@ internal static class VCarveSmoothing
         private FloorField(FloorField source)
         {
             _segments=source._segments;_root=source._root;_generalRoot=source._generalRoot;_endpointRoot=source._endpointRoot;
+            _crestChordIndex=source._crestChordIndex;
             _originalSources=source._originalSources;
             _treePartitionVisits=source._treePartitionVisits;
             _generalSources=source._generalSources;_endpointSources=source._endpointSources;
@@ -3616,13 +3687,13 @@ internal static class VCarveSmoothing
                 if(batch.Count==batchLimit||total+batch.Count>=maximumNewQueries){Flush();if(total>=maximumNewQueries)break;}
             }
             Flush();
-            if(total>0)diagnostic?.Invoke($"stage=smooth-floor event=prepared-queries scope={scope} queries={total} workers={Math.Min(4,GeometryParallelism.WorkerLimit)} "
+            if(total>0)diagnostic?.Invoke($"stage=smooth-floor event=prepared-queries scope={scope} queries={total} workers={Math.Min(8,GeometryParallelism.WorkerLimit)} "
                 +$"batchLimit={batchLimit} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} immutableSourceShared=True privateQueryState=True originalContourOrder=True proofBudgetsUnchanged=True");
             return total;
             void Flush()
             {
                 if(batch.Count<1024){batch.Clear();return;}
-                var inputs=batch.ToArray();int count=Math.Min(4,GeometryParallelism.WorkerLimit);
+                var inputs=batch.ToArray();int count=Math.Min(8,GeometryParallelism.WorkerLimit);
                 var workers=Enumerable.Range(0,count).Select(_=>new FloorField(this)).ToArray();
                 Parallel.For(0,count,new ParallelOptions{MaxDegreeOfParallelism=count,CancellationToken=_cancellationToken},worker=>{
                     using var owned=GeometryParallelism.EnterWorker();
@@ -3705,6 +3776,37 @@ internal static class VCarveSmoothing
                 height += section.Height;
             }
             return Math.Max(0, best);
+        }
+
+        private static Point64 CrestPoint(Point3D point) => new(
+            (long)Math.Round(point.X * PathUtils.Scale), (long)Math.Round(point.Y * PathUtils.Scale));
+
+        private static bool CrestDomain(Point3D point) => double.IsFinite(point.X + point.Y)
+            && Math.Max(Math.Abs(point.X), Math.Abs(point.Y)) <= 1_000_000;
+
+        internal bool ProveCrestChord(Point3D a, Point3D b)
+        {
+            if (_crestChordIndex is null) return false;
+            _cancellationToken.ThrowIfCancellationRequested();
+            double requested = Math.Max(-a.Z, -b.Z);
+            if (!double.IsFinite(requested) || requested > _maximumDepth
+                || !CrestDomain(a) || !CrestDomain(b))
+                return false;
+            if (requested <= 0) return true;
+            _crestChordQueries++;
+            // For constant zero-height crests, the entire tip floor sublevel
+            // is the crest buffered by the existing inverse physical support.
+            // Clearance of the whole XY chord at its deepest endpoint therefore
+            // proves every interpolated depth too. Inflate for BOTH source and
+            // query integer rounding; a refusal uses the original chord proof.
+            double radius = SmoothRoughingPlateau.ExclusionRadius(requested, _grade, _profile)
+                + _profile.TipRadius;
+            if (!double.IsFinite(radius) || radius < 0) return false;
+            radius += 4 / PathUtils.Scale + 1e-10 * Math.Max(1, radius);
+            bool accepted = _crestChordIndex.Value.ClearanceViolation(CrestPoint(a), CrestPoint(b),
+                radius * PathUtils.Scale) is null;
+            if (accepted) _crestChordAccepted++;
+            return accepted;
         }
 
         internal double CappedDepth(double requested, double x, double y)

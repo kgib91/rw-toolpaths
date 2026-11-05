@@ -71,8 +71,8 @@ public class MedialAxisHoleContainmentTests
         Classifier.ClassifyEdges(indexed, outer, holes, diagnostic: logs.Add);
         Classifier.ClassifyEdgesReference(reference, outer, holes);
         Assert.Equal(reference.Select(edge => edge.Color), indexed.Select(edge => edge.Color));
-        Assert.Equal(Classifier.SelectInnerPrimaryTraversal(reference, Math.PI),
-            Classifier.SelectInnerPrimaryTraversal(indexed, Math.PI));
+        Assert.Equal(Classifier.SelectInnerPrimaryTraversal(reference),
+            Classifier.SelectInnerPrimaryTraversal(indexed));
         Assert.Contains(logs, line => line.Contains("event=containment") && line.Contains("memoHits="));
     }
 

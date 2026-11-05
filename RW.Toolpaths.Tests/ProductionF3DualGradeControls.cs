@@ -42,7 +42,7 @@ public sealed class ProductionF3DualGradeControls
         var compactMethod=typeof(VCarveToolpaths).GetMethod("CompactAndClamp",
             System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Static)!;
         var compacted=(List<Point3D>)compactMethod.Invoke(null,
-            new object[]{new[]{relativeA,relativeB},Surface,6.35,true})!;
+            new object[]{new[]{relativeA,relativeB},Surface,6.35,true,false})!;
         Assert.Equal(new[]{a,b},compacted);
         Assert.True(VCarveToolpaths.HasCommandedPenetration(compacted,Surface));
         var capturedPath=new TaggedToolpath(compacted,Array.Empty<ToolpathSpan>(),0,"clearing",null,detectCurves:false);

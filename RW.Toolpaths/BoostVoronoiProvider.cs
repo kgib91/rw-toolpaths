@@ -1,4 +1,4 @@
-﻿using Clipper2Lib;
+using Clipper2Lib;
 using System.Globalization;
 using System.Diagnostics;
 
@@ -15,12 +15,19 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
 {
     public static BoostVoronoiProvider CreateDefault() => new();
 
+    internal IReadOnlyList<MedialSegment> ConstructNominalMedialAxis(
+        IReadOnlyList<PointD> boundary, IReadOnlyList<IReadOnlyList<PointD>> holes,
+        double tolerance, double maxRadius, double cornerAngle, CancellationToken token,
+        Action<string>? diagnostic, Action<double, string, bool>? progress)
+        => ConstructCore(boundary, holes, tolerance, maxRadius, cornerAngle, true,
+            token, diagnostic, progress, false, nominalRadiusSampling: true);
+
     public IReadOnlyList<MedialSegment> ConstructMedialAxis(
         IReadOnlyList<PointD> boundary,
         IReadOnlyList<IReadOnlyList<PointD>> holes,
         double tolerance,
         double maxRadius,
-        double filteringAngle = 3 * Math.PI / 4,
+        double filteringAngle = Math.PI,
         bool useBigIntegers = true)
         => ConstructMedialAxis(boundary, holes, tolerance, maxRadius, filteringAngle,
             useBigIntegers, CancellationToken.None);
@@ -58,7 +65,8 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
         double tolerance, double maxRadius, double filteringAngle, bool useBigIntegers,
         CancellationToken cancellationToken, Action<string>? diagnostic,
         Action<double, string, bool>? progress, bool certifiedGeometricError,
-        BoundedLocalMedialEmitter.SourceCoordinates? sourceCoordinates = null)
+        BoundedLocalMedialEmitter.SourceCoordinates? sourceCoordinates = null,
+        bool nominalRadiusSampling = false)
     {
         cancellationToken.ThrowIfCancellationRequested();
         long t0 = PerfLog.Start();
@@ -128,7 +136,7 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
             cancellationToken.ThrowIfCancellationRequested();
             var output = RunPipeline(handle, segSites, scaledBoundary, scaledHoles,
                                      tolerance, maxRadius, filteringAngle, cancellationToken, diagnostic, progress,
-                                     certifiedGeometricError, sourceCoordinates, wideArrangement?.Scale ?? 1);
+                                     certifiedGeometricError, sourceCoordinates, wideArrangement?.Scale ?? 1, nominalRadiusSampling);
             PerfLog.Stop(
                 "BoostVoronoiProvider.ConstructMedialAxis",
                 t0,
@@ -155,7 +163,8 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
         Action<string>? diagnostic,
         Action<double, string, bool>? progress,
         bool certifiedGeometricError,
-        BoundedLocalMedialEmitter.SourceCoordinates? sourceCoordinates, long nativeScale = 1)
+        BoundedLocalMedialEmitter.SourceCoordinates? sourceCoordinates, long nativeScale = 1,
+        bool nominalRadiusSampling = false)
     {
         cancellationToken.ThrowIfCancellationRequested();
         long t0 = PerfLog.Start();
@@ -268,7 +277,7 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
         Console.WriteLine($"[BoostVoronoi.VertexObjects] mode={(referenceVertexAllocation ? "per-halfedge-reference" : "immutable-native-index")} "
             + $"vertices={vertexCount} endpointReferences={endpointReferences} "
             + $"allocatedObjects={(referenceVertexAllocation ? endpointReferences : vertexCount)} "
-            + "numericValues=unchanged nativeIndices=unchanged sourceOwners=unchanged");
+            + $"numericValues=unchanged nativeIndices=unchanged sourceOwners=unchanged");
 
         bool debugEnabled = IsMedialDebugEnabled();
 
@@ -283,69 +292,18 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
         progress?.Invoke(0.75, "Connecting medial edges", false);
         long traverseAt = Stopwatch.GetTimestamp();
 
-        List<int>? walkedUnfiltered = null;
-        List<int> walked;
-        int innerPrimaryCount = 0;
-
-        if (debugEnabled)
-        {
-            innerPrimaryCount = edgeData.Count(e => e.Color == MedialAxisEdgeClassifier.Colors.InnerPrimary);
-            walkedUnfiltered = MedialAxisEdgeClassifier.SelectInnerPrimaryTraversal(edgeData, Math.PI + 1e-6, cancellationToken);
-            walked = MedialAxisEdgeClassifier.SelectInnerPrimaryTraversal(edgeData, filteringAngle, cancellationToken, diagnostic,
-                progress is null ? null : fraction => progress(0.75 + 0.15 * fraction, "Connecting medial edges", false));
-        }
-        else
-        {
-            walked = MedialAxisEdgeClassifier.SelectInnerPrimaryTraversal(edgeData, filteringAngle, cancellationToken, diagnostic,
-                progress is null ? null : fraction => progress(0.75 + 0.15 * fraction, "Connecting medial edges", false));
-        }
-
+        var walked = MedialAxisEdgeClassifier.SelectInnerPrimaryTraversal(edgeData, cancellationToken, diagnostic,
+            progress is null ? null : fraction => progress(0.75 + 0.15 * fraction, "Connecting medial edges", false));
         PerfLog.Stop("BoostVoronoiProvider.TraverseEdges", traverseAt, $"edges={edgeCount} walked={walked.Count}");
-        diagnostic?.Invoke($"stage=voronoi-traversal event=complete walked={walked.Count} elapsedMs={Stopwatch.GetElapsedTime(traverseAt).TotalMilliseconds:F2}");
-        if (debugEnabled)
-        {
-            var walkedSet = new HashSet<int>(walked);
-            var angleFilteredIndices = walkedUnfiltered!
-                .Where(idx => !walkedSet.Contains(idx))
-                .ToList();
-            var angleFilteredEdges = angleFilteredIndices
-                .Select(idx => edgeData[idx])
-                .ToList();
-
-            int filteredLinear = angleFilteredEdges.Count(e => e.IsLinear);
-            int filteredCurved = angleFilteredEdges.Count(e => e.IsCurved);
-            int filteredPointPoint = angleFilteredEdges.Count(e => e.Cell.ContainsPoint && e.TwinCell.ContainsPoint);
-            int filteredPointSegment = angleFilteredEdges.Count(e => e.Cell.ContainsPoint ^ e.TwinCell.ContainsPoint);
-            int filteredSegmentSegment = angleFilteredEdges.Count(e => !e.Cell.ContainsPoint && !e.TwinCell.ContainsPoint);
-
-            var filteredAngles = angleFilteredIndices
-                .Select(idx => TryGetCellsAngleForDebug(edgeData[idx]))
-                .Where(a => a.HasValue)
-                .Select(a => a!.Value)
-                .ToList();
-
-            string angleStats = filteredAngles.Count > 0
-                ? string.Create(
-                    CultureInfo.InvariantCulture,
-                    $"min={filteredAngles.Min():F6} avg={filteredAngles.Average():F6} max={filteredAngles.Max():F6}")
-                : "min=na avg=na max=na";
-
-            Console.Error.WriteLine(
-                string.Create(
-                    CultureInfo.InvariantCulture,
-                    $"[medial-axis][boost] edges total={edgeCount} primary={edgeData.Count(e => e.IsPrimary)} secondary={edgeData.Count(e => e.IsSecondary)} finite={edgeData.Count(e => !e.IsInfinite)} innerPrimary={innerPrimaryCount} walkedUnfiltered={walkedUnfiltered!.Count} walkedFiltered={walked.Count} angleFiltered={Math.Max(0, walkedUnfiltered.Count - walked.Count)} filteringAngle={filteringAngle:F6}"));
-            Console.Error.WriteLine(
-                string.Create(
-                    CultureInfo.InvariantCulture,
-                    $"[medial-axis][boost] angleFilteredBreakdown linear={filteredLinear} curved={filteredCurved} pointPoint={filteredPointPoint} pointSegment={filteredPointSegment} segmentSegment={filteredSegmentSegment}"));
-            Console.Error.WriteLine($"[medial-axis][boost] angleFilteredStats {angleStats}");
-        }
+        diagnostic?.Invoke($"stage=voronoi-traversal event=complete walked={walked.Count} "
+            + $"elapsedMs={Stopwatch.GetElapsedTime(traverseAt).TotalMilliseconds:F2} anglePruning=False");
 
         // maxRadius is already in the same coordinate scale domain as the inputs.
         double emitMaxRadius = maxRadius > 0 ? maxRadius : -1.0;
         // CentralAngle tolerance is in radians â€” scale-invariant, pass as-is.
 
         var rawOutput = new List<MedialSegment>(walked.Count);
+        int cornerRejected = 0;
         int skippedNullVertices = 0;
         int emitRejected = 0;
         int sourceCertifiedCurves = 0, sourceCertifiedLinear = 0, sourceFallbacks = 0;
@@ -370,6 +328,11 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
                 }
             }
             var edge = edgeData[idx];
+            // The requested construction policy acts on the two generating
+            // segments, never on branch length or the appearance of output.
+            if (filteringAngle < Math.PI && MedialAxisEdgeClassifier.SharedCornerAngle(edge) is { } angle
+                && angle > filteringAngle)
+            { cornerRejected++; continue; }
             if (edge.Vertex0 is null || edge.Vertex1 is null)
             {
                 skippedNullVertices++;
@@ -396,7 +359,7 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
                     Console.WriteLine($"[Offset.Terminal.SourceEmissionFallback] edge={idx} reason={failure} pieces={visited} "
                         + $"first=({edge.Vertex0.X:R},{edge.Vertex0.Y:R}) last=({edge.Vertex1.X:R},{edge.Vertex1.Y:R}) "
                         + $"curved={edge.IsCurved} decision=complete-angular-edge partialPublished=False "
-                        + "originalSites=True originalOwner=True wallAuthority=unchanged");
+                        + $"originalSites=True originalOwner=True wallAuthority=unchanged");
             }
 
             bool emitted = MedialAxisSegmentEmitter.TryCreateOutputSegments(
@@ -407,7 +370,8 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
                 method:     certifiedGeometricError ? MedialAxisSegmentEmitter.ParabolaDiscretizationMethod.Error2D
                     : MedialAxisSegmentEmitter.ParabolaDiscretizationMethod.CentralAngle,
                 maxRadius:  emitMaxRadius,
-                rejectIncompleteDiscretization: certifiedGeometricError);
+                rejectIncompleteDiscretization: certifiedGeometricError,
+                samplePointPointRadius: nominalRadiusSampling);
 
             if (!emitted)
             {
@@ -462,6 +426,7 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
             t0,
             $"edges={edgeCount} vertices={vertexCount} cells={cellCount} out={rawOutput.Count}");
 
+        diagnostic?.Invoke($"stage=voronoi-construction cornerAngleRadians={filteringAngle:R} cornerRejected={cornerRejected} sourceSegmentTest=True");
         return rawOutput;
     }
 
@@ -508,49 +473,6 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
         }
 
         return (degrees.Count, degree1, branch);
-    }
-
-    private static double? TryGetCellsAngleForDebug(MedialAxisEdgeClassifier.EdgeData edge)
-    {
-        if (edge.Cell.ContainsPoint || edge.TwinCell.ContainsPoint)
-            return null;
-
-        var left = edge.Cell.Segment;
-        var right = edge.TwinCell.Segment;
-        if (left is null || right is null)
-            return null;
-
-        if (EqualPoints(left.Low, right.Low))
-            return Angle(left.High, left.Low, right.High);
-        if (EqualPoints(left.High, right.Low))
-            return Angle(left.Low, left.High, right.High);
-        if (EqualPoints(left.Low, right.High))
-            return Angle(left.High, left.Low, right.Low);
-        if (EqualPoints(left.High, right.High))
-            return Angle(left.Low, left.High, right.Low);
-
-        return null;
-    }
-
-    private static bool EqualPoints(MedialAxisEdgeClassifier.EdgePoint a, MedialAxisEdgeClassifier.EdgePoint b) =>
-        Math.Abs(a.X - b.X) < 1e-5 && Math.Abs(a.Y - b.Y) < 1e-5;
-
-    private static double Angle(
-        MedialAxisEdgeClassifier.EdgePoint a,
-        MedialAxisEdgeClassifier.EdgePoint pivot,
-        MedialAxisEdgeClassifier.EdgePoint b)
-    {
-        double ax = a.X - pivot.X;
-        double ay = a.Y - pivot.Y;
-        double bx = b.X - pivot.X;
-        double by = b.Y - pivot.Y;
-
-        double dot = ax * bx + ay * by;
-        double denom = Math.Sqrt((ax * ax + ay * ay) * (bx * bx + by * by));
-        if (denom <= 0)
-            return 0;
-
-        return Math.Acos(Math.Clamp(dot / denom, -1.0, 1.0));
     }
 
     // -- CellSite reconstruction -----------------------------------------------
@@ -652,7 +574,7 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
             + $"candidatePairs={arrangement.CandidatePairs} nodeVisits={arrangement.NodeVisits} "
             + $"buildMs={arrangement.BuildMilliseconds:F2} queryMs={arrangement.QueryMilliseconds:F2} "
             + $"certificateMs={arrangement.CertificateMilliseconds:F2} elapsedMs={Stopwatch.GetElapsedTime(arrangementAt).TotalMilliseconds:F2} "
-            + "completeOriginalFiniteUnion=True originalSubchainsVerified=True originalOwnerMappings=True originalSignedRings=True geometryDisplacement=0");
+            + $"completeOriginalFiniteUnion=True originalSubchainsVerified=True originalOwnerMappings=True originalSignedRings=True geometryDisplacement=0");
         return result;
 
         static void AddRing(List<SegmentSiteData> list, IReadOnlyList<PointD> ring)
@@ -692,5 +614,3 @@ public sealed partial class BoostVoronoiProvider : IMedialAxisProvider
         return result;
     }
 }
-
-

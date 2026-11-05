@@ -118,6 +118,7 @@ public sealed class VCarveSphereConsolidationGuardTests
         using var output = new StringWriter(CultureInfo.InvariantCulture);
         try
         {
+            using var logSelection = RW.Diagnostics.DiagnosticLog.PushNamespaces("*");
             Console.SetOut(output);
             return VCarvePhysicalSweep.Build(paths, profile, surface, .00075,
                 upperBound: upper, consolidateHemisphereChords: enabled);

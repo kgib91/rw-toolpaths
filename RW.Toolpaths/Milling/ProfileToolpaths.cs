@@ -29,6 +29,9 @@ public sealed record TabOptions
 /// <summary>Configuration for contour/profile milling.</summary>
 public sealed record ProfileOptions
 {
+    /// <summary>Common machine rates, transfer plane and optional earlier-stock proof.
+    /// Null retains geometric routing when machine context is unavailable.</summary>
+    public MillingMotionSettings? Motion { get; init; }
     public ProfileSide Side { get; init; } = ProfileSide.Outside;
 
     /// <summary>
@@ -181,7 +184,7 @@ public static class ProfileToolpaths
 
         // Run the common execution policy AFTER optional clipping. A deleted
         // outside fragment cannot remain an earlier-execution witness.
-        var executed=ToolpathContinuationPlanner.Reconnect(plan.Toolpaths,"profile",2*tool.Radius,cancellationToken);
+        var executed=ToolpathContinuationPlanner.Reconnect(plan.Toolpaths,"profile",2*tool.Radius,cancellationToken,motion:options.Motion,surface:depth.SurfaceZ);
         return new ToolpathPlan(
             executed,
             plan.SweptArea.ToList(),

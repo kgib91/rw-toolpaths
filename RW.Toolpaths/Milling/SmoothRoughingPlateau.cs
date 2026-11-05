@@ -302,7 +302,7 @@ internal static class SmoothRoughingPlateau
                 + $"queries={discCoverage.Queries} candidates={discCoverage.Candidates} pruned={containedPrimitives} "
                 + $"priorDiscTrials={discCoverage.PriorDiscTrials} priorDiscWins={discCoverage.PriorDiscWins} "
                 + $"wholeSourceChordsPruned={containedSourceChords} "
-                + "authority=integer-convex-subset-of-published-disc sourceGradeAndSupportUnchanged=True");
+                + $"authority=integer-convex-subset-of-published-disc sourceGradeAndSupportUnchanged=True");
         }
         DrainLeaves();
         foreach (var group in constant)
@@ -327,26 +327,53 @@ internal static class SmoothRoughingPlateau
                     +$"integerScale={PathUtils.Scale:R} maximumChunkEdges=256 literalEdgesPreserved=True noNewConnections=True sameRoundDiskSweep=True");
             }
             Console.WriteLine($"[Pocket.SmoothRoughing.Plateau] event=buffer-start radius={group.Key:R} paths={strokes.Count} points={strokes.Sum(p => p.Count)}");
+            Paths64 OffsetConstant(Paths64 input)
+            {
+                var offset = new ClipperOffset(2, arc * PathUtils.Scale);
+                offset.AddPaths(input, JoinType.Round, EndType.Round);
+                var buffered = new Paths64();
+                offset.Execute((group.Key + reserve) * PathUtils.Scale, buffered);
+                return buffered;
+            }
+            using var constantOffsets = parallelLeafUnions && GeometryParallelism.WorkerLimit > 1
+                && strokes.Sum(p=>(long)p.Count)>=8192
+                ? new VCarveOrderedUnionQueue(token,GeometryParallelism.WorkerLimit,OffsetConstant,
+                    maximumPathsPerLeaf:128) : null;
+            var constantSlots = new List<VCarveOrderedUnionQueue.Slot>();
             long bufferedPoints = 0;
+            void PublishConstant(Paths64 buffered)
+            { bufferedPoints += buffered.Sum(p=>(long)p.Count); KeepBatch(buffered); }
+            void DrainConstants()
+            {
+                if(constantOffsets is null || constantSlots.Count==0)return;
+                constantOffsets.Drain();
+                foreach(var slot in constantSlots)PublishConstant(constantOffsets.ReadDrained(slot));
+                constantSlots.Clear();
+            }
             for (int first = 0; first < strokes.Count;)
             {
                 token.ThrowIfCancellationRequested();
                 int last=first,vertices=0;
                 do{vertices+=strokes[last++].Count;}
                 while(last<strokes.Count&&last-first<leafSize&&vertices+strokes[last].Count<=2048);
-                var offset = new ClipperOffset(2, arc * PathUtils.Scale);
-                offset.AddPaths(new Paths64(strokes.Skip(first).Take(last-first)), JoinType.Round, EndType.Round);
-                var buffered = new Paths64();
                 // Same round primitives, bounded leaf unions: avoid constructing
                 // one arrangement containing thousands of overlapping end caps.
                 // Round joins are inscribed, so pay their sagitta and integer
                 // arithmetic before using the result as an exclusion.
-                offset.Execute((group.Key + reserve) * PathUtils.Scale, buffered);
-                bufferedPoints += buffered.Sum(p => (long)p.Count);
-                KeepBatch(buffered);
+                var input = new Paths64(strokes.Skip(first).Take(last-first));
+                if(constantOffsets is null)PublishConstant(OffsetConstant(input));
+                else
+                {
+                    constantSlots.Add(constantOffsets.Submit(input));
+                    if(constantSlots.Count==constantOffsets.WorkerCount)DrainConstants();
+                }
                 first=last;
             }
-            Console.WriteLine($"[Pocket.SmoothRoughing.Plateau] event=buffer-complete radius={group.Key:R} points={bufferedPoints} leafPaths={leafSize} elapsedMs={Stopwatch.GetElapsedTime(offsetStarted).TotalMilliseconds:F2}");
+            DrainConstants();constantOffsets?.Complete();
+            Console.WriteLine($"[Pocket.SmoothRoughing.Plateau] event=buffer-complete radius={group.Key:R} points={bufferedPoints} leafPaths={leafSize} "
+                +$"elapsedMs={Stopwatch.GetElapsedTime(offsetStarted).TotalMilliseconds:F2} offsetWorkers={constantOffsets?.WorkerCount??1} "
+                +$"offsetComputeMs={constantOffsets?.ComputeMilliseconds??0:F1} offsetWaitMs={constantOffsets?.WaitMilliseconds??0:F1} "
+                +$"offsetRetainedInputBytes={constantOffsets?.PeakRetainedInputBytes??0} originalIntegerOperandsAndHierarchy=True");
         }
         if(targetPaths==null) batches.AddRange(pending); else UnionLeaf(pending);
         DrainLeaves();leafUnions?.Complete();

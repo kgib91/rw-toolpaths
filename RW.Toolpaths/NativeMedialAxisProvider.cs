@@ -1,4 +1,4 @@
-﻿using Clipper2Lib;
+using Clipper2Lib;
 using MIConvexHull;
 
 namespace RW.Toolpaths;
@@ -21,7 +21,7 @@ public sealed class NativeMedialAxisProvider : IMedialAxisProvider
         IReadOnlyList<IReadOnlyList<PointD>> holes,
         double tolerance,
         double maxRadius,
-        double filteringAngle = 3 * Math.PI / 4,
+        double filteringAngle = Math.PI,
         bool useBigIntegers = true)
     {
         if (boundary is null) throw new ArgumentNullException(nameof(boundary));
@@ -203,81 +203,6 @@ public sealed class NativeMedialAxisProvider : IMedialAxisProvider
         }
     }
 
-    private static bool PassesCellAngleFilter(
-        (double X, double Y) p0,
-        (double X, double Y) p1,
-        IReadOnlyList<(PointD A, PointD B)> segments,
-        double filteringAngle)
-    {
-        // Approximate JS get_cells_angle by using the two nearest segment sites.
-        var midX = (p0.X + p1.X) * 0.5;
-        var midY = (p0.Y + p1.Y) * 0.5;
-
-        var nearest = segments
-            .Select(s => (seg: s, dist: DistancePointToSegment(midX, midY, s.A.x, s.A.y, s.B.x, s.B.y)))
-            .OrderBy(x => x.dist)
-            .Take(2)
-            .ToArray();
-
-        if (nearest.Length < 2)
-            return true;
-
-        var s1 = nearest[0].seg;
-        var s2 = nearest[1].seg;
-
-        if (!TryGetSharedEndpoint(s1, s2, out var pivot))
-            return true;
-
-        // JS applies this angle test to Voronoi segment-cells that truly share
-        // a boundary vertex. Our nearest-segment approximation can pair unrelated
-        // edges in the interior, so only enforce angle pruning near that corner.
-        double midPivotDistance = Math.Sqrt((midX - pivot.x) * (midX - pivot.x) + (midY - pivot.y) * (midY - pivot.y));
-        double d0 = nearest[0].dist;
-        double d1 = nearest[1].dist;
-        if (d0 <= 1e-9 || d1 <= 1e-9)
-            return true;
-        if (d0 > d1 * 2.0 || d1 > d0 * 2.0)
-            return true;
-        if (midPivotDistance > Math.Max(d0, d1) * 1.5)
-            return true;
-
-        var a = !PointsEqual(s1.A, pivot) ? s1.A : s1.B;
-        var b = !PointsEqual(s2.A, pivot) ? s2.A : s2.B;
-
-        double v1x = a.x - pivot.x;
-        double v1y = a.y - pivot.y;
-        double v2x = b.x - pivot.x;
-        double v2y = b.y - pivot.y;
-
-        double n1 = Math.Sqrt(v1x * v1x + v1y * v1y);
-        double n2 = Math.Sqrt(v2x * v2x + v2y * v2y);
-        if (n1 <= 1e-9 || n2 <= 1e-9)
-            return true;
-
-        double dot = (v1x * v2x + v1y * v2y) / (n1 * n2);
-        dot = Math.Clamp(dot, -1.0, 1.0);
-        double angle = Math.Acos(dot);
-
-        return angle <= filteringAngle;
-    }
-
-    private static bool TryGetSharedEndpoint(
-        (PointD A, PointD B) s1,
-        (PointD A, PointD B) s2,
-        out PointD shared)
-    {
-        if (PointsEqual(s1.A, s2.A)) { shared = s1.A; return true; }
-        if (PointsEqual(s1.A, s2.B)) { shared = s1.A; return true; }
-        if (PointsEqual(s1.B, s2.A)) { shared = s1.B; return true; }
-        if (PointsEqual(s1.B, s2.B)) { shared = s1.B; return true; }
-
-        shared = default;
-        return false;
-    }
-
-    private static bool PointsEqual(PointD a, PointD b)
-        => Math.Abs(a.x - b.x) <= 1e-9 && Math.Abs(a.y - b.y) <= 1e-9;
-
     private static IEnumerable<MedialSegment> PostProcessSegments(
         IReadOnlyList<MedialSegment> segments,
         IReadOnlyList<PointD> boundary,
@@ -417,4 +342,3 @@ public sealed class NativeMedialAxisProvider : IMedialAxisProvider
         public int GetHashCode(T obj) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
     }
 }
-

@@ -24,6 +24,7 @@ internal sealed class ClearedColumnStock
         internal double Milliseconds;
     }
     private readonly UnionPreparation preparation = new();
+    private readonly FloorPrefixCache? floorPrefixCache;
     private readonly CancellationToken token;
     private const double Reserve = 1e-8;
     private const int MaximumPoses = 500_000;
@@ -55,9 +56,11 @@ internal sealed class ClearedColumnStock
         PoseBudgetReached = snapshot.PoseBudgetReached;
     }
 
-    internal ClearedColumnStock(IEnumerable<Column> source, CancellationToken token,int maximumQueries=2_000_000)
+    internal ClearedColumnStock(IEnumerable<Column> source, CancellationToken token,int maximumQueries=2_000_000,
+        FloorPrefixCache? floorPrefixCache=null)
     {
         this.token = token;
+        this.floorPrefixCache = floorPrefixCache;
         this.maximumQueries=maximumQueries;
         foreach (var group in source.GroupBy(c => c.Radius))
         {
@@ -160,19 +163,81 @@ internal sealed class ClearedColumnStock
     {
         long started = Stopwatch.GetTimestamp();
         floor.Built = true;
-        var segments = floor.Source.Select(c => new PocketPostedChordChains.Segment(
+        if (floorPrefixCache is not null)
+        {
+            floor.Region = floorPrefixCache.Build(floor.Source, floor.Radius, floor.Floor, token);
+            preparation.Builds++; preparation.Chords += floor.Source.Length;
+            preparation.Milliseconds += Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            floor.Source = Array.Empty<Column>();
+            return;
+        }
+        var paths = FloorChains(floor.Source, token, out int uniqueEdges);
+        if (paths.Count > 0) floor.Region = PostedSweepInnerRegion.Build(paths, floor.Radius, token);
+        preparation.Builds++; preparation.Chords += uniqueEdges;
+        preparation.Milliseconds += Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        floor.Source = Array.Empty<Column>();
+    }
+
+    private static Paths64 FloorChains(IEnumerable<Column> source, CancellationToken token, out int uniqueEdges)
+    {
+        var rows = source.ToArray();
+        var segments = rows.Select(c => new PocketPostedChordChains.Segment(
             new((long)Math.Round(c.A.X * 1000), (long)Math.Round(c.A.Y * 1000)),
             new((long)Math.Round(c.B.X * 1000), (long)Math.Round(c.B.Y * 1000)))).ToArray();
         var chains = PocketPostedChordChains.Build(segments, token);
+        uniqueEdges = chains.UniqueEdges;
         var paths = new Paths64(chains.Paths.Select(path => new Path64(path.Select(p =>
             Quantize(p.X / 1000d, p.Y / 1000d)))));
         // Stationary real poses also own physical stock columns.
-        paths.AddRange(floor.Source.Where(c => c.A.X == c.B.X && c.A.Y == c.B.Y)
+        paths.AddRange(rows.Where(c => c.A.X == c.B.X && c.A.Y == c.B.Y)
             .Select(c => new Path64 { Quantize(c.A.X, c.A.Y) }));
-        if (paths.Count > 0) floor.Region = PostedSweepInnerRegion.Build(paths, floor.Radius, token);
-        preparation.Builds++; preparation.Chords += chains.UniqueEdges;
-        preparation.Milliseconds += Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-        floor.Source = Array.Empty<Column>();
+        return paths;
+    }
+
+    /// <summary>Append-only reuse of conservative unions from a single executed
+    /// prefix. A different floor, radius or source prefix resets the evidence.
+    /// It owns no future poses and does not replace the snapshot query budgets.</summary>
+    internal sealed class FloorPrefixCache
+    {
+        private Column[] source = Array.Empty<Column>();
+        private double radius, floor;
+        private Paths64 area = new();
+        private PolygonOps.BoundarySegmentIndex? region;
+        internal long AddedChords { get; private set; }
+        internal long ReusedChords { get; private set; }
+        internal int Builds { get; private set; }
+        internal int Resets { get; private set; }
+
+        internal void Reset()
+        {
+            source = Array.Empty<Column>(); area = new(); region = null;
+            Resets++;
+        }
+
+        internal PolygonOps.BoundarySegmentIndex? Build(Column[] current, double currentRadius,
+            double currentFloor, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            if (currentRadius != radius || currentFloor != floor || current.Length < source.Length
+                || !current.AsSpan(0, source.Length).SequenceEqual(source)) Reset();
+            radius = currentRadius; floor = currentFloor;
+            int previousCount = source.Length;
+            ReusedChords += previousCount;
+            if (current.Length == previousCount) return region;
+            var chains = FloorChains(current.Skip(previousCount), token, out _);
+            var addedArea = PostedSweepInnerRegion.BuildPaths(chains, radius, token);
+            // Both operands are inner bounds of REAL executed cutter solids.
+            // Joining their polygon unions cannot create a chord across a gap.
+            var operands = new Paths64(area);
+            operands.AddRange(addedArea);
+            var combined = Clipper.Union(operands, FillRule.NonZero);
+            token.ThrowIfCancellationRequested();
+            var combinedRegion = combined.Count > 0 ? new PolygonOps.BoundarySegmentIndex(combined) : null;
+            area = combined; region = combinedRegion; source = current;
+            AddedChords += current.Length - previousCount;
+            Builds++;
+            return region;
+        }
     }
 
     private static Point64 Quantize(double x, double y) => new(

@@ -155,13 +155,14 @@ internal static class ToolpathCircuitBuilder
 
     internal static List<TaggedToolpath> Build(IReadOnlyList<TaggedToolpath> source,
         Func<Point3D,Point3D,bool> allowsConnector,double proximity,CancellationToken token,
-        Action<string>? log=null,Point3D? start=null,double maximumGrade=double.PositiveInfinity)
+        Action<string>? log=null,Point3D? start=null,double maximumGrade=double.PositiveInfinity,
+        bool preserveSourceOrder=false,bool openCarrierReturn=false,bool literalPortalsOnly=false)
     {
         long started=Stopwatch.GetTimestamp();
-        bool Candidate(Point3D a,Point3D b)=>a==b || Math.Abs(a.Z-b.Z)<=maximumGrade*
+        bool Candidate(Point3D a,Point3D b)=>a==b || !literalPortalsOnly && Math.Abs(a.Z-b.Z)<=maximumGrade*
             Math.Sqrt((a.X-b.X)*(a.X-b.X)+(a.Y-b.Y)*(a.Y-b.Y));
         var assigned=ToolpathContinuationComponents.Assign(source,p=>p,allowsConnector,proximity,token,log,start,Candidate,
-            closeOpenStrokes:true);
+            closeOpenStrokes:!preserveSourceOrder,literalPortalsOnly:literalPortalsOnly);
         if(assigned.Count==0)return new();
         var plan=assigned[0].ContinuationPlan!;
         var vertexMaps=new Dictionary<Point3D,int>?[source.Count];
@@ -214,6 +215,16 @@ internal static class ToolpathCircuitBuilder
             if(edges.Count==0)continue;
             macroEdges+=edges.Count;
             requiredLength+=edges.Sum(e=>e.Length);
+            // Reserve a literal reverse-carrier macro before parity repair.
+            // Its internal vertices do not become graph exits: branches are
+            // serviced on the outward carrier. The source traversal owner may
+            // discard this final return after auditing all required cuts.
+            if(openCarrierReturn)
+            {
+                var carrier=source[component.Min(p=>p.owner)].Points;
+                if(carrier[0]!=carrier[^1])
+                {Add(carrier.Reverse().ToArray());duplicateLength+=edges[^1].Length;duplicates++;}
+            }
             var odd=Enumerable.Range(0,nodes.Count).Where(i=>(adjacency[i].Count&1)!=0).ToHashSet();
             var grid=new Dictionary<(long,long),List<int>>();
             (long,long) Cell(Point3D p)=>((long)Math.Floor(p.X/proximity),(long)Math.Floor(p.Y/proximity));
@@ -244,7 +255,7 @@ internal static class ToolpathCircuitBuilder
             // Repair parity on a MINIMUM spanning tree of the source macro
             // graph. An arbitrary DFS tree can choose a long cutting stroke
             // where a short proved connection completes the same cycle.
-            int root=Node(source[component.OrderBy(p=>plan.VisitOrder[p.owner]).First().owner].Points[0]);
+            int root=Node(source[component.OrderBy(p=>preserveSourceOrder?p.owner:plan.VisitOrder[p.owner]).First().owner].Points[0]);
             var parent=Enumerable.Repeat(-1,nodes.Count).ToArray();var parentEdge=new int[nodes.Count];
             var order=new List<int>();var frontier=new PriorityQueue<(int Node,int Parent,int Edge),double>();
             frontier.Enqueue((root,root,-1),0);
@@ -269,15 +280,17 @@ internal static class ToolpathCircuitBuilder
             var points=definition.AtDepth(double.PositiveInfinity,-1,token);
             routeChords+=points.Count-1;
             var representative=source[component.First().owner];
-            string category=component.Any(p=>p.path.Category=="final-carve")?"final-carve":representative.Category;
-            result.Add(new TaggedToolpath(points,Array.Empty<ToolpathSpan>(),representative.RegionIndex,category,null,detectCurves:false)
-                {ContinuationComponentIndex=component.Key,ContinuationCircuit=true,ContinuationCircuitDefinition=definition});
+            string category=!preserveSourceOrder&&component.Any(p=>p.path.Category=="final-carve")?"final-carve":representative.Category;
+            result.Add(new TaggedToolpath(points,Array.Empty<ToolpathSpan>(),representative.RegionIndex,category,
+                preserveSourceOrder?representative.DepthPassIndex:null,representative.VisitIdentity,detectCurves:false)
+                {ContinuationComponentIndex=component.Key,ContinuationCircuit=true,ContinuationCircuitDefinition=definition,
+                    ConcentricSource=representative.ConcentricSource});
         }
         log?.Invoke($"stage=source-circuits event=complete sourceVisits={source.Count} circuits={result.Count} "
             +$"certifiedConnectors={plan.Edges.Count} macroEdges={macroEdges} pairedEndpoints={paired} parityDuplicates={duplicates} "
             +$"pairingProofs={proofs} routeChords={routeChords} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F3} "
             +$"requiredLength={requiredLength:R} duplicateLength={duplicateLength:R} parityTree=minimum-spanning "
-            +"sourceChordGeometryRetained=True completedExcursionsPrunedBeforeDepthEmission=True emittedGraphSearch=False");
+            +$"literalPortalsOnly={literalPortalsOnly} sourceChordGeometryRetained=True completedExcursionsPrunedBeforeDepthEmission=True emittedGraphSearch=False");
         return result;
     }
 }

@@ -1,4 +1,4 @@
-﻿// --- AlgorithmParityTests.cs -------------------------------------------------
+// --- AlgorithmParityTests.cs -------------------------------------------------
 //
 // Tests the C# port of each JS algorithm function against known exact outputs
 // derived from running the equivalent JS code in test_toolpaths.js.
@@ -11,7 +11,7 @@
 //   x_  -> TrimSegment
 //   __  -> JoinSegments
 //   iC  -> JoinIntoPolylines
-//   gh  -> GenerateSimplifiedLayer (morphological pass)
+// Original-boundary quantization is checked separately; morphological cleanup is removed.
 //   rC  -> GenerateFlatAreaFill
 // -----------------------------------------------------------------------------
 
@@ -373,101 +373,26 @@ public class JoinIntoPolylinesTests
 }
 
 
-// --- GenerateSimplifiedLayer (gh = GM) ---------------------------------------
-public class GenerateSimplifiedLayerTests
+// --- Original boundary coordinate conditioning -------------------------------
+public class QuantizedMedialBoundaryTests
 {
-    // Build a simple axis-aligned rectangle (workspace coords, inches)
-    // 1" Ã— 0.5" centred at (0,0)
-    private static List<List<PointD>> MakeRect(double w = 1.0, double h = 0.5)
+    [Theory]
+    [InlineData(4096)]
+    [InlineData(8192)]
+    public void QuantizationRetainsEveryVertexOfANarrowOriginalNotch(double scale)
     {
-        double hw = w / 2, hh = h / 2;
-        return new List<List<PointD>>
-        {
-            new List<PointD>
-            {
-                new(-hw, -hh), new( hw, -hh),
-                new( hw,  hh), new(-hw,  hh), new(-hw, -hh),
-            }
-        };
+        double tick = 1 / scale;
+        IReadOnlyList<PointD> ring = new PointD[] { new(0,0), new(10,0), new(10,10),
+            new(5+tick,10), new(5+tick,5), new(5,5), new(5,10), new(0,10) };
+        var result = Assert.Single(MedialAxisToolpaths.QuantizeMedialBoundary(new[] { ring }, scale));
+        Assert.Equal(ring.Select(p => (p.x,p.y)), result.Select(p => (p.x,p.y)));
     }
 
-    // -- Non-null result for a valid rectangle at initial scale p_=4096
     [Fact]
-    public void ValidRect_ReturnsNonNull()
+    public void QuantizationDropsOnlyRingsWithoutThreeVertices()
     {
-        var result = MedialAxisToolpaths.GenerateSimplifiedLayer(MakeRect(), 4096);
-        Assert.NotNull(result);
-        Assert.NotEmpty(result!);
-    }
-
-    // -- Morphological pass must NOT destroy a 1"Ã—0.5" rectangle.
-    //    The contract+expand+contract uses delta = (16/32768)*scale = 2 Clipper units
-    //    at scale=4096.  That is ~0.000488" â€” much smaller than the rectangle.
-    [Fact]
-    public void MorphologicalPass_PreservesLargeShape()
-    {
-        var result = MedialAxisToolpaths.GenerateSimplifiedLayer(MakeRect(), 4096);
-
-        Assert.NotNull(result);
-        // Should still have at least one ring with at least 3 vertices
-        Assert.True(result!.Any(ring => ring.Count >= 3),
-            "Morphological smoothing must not destroy large polygons");
-    }
-
-    // -- Area should be approximately preserved (within a small fraction)
-    [Fact]
-    public void MorphologicalPass_ApproximatesOriginalArea()
-    {
-        var input  = MakeRect();
-        var result = MedialAxisToolpaths.GenerateSimplifiedLayer(input, 4096);
-
-        Assert.NotNull(result);
-
-        // Signed area of input rectangle (in workspace coords, should be 0.5 inÂ²)
-        double inputArea = Math.Abs(Clipper2Lib.Clipper.Area(
-            PathUtils.ToClipper(input.Select(r => r.Select(p => p)))[0])) /
-            (PathUtils.Scale * PathUtils.Scale);
-
-        // Signed area of output â€” sum all rings
-        double outputArea = result!.Sum(ring =>
-        {
-            var path = PathUtils.ToClipper(new[] { ring.Select(p => p) })[0];
-            return Math.Abs(Clipper2Lib.Clipper.Area(path));
-        }) / (PathUtils.Scale * PathUtils.Scale);
-
-        // Allow 1% area difference from morphological pass
-        Assert.True(Math.Abs(inputArea - outputArea) / inputArea < 0.01,
-            $"Area changed too much: input={inputArea:F6}, output={outputArea:F6}");
-    }
-
-    // -- Scale doubles (4096 -> 8192) -> morphDelta doubles too, shape still survives
-    [Fact]
-    public void DoubledScale_ShapeStillSurvives()
-    {
-        var result = MedialAxisToolpaths.GenerateSimplifiedLayer(MakeRect(), 8192);
-        Assert.NotNull(result);
-        Assert.Contains(result, ring => ring.Count >= 3);
-    }
-
-    // -- Tiny degenerate input (smaller than OFFSET_DISTANCE) -> null or empty
-    //    A 1e-4" Ã— 1e-4" square at scale=4096: after contracting by 0.000488"
-    //    the shape disappears entirely -> null/empty is correct JS behaviour (.clean())
-    [Fact]
-    public void TinyShape_ReturnsNullOrEmpty()
-    {
-        var tiny = new List<List<PointD>>
-        {
-            new List<PointD>
-            {
-                new(-5e-5, -5e-5), new( 5e-5, -5e-5),
-                new( 5e-5,  5e-5), new(-5e-5,  5e-5), new(-5e-5, -5e-5),
-            }
-        };
-
-        var result = MedialAxisToolpaths.GenerateSimplifiedLayer(tiny, 4096);
-        // Either null or all rings cleaned away
-        Assert.True(result is null || result.All(r => r.Count < 3),
-            "Tiny shape should be erased by morphological smoothing");
+        IReadOnlyList<PointD> line = new PointD[] { new(0,0), new(1,0) };
+        Assert.Empty(MedialAxisToolpaths.QuantizeMedialBoundary(new[] { line }, 4096));
     }
 }
 
@@ -803,5 +728,3 @@ public class PathUtilsParityTests
         Assert.True(Clipper.Area(defaultDir) < 0, "default should preserve winding");
     }
 }
-
-

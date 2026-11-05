@@ -13,7 +13,7 @@ namespace RW.Toolpaths.Milling;
 /// pair that removes the long orphan hops a purely greedy walk leaves behind. The tour is open: the
 /// cutter never has to return to where it started.
 /// </remarks>
-public static class TravelOptimizer
+public static partial class TravelOptimizer
 {
     private const int MaxSamplesPerIsland = 16;
     private const int MinSamplesPerIsland = 2;

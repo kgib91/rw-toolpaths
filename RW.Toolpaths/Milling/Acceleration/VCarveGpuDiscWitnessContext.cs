@@ -113,8 +113,9 @@ internal sealed partial class VCarveGpuDiscWitnessContext : IDisposable
 
     internal static bool TryCreate(GpuDiscSegment[] segments, GpuDiscNode[] nodes,
         VCarveCutterProfile profile, CancellationToken cancellationToken, Action<string>? diagnostic,
-        out VCarveGpuDiscWitnessContext? context, out string reason)
+        out VCarveGpuDiscWitnessContext? context, out string reason, VCarveGenerationPolicy? policy = null)
     {
+        policy ??= VCarveGenerationPolicy.Capture();
         context = null; reason = "";
         cancellationToken.ThrowIfCancellationRequested();
         if (!ValidateGeometry(segments, nodes, profile, out reason)) return false;
@@ -136,7 +137,7 @@ internal sealed partial class VCarveGpuDiscWitnessContext : IDisposable
             candidate.DeviceName = Encoding.UTF8.GetString(name).TrimEnd('\0');
             Check(Driver.cuCtxCreate_v2(out candidate._context, 0, device), "context-create");
             long compilationStarted = Stopwatch.GetTimestamp();
-            candidate.UseGoldenReference = Environment.GetEnvironmentVariable("RW_TOOLPATHS_GPU_GOLDEN_REFERENCE") == "1";
+            candidate.UseGoldenReference = policy.GpuGoldenReference;
             byte[] ptx = CompileKernel(major, minor, candidate.UseGoldenReference, fp32: false, cancellationToken, out bool cacheHit);
             candidate.CompilationMilliseconds = Stopwatch.GetElapsedTime(compilationStarted).TotalMilliseconds;
             candidate.KernelCacheHit = cacheHit;
@@ -144,7 +145,7 @@ internal sealed partial class VCarveGpuDiscWitnessContext : IDisposable
             Check(Driver.cuModuleGetFunction(out candidate._function, candidate._module, "nominate_disc_witnesses"), "kernel-find");
             Check(Driver.cuModuleGetFunction(out candidate._boxFunction, candidate._module, "nominate_box_witnesses"), "box-kernel-find");
             Check(Driver.cuModuleGetFunction(out candidate._triangleFunction, candidate._module, "nominate_triangle_witnesses"), "triangle-kernel-find");
-            candidate.Fp32Requested = Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_GPU_FP32") == "1";
+            candidate.Fp32Requested = policy.GpuFp32;
             if (candidate.Fp32Requested)
             {
                 if (!Fp32DomainSupported(candidate._segments, nodes, profile, out string fp32Reason))

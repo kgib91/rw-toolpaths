@@ -233,6 +233,7 @@ public sealed class TrialFilledSweepProposalTests
     private static (object Result, string Log) Capture(Func<object> action)
     {
         var previousOut = Console.Out; var previousError = Console.Error; using var log = new StringWriter();
+        using var logSelection = RW.Diagnostics.DiagnosticLog.PushNamespaces("*");
         Console.SetOut(log); Console.SetError(log);
         try { return (action(), log.ToString()); }
         finally { Console.SetOut(previousOut); Console.SetError(previousError); }

@@ -437,6 +437,7 @@ public sealed class ParentLocalRescueTests
     private static int Count(string value, string fragment) => (value.Length - value.Replace(fragment, "").Length) / fragment.Length;
     private static (object Result, string Log) Capture(Func<object> action)
     {
+        using var logSelection = RW.Diagnostics.DiagnosticLog.PushNamespaces("*");
         var previous = Console.Out; using var log = new StringWriter(); Console.SetOut(log);
         try { return (action(), log.ToString()); } finally { Console.SetOut(previous); }
     }

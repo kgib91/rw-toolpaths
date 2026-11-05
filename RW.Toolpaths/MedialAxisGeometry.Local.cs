@@ -55,14 +55,14 @@ public static partial class MedialAxisGeometry
                 (worldGridWindow.right / PathUtils.Scale - _originX) * _scale,
                 (worldGridWindow.bottom / PathUtils.Scale - _originY) * _scale);
             var diagram = BoostVoronoiProvider.TryConstructLocalMedialAxis(_sites, query,
-                maximumWorldChordError * _scale, 3 * Math.PI / 4, token);
+                maximumWorldChordError * _scale, token);
             if (diagram is null) return null;
             var result = diagram.Segments.Select(segment => new MedialSegment(World(segment.Point0), World(segment.Point1))).ToArray();
             Console.WriteLine($"[Offset.Terminal.LocalCertificate] originalSites={diagram.SourceSiteCount} "
                 + $"retainedSites={diagram.OriginalSiteOrdinals.Count} segments={result.Length} "
                 + $"upperMm={diagram.InfluenceUpperBound / _scale:R} arithmeticMm={diagram.NumericalReserve / _scale:R} "
                 + $"maximumChordError={maximumWorldChordError:R} nearestSiteIdentity=complete-original "
-                + "fullSignedMaterial=caller-authority replacementWalls=0");
+                + $"fullSignedMaterial=caller-authority replacementWalls=0");
             return result;
         }
         private MedialPoint World(MedialPoint point) => new(point.X / _scale + _originX,

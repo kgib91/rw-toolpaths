@@ -10,6 +10,8 @@ internal sealed class FlatPocketContinuationAdapter
     private readonly CancellationToken token;
     private readonly PocketContinuationRouter.ClearedStock stock;
     private readonly PocketPostedStepdownStock posted;
+    private readonly PocketContinuationRouter.FollowingSweepCache followingCache = new();
+    private readonly PocketContinuationRouter.CoverageDiagnostics coverageDiagnostics = new();
     private PocketContinuationRouter.TemporalClearance? proof;
     private IReadOnlyList<Point3D>? proofPath;
     private double proofFloor;
@@ -35,7 +37,8 @@ internal sealed class FlatPocketContinuationAdapter
             if (first.MoveCount <= 0) return false;
             var following = PocketContinuationRouter.BelowFloor(path.Points.Skip(first.StartIndex)
                 .Take(first.PointCount).ToArray(),b.Z);
-            proof = new(clearance,stock,b.Z,following,tool.Radius,token,priorStepdown:posted.Capture());
+            proof = new(clearance,stock,b.Z,following,tool.Radius,token,
+                diagnostics:coverageDiagnostics,followingCache:followingCache,priorStepdown:posted.Capture());
             proofPath = path.Points; proofFloor = b.Z;
         }
         return proof.IsTravelSafe(a,b,tool.Radius);
@@ -54,4 +57,10 @@ internal sealed class FlatPocketContinuationAdapter
     private Point3D Posted(Point3D p)=>new(Math.Round((double)(float)p.X*1000,MidpointRounding.ToEven)/1000,
         Math.Round((double)(float)p.Y*1000,MidpointRounding.ToEven)/1000,
         depth.SurfaceZ+Math.Round(((float)p.Z-(float)depth.SurfaceZ)*1000d,MidpointRounding.ToEven)/1000);
+
+    internal void Report()
+        => Console.WriteLine($"[FlatPocketContinuation.Perf] recordedStrokes={stock.RecordedStrokes} floors={stock.FloorCount} "
+            +$"floorQueries={stock.FloorQueries} floorSweepMs={stock.FloorSweepMilliseconds:F1} floorUnionMs={stock.FloorUnionMilliseconds:F1} floorUnionRetainedVertices={stock.FloorUnionRetainedVertices} floorUnionSubmittedVertices={stock.FloorUnionSubmittedVertices} "
+            +$"{coverageDiagnostics.Describe()} priorStepdownMs={posted.ProofMilliseconds:F1} "
+            +$"timing=accumulated-owned-query-wall sourceAndPostedPhysicalGuardsUnchanged=True");
 }

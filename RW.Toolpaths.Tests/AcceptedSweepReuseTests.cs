@@ -154,6 +154,7 @@ public sealed class AcceptedSweepReuseTests
     private static (object Result, string Log) Capture(Func<object> action)
     {
         var old = Console.Out; var oldError = Console.Error; using var log = new StringWriter();
+        using var logSelection = RW.Diagnostics.DiagnosticLog.PushNamespaces("*");
         Console.SetOut(log); Console.SetError(log);
         try { return (action(), log.ToString()); }
         finally { Console.SetOut(old); Console.SetError(oldError); }

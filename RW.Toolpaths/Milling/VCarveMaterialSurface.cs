@@ -20,10 +20,10 @@ public sealed record VCarveClearedSweep(VCarveCutterProfile Profile, IReadOnlyLi
 /// <summary>Height-dependent cutter fit against remaining stock. The original
 /// target still owns every medial XY branch. Unions here describe clearance at
 /// particular heights, never geometry from which to generate a new medial axis.</summary>
-internal sealed class VCarveMaterialSurface
+internal sealed partial class VCarveMaterialSurface
 {
     private sealed record Layer(double TopDepth, PreparedRegionDistance Distance, PreparedRegionDistance ClearedDistance,
-        MedialAxisToolpaths.SpatialSegmentIndex Boundary);
+        MedialAxisToolpaths.SpatialSegmentIndex Boundary, IReadOnlyList<IReadOnlyList<PointD>> FreeRegion);
     private readonly List<Layer> layers = new();
     private readonly VCarveCutterProfile profile;
     private readonly VCarveProjectedStock projectedStock;
@@ -31,30 +31,42 @@ internal sealed class VCarveMaterialSurface
     private readonly double maximumDepth, surface;
     private readonly CancellationToken token;
     private readonly Action<string>? diagnostic;
+    private readonly bool parallelMedialFits;
     private long sourcePoints, outputPoints, loweredPoints, chordChecks, subdivisions, retreats, refusedSources, shortRefusals, fittedRetreats;
     private double largestDescent;
-    private long shoulderTrials, shoulderMovedSites, shoulderUnreachableSites;
-    private long shoulderInwardCorrections;
     private long verticalSweepsReduced;
-    private long shoulderRunJoins, shoulderJoinRefusals;
-    private long shoulderUnusedMidpointFitsAvoided;
     private long raisedSourceProofs, qualifiedSourceChords;
     internal long RaisedSourceProofs => raisedSourceProofs;
     private readonly Dictionary<(double, double, double, double), List<(double A, double B)>> qualifiedSources = new();
-    private readonly Dictionary<(double X, double Y), double> shoulderSurfaceDepths = new();
+    // Layer geometry and cutter profile never change in this owner. Repeated
+    // native and posted poses retain the literal layer answer,
+    // including refusals, without transferring any executed-stock certificate.
+    private const int LayerPoseCacheLimit = 65536;
+    private readonly Dictionary<Point3D, bool> layerPoseProofs = new();
+    private readonly Queue<Point3D> layerPoseOrder = new();
+    private long layerPoseCacheHits, layerPoseCacheMisses, layerPoseCacheEvictions;
+    private const int LegalPoseCacheLimit=131072;
+    private readonly Dictionary<(double X,double Y),double> deepestLegalPoses=new();
+    private readonly Queue<(double X,double Y)> legalPoseOrder=new();
+    private long raisedPoseProofHits,raisedPoseProofPublications;
+    private long postedChordRefusals,nativeChordRefusals;
+    private long pointDiscLayerProofs;
     // Accounts for F3 planar posting and integer boundary construction. Every
     // resulting chord is additionally proved with the complete physical profile.
     internal const double PlanarReserve = .002;
 
     internal VCarveMaterialSurface(IEnumerable<IReadOnlyList<PointD>> target,
         VCarveClearedStock stock, VCarveCutterProfile profile, double maximumDepth,
-        double surface, CancellationToken token, Action<string>? diagnostic)
+        double surface, CancellationToken token, Action<string>? diagnostic,
+        bool parallelMedialFits = true)
     {
+        this.parallelMedialFits = parallelMedialFits;
         this.profile = profile; this.maximumDepth = maximumDepth; this.surface = surface;
         this.token = token; this.diagnostic = diagnostic;
         long started = Stopwatch.GetTimestamp();
         var original = Clipper.Union(PathUtils.ToClipper(target), FillRule.NonZero);
         originalTarget = new PreparedRegionDistance(PathUtils.FromClipper(original));
+        VCarveNativeStockTrace.Observer.Value?.Invoke(new(PathUtils.FromClipper(original),stock,profile,maximumDepth,surface));
         if (stock.PartBoundary.Count < 3 || stock.PartBoundary.Any(p => !double.IsFinite(p.x + p.y)))
             throw new ArgumentException("Cleared V-carve stock requires a finite physical Part boundary.", nameof(stock));
         var part = PathUtils.ToClipper(new[] { stock.PartBoundary });
@@ -104,7 +116,7 @@ internal sealed class VCarveMaterialSurface
             var edges = rings.SelectMany(ring => Enumerable.Range(0, ring.Count)
                 .Select(i => (ring[i], ring[(i + 1) % ring.Count]))).ToList();
             layers.Add(new(top, new PreparedRegionDistance(rings), new PreparedRegionDistance(PathUtils.FromClipper(swept)),
-                new MedialAxisToolpaths.SpatialSegmentIndex(edges)));
+                new MedialAxisToolpaths.SpatialSegmentIndex(edges), rings));
             diagnostic?.Invoke($"stage=material-surface layerTopDepth={top:R} layerBottomDepth={floor:R} "
                 + $"postedColumnChords={credited} boundaryEdges={edges.Count} "
                 + "targetBranchesUnchanged=True credit=entire-executed-column platformClipped=True");
@@ -114,6 +126,22 @@ internal sealed class VCarveMaterialSurface
             + $"elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
             + $"receivedChords={stock.Chords.Count} admittedPostedColumns={executed.Length} "
             + $"finalTipDepth={maximumDepth:R} startingDepthIsNotGlobalCutterDatum=True");
+    }
+
+    private VCarveMaterialSurface(VCarveMaterialSurface source)
+    {
+        layers = source.layers.Select(layer => layer with {
+            Distance = layer.Distance.CreateQueryWorker(),
+            ClearedDistance = layer.ClearedDistance.CreateQueryWorker() }).ToList();
+        profile = source.profile;
+        projectedStock = source.projectedStock.CreateQueryWorker();
+        originalTarget = source.originalTarget.CreateQueryWorker();
+        maximumDepth = source.maximumDepth;
+        surface = source.surface; token = source.token;
+        // Apply publishes/qualifies sources after every fitting worker has joined.
+        // This dictionary is read-only for the complete parallel query interval.
+        qualifiedSources = source.qualifiedSources;
+        diagnostic = null; parallelMedialFits=false;
     }
 
     internal double AllowedDepth(double x, double y)
@@ -186,7 +214,14 @@ internal sealed class VCarveMaterialSurface
     internal bool IsLegalChord(Point3D a, Point3D b, bool postingReserve = true)
     {
         chordChecks++;
-        return Legal(a, b, postingReserve) && Legal(Command(a), Command(b), postingReserve);
+        // Refuse an unpostable chord before constructing its otherwise
+        // unused native proof.
+        // Every positive still requires BOTH unchanged complete authorities.
+        var ca=Command(a);var cb=Command(b);
+        if(!Legal(ca,cb,postingReserve)){postedChordRefusals++;return false;}
+        if(ca==a && cb==b)return true;
+        if(!Legal(a,b,postingReserve)){nativeChordRefusals++;return false;}
+        return true;
     }
 
     private bool Legal(Point3D a, Point3D b, bool postingReserve = true)
@@ -199,8 +234,29 @@ internal sealed class VCarveMaterialSurface
             if (a.Z != b.Z) verticalSweepsReduced++;
             a = b = a.Z < b.Z ? a : b;
         }
-        return ContainsQualifiedRaisedChord(a,b)
+        bool pose=a==b && -a.Z<=profile.MaximumDepth;
+        var key=(a.X,a.Y);
+        if(pose && deepestLegalPoses.TryGetValue(key,out double provedZ) && a.Z>=provedZ)
+        {raisedPoseProofHits++;return true;}
+        bool legal=ContainsQualifiedRaisedChord(a,b) || projectedStock.TryPositiveProof(a,b,postingReserve)
             || LayerLegal(a, b) || projectedStock.Prove(a, b, postingReserve: postingReserve);
+        // With this immutable stock/target and nondecreasing physical profile,
+        // every shallower pose at IDENTICAL XY is a subset of a proved deeper
+        // pose. Retain only positive complete proofs, including the posting
+        // shell; a proof without that shell never enters this stronger memo.
+        if(pose && legal && postingReserve)
+        {
+            if(deepestLegalPoses.TryGetValue(key,out double priorZ))
+                deepestLegalPoses[key]=Math.Min(priorZ,a.Z);
+            else
+            {
+                if(deepestLegalPoses.Count==LegalPoseCacheLimit)
+                    deepestLegalPoses.Remove(legalPoseOrder.Dequeue());
+                deepestLegalPoses.Add(key,a.Z);legalPoseOrder.Enqueue(key);
+            }
+            raisedPoseProofPublications++;
+        }
+        return legal;
     }
 
     private static (double, double, double, double) SourceKey(ref Point3D a, ref Point3D b)
@@ -234,7 +290,7 @@ internal sealed class VCarveMaterialSurface
             if (Math.Max(-a.Z,-b.Z)>profile.MaximumDepth) return;
             // Establish authority directly from original stock, without using
             // any previously registered source certificate.
-            if (!LayerLegal(a,b) && !projectedStock.Prove(a,b)) return;
+            if (!projectedStock.TryPositiveProof(a,b) && !LayerLegal(a,b) && !projectedStock.Prove(a,b)) return;
             var key=SourceKey(ref a,ref b);
             if (!qualifiedSources.TryGetValue(key,out var depths))
                 qualifiedSources.Add(key,depths=new());
@@ -254,9 +310,40 @@ internal sealed class VCarveMaterialSurface
 
     private bool LayerLegal(Point3D a, Point3D b)
     {
+        if (a != b) return LayerLegalCore(a, b);
+        if (layerPoseProofs.TryGetValue(a, out bool cached))
+        {
+            layerPoseCacheHits++;
+            return cached;
+        }
+        layerPoseCacheMisses++;
+        bool result = LayerLegalCore(a, b);
+        if (layerPoseProofs.Count == LayerPoseCacheLimit)
+        {
+            layerPoseProofs.Remove(layerPoseOrder.Dequeue());
+            layerPoseCacheEvictions++;
+        }
+        layerPoseProofs.Add(a, result);
+        layerPoseOrder.Enqueue(a);
+        return result;
+    }
+
+    private bool LayerLegalCore(Point3D a, Point3D b)
+    {
         foreach (var layer in layers)
         {
             if (Math.Max(-a.Z, -b.Z) <= layer.TopDepth + 1e-10) continue;
+            if(a==b)
+            {
+                double clearance=layer.Distance.SignedDistance(new(a.X,a.Y));
+                double radius=profile.PhysicalRadiusAtDepth(-a.Z-layer.TopDepth);
+                // A signed-distance lower bound contains the ENTIRE physical
+                // cross-section disc at this layer's top. All deeper sections
+                // of the monotone cutter are smaller. Uncertain/tangent poses
+                // retain the original exact finite-boundary test below.
+                if(radius<=clearance-PreparedRegionDistance.Uncertainty)
+                {pointDiscLayerProofs++;continue;}
+            }
             foreach (var point in new[] { a, b })
             {
                 double penetration = -point.Z - layer.TopDepth;
@@ -280,243 +367,131 @@ internal sealed class VCarveMaterialSurface
         return true;
     }
 
-    private double ShoulderFloor(PointD edge)
-    {
-        if(shoulderSurfaceDepths.TryGetValue((edge.x,edge.y),out double floor))return floor;
-        floor=projectedStock.ClearedDepth(edge.x,edge.y,0);
-        if(shoulderSurfaceDepths.Count>=131072)shoulderSurfaceDepths.Clear();
-        shoulderSurfaceDepths[(edge.x,edge.y)]=floor;
-        return floor;
-    }
-
-    private Point3D? FitShoulder(Point3D source)
-    {
-        if (projectedStock.IndexedChords == 0) return null;
-        if (originalTarget.NearestBoundaryPoint(new(source.X, source.Y)) is not { } edge)
-            return null;
-        double dx = source.X - edge.x, dy = source.Y - edge.y;
-        double length = Math.Sqrt(dx * dx + dy * dy);
-        if (length <= 1e-10) return null;
-        dx /= length; dy /= length;
-        // A simplified nomination may lie across a concave original edge.
-        // Its side must not reverse the contact ray: the original filled
-        // target, rather than the approximate nomination, owns the inward side.
-        if(originalTarget.SignedDistance(new(edge.x+dx*PlanarReserve,edge.y+dy*PlanarReserve))<0)
-        {
-            dx=-dx;dy=-dy;
-            if(++shoulderInwardCorrections<=8)
-                diagnostic?.Invoke($"stage=material-surface event=shoulder-inward-correction source={source} edge=({edge.x:R},{edge.y:R}) "
-                    +"inwardOwner=original-filled-target nominationSideIsNotAuthoritative=True");
-        }
-        double cap = Math.Min(maximumDepth, Math.Max(0, -source.Z));
-        double floor=ShoulderFloor(edge);
-        if (floor >= cap - .0005) return null;
-        double high = profile.RadiusAtDepth(Math.Max(0, cap - floor)) + PlanarReserve;
-        Point3D Candidate(double offset)
-        {
-            double depth = Math.Min(cap, floor + profile.DepthAtRadius(Math.Max(0, offset - PlanarReserve)));
-            // Choose an actual shallower F3 depth. Rounding a sagitta downward
-            // in Z can otherwise create disconnected false-fit intervals.
-            depth = Math.Floor(depth * 1000) / 1000;
-            return new(edge.x + dx * offset, edge.y + dy * offset, -depth);
-        }
-        bool Fits(Point3D candidate)
-        {
-            shoulderTrials++;
-            return IsLegalChord(candidate, candidate);
-        }
-        var result = Candidate(high);
-        bool OriginalStockContains(Point3D point) => originalTarget.SignedDistance(new(point.X, point.Y))
-            >= profile.PhysicalRadiusAtDepth(-point.Z) + PreparedRegionDistance.Uncertainty;
-        // The original carving already supplies poses contained by the original
-        // stock domain. Add only contact enabled by actual preceding removal.
-        if (OriginalStockContains(result)) return null;
-        bool found = Fits(result);
-        double localDepth = Math.Max(0, cap-floor);
-        if (!found && localDepth >= profile.FirstCylinderHeight
-            && profile.RadiusAtDepth(localDepth) == profile.RadiusAtDepth(Math.Max(0,localDepth-.001)))
-        {
-            // A cylinder's contact radius does not select a unique depth.
-            // Fit its actual stock-limited depth at this same contact axis.
-            var limited = Fit(result, preserveDepthCap:true);
-            if (-limited.Z > floor+.0005
-                && profile.RadiusAtDepth(-limited.Z-floor) == profile.RadiusAtDepth(localDepth))
-            { result=limited; found=true; }
-        }
-        if (!found || -result.Z <= floor + .0005)
-        {
-            double low = 0;
-            for (int trial = 0; trial < 18 && high - low > .0001; trial++)
-            {
-                double mid = (low + high) / 2;
-                var candidate = Candidate(mid);
-                if (Fits(candidate)) { low = mid; result = candidate; found = true; }
-                else high = mid;
-            }
-        }
-        if (!found)
-        {
-            if (++shoulderUnreachableSites <= 8)
-                diagnostic?.Invoke($"stage=material-surface event=shoulder-contact-refused source={source} floor={floor:R} "
-                    + "fallback=omit-supplemental-interval fullPhysicalAndF3Guard=True");
-            return null;
-        }
-        if (OriginalStockContains(result)) return null;
-        if (++shoulderMovedSites <= 8)
-            diagnostic?.Invoke($"stage=material-surface event=shoulder-contact source={source} fitted={result} floor={floor:R} "
-                + "actualCutterXYAndDepth=True fullPhysicalAndF3Guard=True");
-        return result;
-    }
-
-    private List<TaggedToolpath> FitShoulderPath(TaggedToolpath path)
-    {
-        var runs = new List<List<Point3D>>();
-        var run = new List<Point3D>();
-        void Finish()
-        {
-            if (run.Count > 1) runs.Add(run);
-            run = new();
-        }
-        void Segment(Point3D sourceA, Point3D sourceB, Point3D? a, Point3D? b, int level)
-        {
-            token.ThrowIfCancellationRequested();
-            var sourceMid = new Point3D((sourceA.X + sourceB.X) / 2,
-                (sourceA.Y + sourceB.Y) / 2, (sourceA.Z + sourceB.Z) / 2);
-            double sourceLength = Math.Pow(sourceA.X-sourceB.X,2)+Math.Pow(sourceA.Y-sourceB.Y,2);
-            // At command-scale spans the full chord proof already decides
-            // acceptance. The midpoint fit was calculated and then ignored
-            // by both the accepted-short-chord and terminal-refusal branches.
-            if(sourceLength<=.000004 && a is { } shortA && b is { } shortB && IsLegalChord(shortA,shortB))
-            {
-                if(run.Count>0&&run[^1]!=shortA)Finish();
-                if(run.Count==0)run.Add(shortA);
-                if(run[^1]!=shortB)run.Add(shortB);
-                shoulderUnusedMidpointFitsAvoided++;return;
-            }
-            if(level>=16 || sourceLength<=Math.Pow(ToolpathCommandRounding.CommandIncrement,2))
-            {
-                Finish();if(b is { } terminal)run.Add(terminal);
-                shoulderUnusedMidpointFitsAvoided++;return;
-            }
-            var mid = FitShoulder(sourceMid);
-            bool smooth=a is { } fitStart && b is { } fitEnd && mid is { } middle
-                && Math.Pow(fitStart.X-fitEnd.X,2)+Math.Pow(fitStart.Y-fitEnd.Y,2)<=.25
-                && Math.Abs(middle.X-(fitStart.X+fitEnd.X)/2)<=.002 && Math.Abs(middle.Y-(fitStart.Y+fitEnd.Y)/2)<=.002
-                && Math.Abs(middle.Z-(fitStart.Z+fitEnd.Z)/2)<=.01;
-            if (a is { } pa && b is { } pb && mid is { } pm && IsLegalChord(pa,pb)
-                && (sourceLength <= .000004 || smooth))
-            {
-                if (run.Count > 0 && run[^1] != pa) Finish();
-                if (run.Count == 0) run.Add(pa);
-                if (run[^1] != pb) run.Add(pb);
-                return;
-            }
-            // A refused interval below the posted XY increment cannot supply
-            // another machinable contact site. Preserve the qualified endpoints
-            // and let the fully proved local withdrawal join them; subdividing
-            // to tenths of a micron only repeats the same command-cell failures.
-            if (a is null && b is null && mid is null && sourceLength <= .25)
-            {
-                Finish();
-                if (b is { } end) run.Add(end);
-                return;
-            }
-            Segment(sourceA, sourceMid, a, mid, level+1);
-            Segment(sourceMid, sourceB, mid, b, level+1);
-        }
-        var first = FitShoulder(path.Points[0]);
-        var previous = first;
-        for (int i=1;i<path.Points.Count;i++)
-        {
-            var next = i==path.Points.Count-1 && path.Points[0]==path.Points[^1]
-                ? first : FitShoulder(path.Points[i]);
-            Segment(path.Points[i-1],path.Points[i],previous,next,0);
-            previous=next;
-        }
-        Finish();
-        if (runs.Count>1 && runs[^1][^1]==runs[0][0])
-        {
-            runs[^1].AddRange(runs[0].Skip(1));
-            runs.RemoveAt(0);
-        }
-        // Nearby fit intervals can end separately. A new surface
-        // entry for every such interval creates thousands of tiny ramp laps.
-        // Retain both contact traces and use the same half-mm construction span,
-        // with a fully proved local withdrawal when a direct chord cannot fit.
-        var joined=new List<List<Point3D>>();
-        foreach (var next in runs)
-        {
-            if (joined.Count==0 || !Join(joined[^1],next)) joined.Add(next);
-        }
-        if(joined.Count>1 && Join(joined[^1],joined[0]))joined.RemoveAt(0);
-        return joined.Select(points=>new TaggedToolpath(points,Array.Empty<ToolpathSpan>(),path.RegionIndex,
-            path.Category,path.DepthPassIndex,path.VisitIdentity,detectCurves:false)).ToList();
-
-        bool Join(List<Point3D> previous,List<Point3D> next)
-        {
-            var a=previous[^1];var b=next[0];
-            if (Math.Pow(a.X-b.X,2)+Math.Pow(a.Y-b.Y,2)>.25) return false;
-            if (!IsLegalChord(a,b))
-            {
-                double low=Math.Max(a.Z,b.Z),high=Math.Min(0,low+.01);
-                bool Fits(double z)=>IsLegalChord(a with{Z=z},b with{Z=z});
-                if (!Fits(high)) {shoulderJoinRefusals++;return false;}
-                for(int trial=0;trial<10;trial++)
-                {
-                    double mid=(low+high)/2;
-                    if(Fits(mid))high=mid;else low=mid;
-                }
-                var safeA=a with{Z=high};var safeB=b with{Z=high};
-                if(!IsLegalChord(a,safeA)||!IsLegalChord(safeB,b))
-                {shoulderJoinRefusals++;return false;}
-                if(previous[^1]!=safeA)previous.Add(safeA);
-                if(previous[^1]!=safeB)previous.Add(safeB);
-            }
-            if(previous[^1]!=b)previous.Add(b);
-            previous.AddRange(next.Skip(1));
-            shoulderRunJoins++;
-            return true;
-        }
-    }
-
-    internal List<TaggedToolpath> Apply(List<TaggedToolpath> paths, IReadOnlySet<TaggedToolpath>? clearingNominations = null)
+    internal List<TaggedToolpath> Apply(List<TaggedToolpath> paths)
     {
         long started=System.Diagnostics.Stopwatch.GetTimestamp();
         var result = new List<TaggedToolpath>(paths.Count);
-        foreach (var path in paths)
+        var medial=paths.Select((path,index)=>(Path:path,Index:index)).Where(p=>p.Path.Category=="final-carve"
+            &&p.Path.Points.Count>=2).ToArray();
+        const int medialBlockEdges=16;
+        var blocks=new List<(int Path,int First,int Last)>();
+        foreach(var item in medial)
+            for(int at=0;at<item.Path.Points.Count-1;at+=medialBlockEdges)
+                blocks.Add((item.Index,at,Math.Min(item.Path.Points.Count-1,at+medialBlockEdges)));
+        var fitted=new List<Point3D>?[blocks.Count];
+        int medialWorkers=parallelMedialFits && medial.Sum(p=>(long)p.Path.Points.Count)>=512
+            ? Math.Min(GeometryParallelism.StockFitWorkerLimit,blocks.Count) : 1;
+        if(medialWorkers>1)
         {
-            // Original-stock clearing already has a complete physical proof.
-            // Preserve its literal level moves; fit only the new shoulder fronts.
-            if (clearingNominations?.Contains(path) == true && path.Points.Count > 1)
-            {
-                result.AddRange(FitShoulderPath(path));
-                continue;
-            }
-            if (path.Category != "final-carve" || path.Points.Count < 2) { result.Add(path); continue; }
+            long medialStarted=Stopwatch.GetTimestamp();
+            var workers=new VCarveMaterialSurface[medialWorkers];
+            Parallel.For(0,medialWorkers,new ParallelOptions { CancellationToken=token,
+                MaxDegreeOfParallelism=medialWorkers }, index=>{
+                using var scope=GeometryParallelism.EnterWorker();
+                var worker=workers[index]=new VCarveMaterialSurface(this);
+                for(int block=index;block<blocks.Count;block+=medialWorkers)
+                {
+                    var item=blocks[block];
+                    fitted[block]=worker.FitMedialRange(paths[item.Path],item.First,item.Last);
+                }
+            });
             token.ThrowIfCancellationRequested();
-            sourcePoints += path.Points.Count;
-            var points = new List<Point3D>(path.Points.Count) { Fit(path.Points[0]) };
-            for (int i = 1; i < path.Points.Count; i++)
-                Append(path.Points[i - 1], path.Points[i], points[^1],
-                    i == path.Points.Count - 1 && path.Points[^1] == path.Points[0] ? points[0] : Fit(path.Points[i]),
-                    points, 0);
-            outputPoints += points.Count;
-            result.Add(new TaggedToolpath(points, Array.Empty<ToolpathSpan>(), path.RegionIndex,
-                path.Category, path.DepthPassIndex, path.VisitIdentity, detectCurves: false));
+            long imported=0;
+            foreach(var worker in workers)
+            {
+                sourcePoints+=worker.sourcePoints;outputPoints+=worker.outputPoints;loweredPoints+=worker.loweredPoints;
+                largestDescent=Math.Max(largestDescent,worker.largestDescent);
+                chordChecks+=worker.chordChecks;subdivisions+=worker.subdivisions;retreats+=worker.retreats;
+                refusedSources+=worker.refusedSources;shortRefusals+=worker.shortRefusals;fittedRetreats+=worker.fittedRetreats;
+                verticalSweepsReduced+=worker.verticalSweepsReduced;raisedSourceProofs+=worker.raisedSourceProofs;
+                raisedPoseProofHits+=worker.raisedPoseProofHits;raisedPoseProofPublications+=worker.raisedPoseProofPublications;
+                postedChordRefusals+=worker.postedChordRefusals;nativeChordRefusals+=worker.nativeChordRefusals;
+                pointDiscLayerProofs+=worker.pointDiscLayerProofs;
+                layerPoseCacheHits+=worker.layerPoseCacheHits;layerPoseCacheMisses+=worker.layerPoseCacheMisses;
+                layerPoseCacheEvictions+=worker.layerPoseCacheEvictions;
+                imported+=projectedStock.ImportPositiveProofs(worker.projectedStock);
+            }
+            diagnostic?.Invoke($"stage=material-surface event=medial-fits paths={medial.Length} sourcePoints={medial.Sum(p=>p.Path.Points.Count)} "
+                +$"workers={medialWorkers} blockEdges={medialBlockEdges} elapsedMs={Stopwatch.GetElapsedTime(medialStarted).TotalMilliseconds:F1} "
+                +$"workerProofQueries={workers.Sum(w=>w.projectedStock.Queries)} workerProofCells={workers.Sum(w=>w.projectedStock.Cells)} workerInheritedCellProofs={workers.Sum(w=>w.projectedStock.InheritedStockCellProofs)} workerReusedCellIntersections={workers.Sum(w=>w.projectedStock.ReusedCellIntersectionPredicates)} workerInheritedRegionQueriesAvoided={workers.Sum(w=>w.projectedStock.InheritedRegionDistanceQueriesAvoided)} "
+                +$"importedPositiveProofs={imported} workerRefusalWitnessHits={workers.Sum(w=>w.projectedStock.RefusalWitnessHits)} "
+                +"immutableStockShared=True privateFitHints=True publication=original-source-order fullNativeAndF3Guards=True");
         }
+        for(int pathIndex=0;pathIndex<paths.Count;pathIndex++)
+        {
+            var path=paths[pathIndex];
+            // Preserve native clearing moves literally; fit only medial Z.
+            if (path.Category != "final-carve" || path.Points.Count < 2) { result.Add(path); continue; }
+            result.Add(medialWorkers>1 ? AssembleMedialPath(path,pathIndex,blocks,fitted) : FitMedialPath(path));
+        }
+        long qualificationStarted=Stopwatch.GetTimestamp();
+        long beforeQualificationCells=projectedStock.Cells;
         QualifySourceChords(result);
+        diagnostic?.Invoke($"stage=material-surface event=source-qualification paths={result.Count} "
+            +$"elapsedMs={Stopwatch.GetElapsedTime(qualificationStarted).TotalMilliseconds:F1} "
+            +$"proofCells={projectedStock.Cells-beforeQualificationCells} authority=original-complete-stock-and-layer-proofs");
         diagnostic?.Invoke($"stage=material-surface event=fitted-region paths={paths.Count} originalMedialPoints={sourcePoints} retainedMedialPoints={outputPoints} "
             +$"qualifiedSourceChords={qualifiedSourceChords} sourceCertificatePolicy=exact-XY-axially-raised-native-and-F3 "
-            +$"shoulderTrials={shoulderTrials} shoulderContactSites={shoulderMovedSites} shoulderUnreachableSites={shoulderUnreachableSites} originalClearingPreserved=True "
-            +$"minimumShoulderNominationSpan={ToolpathCommandRounding.CommandIncrement:R} physicalProofToleranceUnchanged=True "
-            +$"shoulderUnusedMidpointFitsAvoided={shoulderUnusedMidpointFitsAvoided} smallChordAuthority=complete-native-and-F3-sweep "
-            +$"shoulderInwardCorrections={shoulderInwardCorrections} inwardOwner=original-filled-target "
-            +$"seededStockCellProofs={projectedStock.SeededCellProofs} seededStockCellTrials={projectedStock.SeededCellTrials} seedCellAuthority=whole-prior-pose-disk-and-current-full-cutter "
-            +$"shoulderRunJoins={shoulderRunJoins} shoulderJoinRefusals={shoulderJoinRefusals} maximumJoinGap=0.5 localJoinLift=0.01 fullNativeAndF3JoinProof=True "
-            +$"nearbyDepthTrials={projectedStock.NearbyDepthTrials} nearbyDepthFits={projectedStock.NearbyDepthFits} nearbyDepthRefusals={projectedStock.NearbyDepthRefusals} "
+            +"supplementalShoulder=False originalClearingPreserved=True physicalProofToleranceUnchanged=True "
+            +$"inheritedStockCellProofs={projectedStock.InheritedStockCellProofs} seededStockCellProofs={projectedStock.SeededCellProofs} seededStockCellTrials={projectedStock.SeededCellTrials} seedCellAuthority=whole-prior-pose-disk-and-current-full-cutter "
+            +$"nearbyDepthTrials={projectedStock.NearbyDepthTrials} nearbyDepthFits={projectedStock.NearbyDepthFits} nearbyDepthRefusals={projectedStock.NearbyDepthRefusals} rejectedHighDepthTrials={projectedStock.RejectedHighDepthTrials} intermediateDepthFits={projectedStock.IntermediateDepthFits} "
             +$"stockCellCacheHits={projectedStock.StockCellCacheHits} stockCellCacheMisses={projectedStock.StockCellCacheMisses} stockCellCacheEvictions={projectedStock.StockCellCacheEvictions} cellGeometryCacheHits={projectedStock.CellGeometryCacheHits} cellGeometryCacheMisses={projectedStock.CellGeometryCacheMisses} cachedSweepProofs={projectedStock.CachedSweepProofs} sweepProofCacheLimit={VCarveProjectedStock.SweepProofCacheLimit} sweepProofCacheEvictions={projectedStock.SweepProofCacheEvictions} reversedSweepProofHits={projectedStock.ReversedSweepProofHits} strongerSweepProofHits={projectedStock.StrongerSweepProofHits} depthWitnessQueries={projectedStock.DepthWitnessQueries} depthWitnessBounds={projectedStock.DepthWitnessBounds} depthWitnessSeedFits={projectedStock.DepthWitnessSeedFits} "
             +$"profileCandidatesPruned={projectedStock.ProfileCandidatesPruned} profileNodesPruned={projectedStock.ProfileNodesPruned} priorPoseSeedTrials={projectedStock.PriorPoseSeedTrials} priorPoseSeedPositive={projectedStock.PriorPoseSeedPositive} elapsedMs={System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} deletedBranches=0");
         return result;
+    }
+
+    private List<Point3D> FitMedialRange(TaggedToolpath path,int first,int last)
+    {
+        token.ThrowIfCancellationRequested();
+        var points=new List<Point3D>{Fit(path.Points[first])};
+        // Close against the actual first output pose after all blocks join.
+        if(last==path.Points.Count-1 && path.Points[0]==path.Points[^1])last--;
+        for(int i=first+1;i<=last;i++)
+            Append(path.Points[i-1],path.Points[i],points[^1],Fit(path.Points[i]),points,0);
+        return points;
+    }
+
+    private TaggedToolpath AssembleMedialPath(TaggedToolpath path,int pathIndex,
+        List<(int Path,int First,int Last)> blocks,List<Point3D>?[] fitted)
+    {
+        var points=new List<Point3D>();int raisedSeams=0;double maximumLift=0;
+        for(int block=0;block<blocks.Count;block++)
+        {
+            if(blocks[block].Path!=pathIndex)continue;
+            token.ThrowIfCancellationRequested();
+            var next=fitted[block]!;
+            if(points.Count==0){points.AddRange(next);continue;}
+            var a=points[^1];var b=next[0];
+            if(a.X!=b.X||a.Y!=b.Y)
+                throw new InvalidOperationException($"Medial block lost its original XY interface: path={pathIndex} block={block} a={a} b={b}");
+            // Raising either endpoint of a proved chord keeps its complete
+            // monotone-cutter sweep inside that original proof. Use the same
+            // shallower interface pose on both sides; add no connecting motion.
+            double z=Math.Max(a.Z,b.Z);
+            if(a.Z!=b.Z){raisedSeams++;maximumLift=Math.Max(maximumLift,Math.Abs(a.Z-b.Z));}
+            points[^1]=a with{Z=z};next[0]=b with{Z=z};points.AddRange(next.Skip(1));
+        }
+        if(path.Points[0]==path.Points[^1])
+            Append(path.Points[^2],path.Points[^1],points[^1],points[0],points,0);
+        sourcePoints+=path.Points.Count;outputPoints+=points.Count;
+        if(raisedSeams>0)diagnostic?.Invoke($"stage=material-surface event=medial-block-interfaces region={path.RegionIndex} "
+            +$"raisedSeams={raisedSeams} maximumLift={maximumLift:R} originalXY=True newConnectingMoves=0 "
+            +"authority=pointwise-axial-subset-of-complete-proved-monotone-cutter-chords finalQualificationRequired=True");
+        return new TaggedToolpath(points,Array.Empty<ToolpathSpan>(),path.RegionIndex,path.Category,
+            path.DepthPassIndex,path.VisitIdentity,detectCurves:false);
+    }
+
+    private TaggedToolpath FitMedialPath(TaggedToolpath path)
+    {
+        token.ThrowIfCancellationRequested();
+        sourcePoints+=path.Points.Count;
+        var points=new List<Point3D>(path.Points.Count){Fit(path.Points[0])};
+        for(int i=1;i<path.Points.Count;i++)
+            Append(path.Points[i-1],path.Points[i],points[^1],
+                i==path.Points.Count-1 && path.Points[^1]==path.Points[0] ? points[0] : Fit(path.Points[i]),points,0);
+        outputPoints+=points.Count;
+        return new TaggedToolpath(points,Array.Empty<ToolpathSpan>(),path.RegionIndex,path.Category,
+            path.DepthPassIndex,path.VisitIdentity,detectCurves:false);
     }
 
     private void Append(Point3D sourceA, Point3D sourceB, Point3D a, Point3D b,
@@ -585,7 +560,13 @@ internal sealed class VCarveMaterialSurface
             + $"continuousCacheHits={projectedStock.CacheHits} continuousRefusals={projectedStock.Refusals} "
             + $"flatWitnessRefusals={projectedStock.FlatWitnessRefusals} priorProfileChords={projectedStock.ProfileChords} "
             + $"stockCellCacheHits={projectedStock.StockCellCacheHits} stockCellCacheMisses={projectedStock.StockCellCacheMisses} stockCellCacheEvictions={projectedStock.StockCellCacheEvictions} cellGeometryCacheHits={projectedStock.CellGeometryCacheHits} cellGeometryCacheMisses={projectedStock.CellGeometryCacheMisses} cachedSweepProofs={projectedStock.CachedSweepProofs} sweepProofCacheLimit={VCarveProjectedStock.SweepProofCacheLimit} sweepProofCacheEvictions={projectedStock.SweepProofCacheEvictions} reversedSweepProofHits={projectedStock.ReversedSweepProofHits} strongerSweepProofHits={projectedStock.StrongerSweepProofHits} depthWitnessQueries={projectedStock.DepthWitnessQueries} depthWitnessBounds={projectedStock.DepthWitnessBounds} depthWitnessSeedFits={projectedStock.DepthWitnessSeedFits} stockCellRootWidth=16 stockCellCacheLimit=1048576 "
-            + $"nearbyDepthTrials={projectedStock.NearbyDepthTrials} nearbyDepthFits={projectedStock.NearbyDepthFits} nearbyDepthRefusals={projectedStock.NearbyDepthRefusals} "
+            + $"nearbyDepthTrials={projectedStock.NearbyDepthTrials} nearbyDepthFits={projectedStock.NearbyDepthFits} nearbyDepthRefusals={projectedStock.NearbyDepthRefusals} rejectedHighDepthTrials={projectedStock.RejectedHighDepthTrials} intermediateDepthFits={projectedStock.IntermediateDepthFits} "
+            + $"raisedPoseProofHits={raisedPoseProofHits} raisedPoseProofPublications={raisedPoseProofPublications} raisedPoseProofLimit={LegalPoseCacheLimit} "
+            + $"postedChordRefusals={postedChordRefusals} nativeChordRefusals={nativeChordRefusals} "
+            + $"pointDiscLayerProofs={pointDiscLayerProofs} pointDiscReserve={PreparedRegionDistance.Uncertainty:R} "
+            + $"refusalWitnessHits={projectedStock.RefusalWitnessHits} refusalWitnessPublications={projectedStock.RefusalWitnessPublications} refusalWitnessTrials={projectedStock.RefusalWitnessTrials} "
+            + "refusalWitnessAuthority=upper-prior-removal-plus-original-posting-shell-collision "
+            + "stockCellMemoKey=exact-dyadic-centre-pair stockCellEviction=FIFO "
             + "deletedBranches=0 nativeAndActualF3=True fullPhysicalProfile=True");
     }
 }

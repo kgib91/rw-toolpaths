@@ -7,6 +7,7 @@ namespace RW.Toolpaths.Milling;
 internal sealed class VCarveContinuationAdapter
 {
     private readonly ToolpathContinuationPlanner planner;
+    private readonly ToolpathMotionCost? motionCost;
     private readonly VCarveCutterProfile profile;
     private readonly VCarveOptions options;
     private readonly VCarveRoughingChord[] roughing;
@@ -17,10 +18,10 @@ internal sealed class VCarveContinuationAdapter
     private readonly double distance, grade, step;
     private readonly double[] airDepths;
     private ClearedColumnStock? prior;
-    private long airLinks, freshLinks, guardQueries,stockProvedEntries;
+    private long airLinks, freshLinks, guardQueries,stockProvedEntries,engagementRefused,floorRefused,seamCandidates,seamConnections;
     private bool freshCutAllowed;
     private bool lastExitAnchored=true;
-    internal const double MinimumTravelClearance=.1;
+    internal const double MinimumTravelClearance=MillingTransitionPlanner.PositiveTravelClearance;
     private readonly Dictionary<(Point3D,Point3D),bool> travelCache=new();
     private readonly Queue<(Point3D,Point3D)> travelOrder=new();
     private long positiveTravelQueries,positiveTravelAccepted;
@@ -33,6 +34,7 @@ internal sealed class VCarveContinuationAdapter
         IReadOnlyList<TaggedToolpath> paths)
     {
         options = options.WithPriorStock(token);
+        motionCost=options.Motion is null?null:new(options.Motion,depth.SurfaceZ);
         this.depth = depth; this.options = options; this.originalCutGuard = originalCutGuard;
         prior = options.PriorStock?.CreateQuerySession(8_000_000);
         roughing=options.RoughingRestChords.ToArray();
@@ -81,16 +83,10 @@ internal sealed class VCarveContinuationAdapter
         }
     }
 
-    internal ToolpathContinuationPlanner.Connection? Connect(Point3D from, ref TaggedToolpath path)
+    internal ToolpathContinuationPlanner.Connection? Connect(Point3D from, ref TaggedToolpath path, TaggedToolpath? independentEntry=null)
     {
         if(!lastExitAnchored)return null;
         var original=path;
-        double budget=EntryLength(original,depth.SurfaceZ);
-        // Compare complete alternatives: a separate visit also retracts,
-        // traverses at safe height, and approaches its surface entry. Omitting
-        // this air time unfairly rejects short stay-down links between tiny cuts.
-        budget+=ToolpathContinuationPlanner.SafeHeightTransferCost(from,original.Points[0] with{Z=depth.SurfaceZ},
-            options.ContinuationSafeZ,options.EntryTransferCostRatio);
         var entries=original.ContinuationPlan is { } plan && original.ContinuationSourceOrdinal is { } owner
             ? plan.Entries(owner).Where(p=>visitedSources.Contains(p.Other.Owner)).ToArray()
             : Array.Empty<(ToolpathContinuationComponents.Portal Own,ToolpathContinuationComponents.Portal Other)>();
@@ -103,8 +99,18 @@ internal sealed class VCarveContinuationAdapter
             for(int i=0;i<original.Points.Count;i++)
                 if(original.Points[i].X==entry.Own.Point.X && original.Points[i].Y==entry.Own.Point.Y){index=i;break;}
             if(index>=0 && !indices.Contains(index))indices.Add(index);
-            if(indices.Count>=8)break;
+            if(indices.Count>=4)break;
         }
+        // Keep a bounded nearest-seam shortlist in one linear pass over this
+        // source. No all-pairs path search and no new source subdivision.
+        var nearest=new List<(double Distance,int Index)>();
+        for(int i=1;i<original.Points.Count;i++)
+        {
+            if((i&1023)==0)token.ThrowIfCancellationRequested();
+            var p=original.Points[i];double d=(p.X-from.X)*(p.X-from.X)+(p.Y-from.Y)*(p.Y-from.Y);
+            nearest.Add((d,i));nearest.Sort();if(nearest.Count>4)nearest.RemoveAt(4);
+        }
+        foreach(var candidate in nearest)if(!indices.Contains(candidate.Index))indices.Add(candidate.Index);
         // A forest portal is an XY relationship, not a permanent first-layer Z.
         // Nominate its literal executed poses at ALL completed depths. Otherwise
         // a valid next-layer connector is missed and the search climbs back to
@@ -112,22 +118,30 @@ internal sealed class VCarveContinuationAdapter
         var preferred=entries.SelectMany(p=>planner.ClearedEntries(
                 p.Other.Point with{Z=depth.SurfaceZ-depth.Depth},depth.SurfaceZ,upwardProfileIsContained:true)
             .Append(p.Other.Point with{Z=depth.SurfaceZ+p.Other.Point.Z})).Distinct().ToArray();
+        ToolpathContinuationPlanner.Connection? best=null;var bestPath=original;double bestCost=motionCost is not null && independentEntry is {} retainedEntry
+            ? motionCost.CompleteVisitSeconds(from,retainedEntry):double.PositiveInfinity;
         foreach(int index in indices)
         {
+            seamCandidates++;
             var candidate=Rebase(original,index);
-            if(Length(candidate.Points)>budget+1e-9)continue;
-            var connection=ConnectCore(from,candidate,preferred,budget);
+            var connection=ConnectCore(from,candidate,preferred,bestCost);
             if(connection is null)continue;
-            path=candidate;return connection;
+            double cost=EntryLength(candidate,connection.Points[^1].Z);
+            for(int i=1;i<connection.Points.Count;i++)cost+=motionCost?.ChordSeconds(
+                connection.Points[i-1],connection.Points[i],connection.ClearedTravel?[i-1]==true)
+                ?? ToolpathContinuationPlanner.Distance(connection.Points[i-1],connection.Points[i])
+                    *(connection.ClearedTravel?[i-1]==true?options.ClearedTravelCostRatio:1);
+            if(cost<=bestCost+1e-9){best=connection;bestPath=candidate;bestCost=cost;}
         }
-        return null;
+        if(best is not null){path=bestPath;seamConnections++;}
+        return best;
     }
 
     private ToolpathContinuationPlanner.Connection? ConnectCore(Point3D from,TaggedToolpath path,
         IReadOnlyList<Point3D> preferred,double budget)
     {
         freshCutAllowed=path.Category=="clearing";
-        var targets = new List<Point3D> { path.Points[0] };
+        var targets = new List<Point3D> { RampPlanner.PlanTransitionEntry(from,path.Points[0],options.Ramp) };
         // These are literal earlier executed cutter poses, not an authored
         // StartDepth, pass-number inference, or future finished-stock envelope.
         targets.AddRange(planner.ClearedEntries(path.Points[0], depth.SurfaceZ, upwardProfileIsContained: true));
@@ -153,13 +167,18 @@ internal sealed class VCarveContinuationAdapter
         // promise that an entry or interior-portal retrace will be cheaper.
         var remaining=entries.Select(p=>EntryLength(path,p.Z)).ToArray();
         return planner.Connect(from,entries,AllowsNewChord,PositiveTravelClearance,
-            options.ClearedTravelCostRatio,remaining,preferred,maximumCost:budget);
+            options.ClearedTravelCostRatio,remaining,preferred,maximumCost:budget,motionCost:motionCost);
     }
 
-    private double EntryLength(TaggedToolpath path,double z)=>Length(RampPlanner.PlanPathEntry(path.Points,z,
-        options.Ramp with{AngleRadians=Math.Min(options.Ramp.AngleRadians>0 ? options.Ramp.AngleRadians : double.PositiveInfinity,
-            options.SmoothRampAngleDegrees*Math.PI/180),Strategy=RampStrategy.Linear},token,diagnostic:null,
-        landAtSourceVertex:true,preserveClosedExit:false).Points);
+    private double EntryLength(TaggedToolpath path,double z)
+    {
+        var entry=RampPlanner.PlanPathEntry(path.Points,z,
+            options.Ramp with{AngleRadians=Math.Min(options.Ramp.AngleRadians>0 ? options.Ramp.AngleRadians : double.PositiveInfinity,
+                options.SmoothRampAngleDegrees*Math.PI/180),Strategy=RampStrategy.Linear},token,diagnostic:null,
+            landAtSourceVertex:true,preserveClosedExit:false,preserveOpenExit:false);
+        return motionCost?.VisitSeconds(new TaggedToolpath(entry.Points,entry.Spans,path.RegionIndex,
+            path.Category,path.DepthPassIndex,detectCurves:false)) ?? Length(entry.Points);
+    }
     private static double Length(IReadOnlyList<Point3D> points)
     {
         double length=0;
@@ -195,7 +214,7 @@ internal sealed class VCarveContinuationAdapter
         if(path.ContinuationSourceOrdinal is { } owner)visitedSources.Add(owner);
     }
 
-    private static TaggedToolpath Rebase(TaggedToolpath path,int index)
+    internal static TaggedToolpath Rebase(TaggedToolpath path,int index)
     {
         if(index==0 || path.Spans.Any(s=>s.Kind!=ToolpathSpanKind.Cut))return path;
         var source=path.Points;var points=new List<Point3D>();
@@ -207,15 +226,13 @@ internal sealed class VCarveContinuationAdapter
         }
         else
         {
-            // Reach the original seam through the original prefix, then retain
-            // every original directed cutting chord. No synthetic XY is added.
+            // Cover the original prefix. Starting at the far endpoint completes
+            // the source in reverse, without an unnecessary forward replay.
             for(int i=index;i>=0;i--)points.Add(source[i]);
-            points.AddRange(source.Skip(1));
+            if(index<source.Count-1)points.AddRange(source.Skip(1));
         }
-        return new TaggedToolpath(points,new[]{new ToolpathSpan(0,points.Count-1,ToolpathSpanKind.Cut)},
-            path.RegionIndex,path.Category,path.DepthPassIndex,path.VisitIdentity,path.DetectCurves)
-            {ContinuationComponentIndex=path.ContinuationComponentIndex,ContinuationPlan=path.ContinuationPlan,
-                ContinuationSourceOrdinal=path.ContinuationSourceOrdinal};
+        return path with{Points=points,Moves=new LineToolMoves(points),
+            Spans=new[]{new ToolpathSpan(0,points.Count-1,ToolpathSpanKind.Cut)}};
     }
     internal void Reentry(Point3D? from, Point3D target) => planner.Reentry(from is null
         ? "first-entry" : !lastExitAnchored ? "exit-not-in-proved-network" : planner.LastFailure, from, target);
@@ -224,11 +241,13 @@ internal sealed class VCarveContinuationAdapter
         planner.Report();
         log?.Invoke($"stage=continuation event=physical-guards owner=vcarve priorAirLinks={airLinks} "
             + $"boundedStepCutLinks={freshLinks} stockProvedEntryPoses={stockProvedEntries} newChordQueries={guardQueries} "
+            + $"engagementRefused={engagementRefused} floorOrWallRefused={floorRefused} "
+            + $"seamCandidates={seamCandidates} connectedVisits={seamConnections} maximumSeamsPerVisit=8 completeEntryCostsCompared=True machineTimeContext={motionCost is not null} alternative=full-safe-plane-entry "
             + $"priorColumnQueries={prior?.Queries ?? 0} priorColumnBudgetReached={prior?.QueryBudgetReached ?? false} "
             + $"priorColumnCacheHits={prior?.CachedQueries ?? 0} "
             + $"travelProofQueries={positiveTravelQueries} travelProofAccepted={positiveTravelAccepted} minimumTravelClearance={MinimumTravelClearance:R} "
-            + $"entryCostIncludesTransfer={double.IsFinite(options.ContinuationSafeZ)} safeTransferZ={options.ContinuationSafeZ:R} cutToRapidRatio={options.EntryTransferCostRatio:R} "
-            + "originalFloorAndArtwork=True nominalAndPostedGrade=True retainedScheduledCuts=True entryPose=executed-or-whole-volume-proved-XYZ");
+            + "connectionPolicy=shared-connector-then-source-ramp graphScope=source-family "
+            + "originalFloorAndArtwork=True nominalAndPostedGrade=True linkSlopePolicy=authored-surface-angle retainedScheduledCuts=True entryPose=certified-connector-or-executed-XYZ");
     }
 
     private bool AllowsNewChord(Point3D a, Point3D b)
@@ -242,14 +261,17 @@ internal sealed class VCarveContinuationAdapter
                 new ClearedColumnStock.Column(c.A,c.B,c.ClearedColumnRadius)), token,8_000_000);
             if (prior.Contains(ca,cb,profile.PhysicalRadiusAtDepth)) { airLinks++; return true; }
         }
-        // A NEW link has no pre-existing deeper precursor. Restrict fresh cutting
-        // to the first physical step from the stock surface; original floor and
-        // full native/posted artwork guards still own the entire chord.
-        if ((!freshCutAllowed && !certifiedPortals.Contains((a.X,a.Y,b.X,b.Y))) || originalCutGuard is null
-            || ToolpathContinuationPlanner.Distance(a,b) > distance) return false;
-        if(Math.Max(-ca.Z,-cb.Z)>step+1e-10 && !planner.HasStepdownPrecursor(a,b,step,Command))return false;
+        // A new link starts at a literal executed cutter pose. Bound its extra
+        // radial engagement and axial drop relative to that pose; original floor
+        // and full native/posted artwork guards still own the entire chord.
+        if ((!freshCutAllowed && !certifiedPortals.Contains((a.X,a.Y,b.X,b.Y))) || originalCutGuard is null) return false;
+        double engaged=2*profile.PhysicalRadiusAtDepth(Math.Max(0,Math.Max(-ca.Z,-cb.Z)));
+        double radial=profile.RoundedTip?profile.NoseLimitedPitch(engaged,options.StepOver):options.StepOver*engaged;
+        if(!ToolpathEngagementLimits.Allows(a,b,radial,step,grade,Command)
+            &&!planner.HasLateralPrecursor(a,b,radial,step,grade,Command))
+        {engagementRefused++;return false;}
         bool allowed = originalCutGuard(a with { Z = a.Z-depth.SurfaceZ }, b with { Z = b.Z-depth.SurfaceZ });
-        if (allowed) freshLinks++;
+        if (allowed) freshLinks++;else floorRefused++;
         return allowed;
     }
 
@@ -262,13 +284,57 @@ internal sealed class VCarveContinuationAdapter
         var ca=Command(a);var cb=Command(b);
         // Inflate the entire query cylinder radially and below its tip. Faster
         // travel never follows merely touching old cutter sweeps or tip disks.
-        bool allowed=prior.Contains(ca with{Z=ca.Z-MinimumTravelClearance},cb with{Z=cb.Z-MinimumTravelClearance},
-            d=>profile.PhysicalRadiusAtDepth(d)+MinimumTravelClearance);
+        bool allowed=ContainsPositiveTravel(prior,profile,ca,cb);
         if(allowed)positiveTravelAccepted++;
         if(travelCache.Count>=262144)
         {var old=travelOrder.Dequeue();travelCache.Remove(old);}
         travelCache[(a,b)]=allowed;travelOrder.Enqueue((a,b));
         return allowed;
+    }
+
+    private static bool ContainsPositiveTravel(ClearedColumnStock stock,VCarveCutterProfile cutter,
+        Point3D a,Point3D b) => stock.Contains(
+            a with{Z=a.Z-MinimumTravelClearance},b with{Z=b.Z-MinimumTravelClearance},
+            d=>cutter.PhysicalRadiusAtDepth(d)+MinimumTravelClearance);
+
+    // The same immutable full-body proof also permits a faster prefix of a
+    // final vertical approach. Native source geometry/grade/finish checks have
+    // already completed; the host retains controlled descent where proof fails.
+    internal static Func<Point3D,Point3D,bool>? CreatePriorStockTravelGuard(VCarveOptions options,
+        VCarveCutterProfile cutter,double surfaceZ,CancellationToken token,Action<string>? log)
+    {
+        if(!options.CompactCollinearCommands)return null;
+        // Ordinary material-surface finishing intentionally keeps rest-routing
+        // input empty. Consume its existing actual stock ONLY for approach proof;
+        // do not expose it to legacy source omission or continuation nomination.
+        var chords=options.RoughingRestChords.Count>0?options.RoughingRestChords:options.ClearedStock?.Chords;
+        var snapshot=options.PriorStock;
+        if(snapshot is null && chords is {Count:>0})
+            snapshot=new ClearedColumnStock(chords.Select(c=>new ClearedColumnStock.Column(
+                c.A,c.B,c.ClearedColumnRadius)),token);
+        if(snapshot is null)return null;
+        var stock=snapshot.CreateQuerySession();
+        bool reportedBudget=false;
+        log?.Invoke($"stage=approach-travel-proof event=start priorChords={chords?.Count??0} "
+            +$"clearanceMm={MinimumTravelClearance:R} nominalAndF3=True earlierStockOnly=True");
+        Point3D Nominal(Point3D p)=>new((float)p.X,(float)p.Y,(float)p.Z-(float)surfaceZ);
+        Point3D Posted(Point3D p)=>new(ToolpathCommandRounding.Round((float)p.X),
+            ToolpathCommandRounding.Round((float)p.Y),ToolpathCommandRounding.Round((float)p.Z));
+        return (a,b)=>
+        {
+            token.ThrowIfCancellationRequested();
+            var na=Nominal(a);var nb=Nominal(b);
+            if(na==nb || Math.Min(na.Z,nb.Z)>=0)return false;
+            bool allowed=ContainsPositiveTravel(stock,cutter,na,nb)
+                && ContainsPositiveTravel(stock,cutter,Posted(na),Posted(nb));
+            if(stock.QueryBudgetReached&&!reportedBudget)
+            {
+                reportedBudget=true;
+                log?.Invoke($"stage=approach-travel-proof event=budget-reached queries={stock.Queries} "
+                    +$"cachedQueries={stock.CachedQueries} unprovedRemainAtCutFeed=True");
+            }
+            return allowed;
+        };
     }
 
     private bool Grade(Point3D a, Point3D b)

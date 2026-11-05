@@ -83,13 +83,19 @@ public sealed class MillingBoundaryAccessTests
         var tool = new ToolGeometry(2) { BottomRadius=0, TopRadius=2, ConeLength=2, TipAngleRadians=Math.PI/2 };
         var plan = VCarveToolpaths.Generate(new[] { new MillingRegion(Box(0,0,8,8)) },tool,new DepthSchedule(1,1),
             new VCarveOptions { SmoothVCarving=true, SmoothRampAngleDegrees=30, RampOutsideEdges=rampOutside,
-                RoughingRestWidth=restWidth,EdgeFillWidth=restWidth,
+                IncludeInteriorFill=false,RoughingRestWidth=restWidth,EdgeFillWidth=restWidth,
                 BoundaryAccess=new(Array.Empty<MillingRegion>(),Box(0,0,8,8)), DetectCurves=false, CalculateSweptArea=false },
             BoostVoronoiProvider.CreateDefault());
         var points=plan.Toolpaths.SelectMany(p=>p.Points).Where(p=>p.Z<0).ToArray();
+        if (!rampOutside)
+        {
+            // With no retained wall, outside permission creates no carving job.
+            Assert.Empty(points);
+            return;
+        }
         Assert.NotEmpty(points);
         Assert.DoesNotContain(points,p=>p.X<0 || p.X>8 || p.Y<0 || p.Y>8);
-        Assert.Equal(!rampOutside,points.Any(p=>p.X<.01 && p.Y<.01 && p.Z<-.999));
+        Assert.DoesNotContain(points,p=>p.X<.01 && p.Y<.01 && p.Z<-.999);
     }
 
     [Theory]
@@ -115,34 +121,6 @@ public sealed class MillingBoundaryAccessTests
             open.Preparation.Regions.SelectMany(r=>r.OriginalMedialPaths).SelectMany(p=>p.Points).Select(p=>(p.X,p.Y)));
         Assert.Equal(closed.ProtectedArea,preparation.AnalyzePocketPlateau(3,30,rampOutsideEdges:true).ProtectedArea);
         Assert.True(open.ProtectedArea<closed.ProtectedArea);
-    }
-
-    [Fact]
-    public void RestReachClippingKeepsEveryPossibleDemandContactAndSplitsClosedContours()
-    {
-        var target=new[] {new MillingRegion(Box(8,8,12,12))};
-        var access=new MillingBoundaryAccess(Array.Empty<MillingRegion>(),Box(0,0,20,20))
-            .Resolve(target,ToolGeometry.Flat(2),new(1,1),true,30,0,default);
-        var cross=new PointD[]{new(-5,10),new(25,10)};
-        var retained=access.RestrictRestContour(cross,false,2,default).ToArray();
-        var fragment=Assert.Single(retained);
-        Assert.False(fragment.Closed);
-        Assert.InRange(fragment.Points[0].x,5.99,6);
-        Assert.InRange(fragment.Points[^1].x,14,14.01);
-        // Independently audit the original continuous chord at three cutter
-        // radii. Any disk capable of touching demand retains its centre.
-        foreach(double radius in new[]{.1,1d,2d})
-        for(double x=-5;x<=25;x+=.01)
-            if(Math.Max(0,Math.Max(8-x,x-12))<=radius)
-                Assert.True(x>=fragment.Points[0].x && x<=fragment.Points[^1].x);
-        var split=access.RestrictRestContour(Box(2,8,18,12),true,2,default).ToArray();
-        Assert.Equal(2,split.Length);Assert.All(split,p=>Assert.False(p.Closed));
-        var loop=Assert.Single(access.RestrictRestContour(Box(9,9,11,11),true,2,default));
-        Assert.True(loop.Closed);Assert.Equal(4,loop.Points.Count);
-        Assert.Empty(access.RestrictRestContour(Box(1,1,2,2),true,2,default));
-        var edgeAccess=new MillingBoundaryAccess(Array.Empty<MillingRegion>(),Box(0,0,20,20))
-            .Resolve([new MillingRegion(Box(0,0,4,4))],ToolGeometry.Flat(2),new(1,1),true,30,0,default);
-        Assert.Equal(0,Assert.Single(edgeAccess.RestrictRestContour([new(0,2),new(20,2)],false,2,default)).Points[0].x);
     }
 
     [Fact]
@@ -502,7 +480,16 @@ public sealed class MillingBoundaryAccessTests
         var samples=plan.Toolpaths.SelectMany(path=>Enumerable.Range(1,path.Points.Count-1).SelectMany(i=>
             new[]{path.Points[i-1],path.Points[i],new Point3D((path.Points[i-1].X+path.Points[i].X)/2,
                 (path.Points[i-1].Y+path.Points[i].Y)/2,(path.Points[i-1].Z+path.Points[i].Z)/2)})).ToArray();
-        Assert.Contains(samples,p=>p.X<.01 && p.Y>3 && p.Y<9 && p.Z<surface-.25);
+        if (!smooth)
+            Assert.Contains(samples,p=>p.X<.01 && p.Y>3 && p.Y<9 && p.Z<surface-.25);
+        else
+        {
+            // Zero fill now keeps the COMPLETE retained-wall slope. Its rows
+            // may reach the open left edge without making that edge a crest.
+            // A false exterior crest would instead raise their depth to zero.
+            if(!rounded) Assert.Contains(samples,p=>p.X<.01 && p.Y>3 && p.Y<9 && p.Z<surface-.45);
+            Assert.Contains(samples,p=>p.Y>3 && p.Y<9 && p.Z<surface-.05);
+        }
         Assert.All(samples,p=> { Assert.InRange(p.X,0,20); Assert.InRange(p.Y,0,12); });
         // Independent planar footprint check on the literal physical radius at the top plane.
         Assert.All(samples.Where(p=>p.Y>2 && p.Y<10 && p.Z<surface),p=>

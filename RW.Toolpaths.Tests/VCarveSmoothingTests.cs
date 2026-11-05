@@ -237,22 +237,53 @@ public sealed class VCarveSmoothingTests
         var tool = new ToolGeometry(3) { VCarveProfile = profile, BottomRadius = 1.5875,
             TopRadius = 3, ConeLength = 20, TipAngleRadians = 2 * Math.Atan((3 - 1.5875) / 20) };
         double surface = (double)12.7f;
-        var result = VCarveToolpaths.Generate(new[] { new MillingRegion(VCarveSavedNarrowChannelFixture.Boundary) },
+        var witnesses = new List<string>();
+        var previousTrace = MillingGeometryTrace.Observer.Value;
+        MillingGeometryTrace.Observer.Value = (stage, batch, paths) => {
+            if (stage is "smoothing-input" or "protect-grade" or "stock-selected" or "source-circuits" or "routed-depth-passes")
+                foreach (var group in paths.GroupBy(p => p.Category))
+                    witnesses.Add($"stage={stage} batch={batch} category={group.Key} discDistance={DiscDistance(stage == "routed-depth-passes" ? group.ToArray() : VCarveSmoothing.CommandPaths(group.ToArray(), surface), stage == "routed-depth-passes" ? surface : 0):R}");
+        };
+        ToolpathPlan result;
+        try { result = VCarveToolpaths.Generate(new[] { new MillingRegion(VCarveSavedNarrowChannelFixture.Boundary) },
             tool, new DepthSchedule(6.35, 2) { SurfaceZ = surface, StartDepth = 6.35 },
             new VCarveOptions { SmoothVCarving = true, IncludeInteriorFill = false, EdgeFillWidth = 3.175,
-                StepOver = .4, DetectCurves = false, CalculateSweptArea = false }, BoostVoronoiProvider.CreateDefault());
-        const double witnessX = 304.5856925421331, witnessY = 450.02134666330767;
-        double distance = double.PositiveInfinity;
-        static double F3(float value) => double.Parse(value.ToString("F3", System.Globalization.CultureInfo.InvariantCulture),
-            System.Globalization.CultureInfo.InvariantCulture);
-        foreach (Point3D point in result.Toolpaths.SelectMany(path => path.Points))
+                StepOver = .4, DetectCurves = false, CalculateSweptArea = false }, BoostVoronoiProvider.CreateDefault()); }
+        finally { MillingGeometryTrace.Observer.Value = previousTrace; }
+        double distance = DiscDistance(result.Toolpaths, surface);
+        Assert.True(distance <= .004, $"Saved end-channel witness remains {distance:R} mm from the continuous commanded cutter sweep.\n"
+            + string.Join('\n', witnesses));
+
+        double DiscDistance(IReadOnlyList<TaggedToolpath> paths, double surfaceZ)
         {
-            double depth = -F3((float)point.Z - (float)surface);
-            if (depth <= 0) continue;
-            double dx = F3((float)point.X) - witnessX, dy = F3((float)point.Y) - witnessY;
-            distance = Math.Min(distance, Math.Sqrt(dx * dx + dy * dy) - profile.PhysicalRadiusAtDepth(depth));
+            const double witnessX = 304.5856925421331, witnessY = 450.02134666330767;
+            double distance = double.PositiveInfinity;
+            static double F3(float value) => double.Parse(value.ToString("F3", System.Globalization.CultureInfo.InvariantCulture),
+                System.Globalization.CultureInfo.InvariantCulture);
+            foreach (var path in paths)
+            for (int i = 1; i < path.Points.Count; i++)
+            {
+                Point3D Command(Point3D p) => new(F3((float)p.X), F3((float)p.Y), F3((float)p.Z - (float)surfaceZ));
+                var a = Command(path.Points[i - 1]); var b = Command(path.Points[i]);
+                double DistanceAt(double t)
+                {
+                    double depth = -a.Z - t * (b.Z - a.Z);
+                    if (depth <= 0) return double.PositiveInfinity;
+                    double dx = a.X + t * (b.X - a.X) - witnessX, dy = a.Y + t * (b.Y - a.Y) - witnessY;
+                    return Math.Sqrt(dx * dx + dy * dy) - profile.PhysicalRadiusAtDepth(depth);
+                }
+                // Real poses along the complete posted cut remain witnesses even
+                // when the contour family no longer puts an endpoint beside it.
+                double lo = 0, hi = 1;
+                for (int step = 0; step < 40; step++)
+                {
+                    double left = hi - (hi - lo) * .6180339887498949, right = lo + (hi - lo) * .6180339887498949;
+                    if (DistanceAt(left) <= DistanceAt(right)) hi = right; else lo = left;
+                }
+                distance = Math.Min(distance, Math.Min(Math.Min(DistanceAt(0), DistanceAt(1)), DistanceAt((lo + hi) / 2)));
+            }
+            return distance;
         }
-        Assert.True(distance <= .004, $"Saved end-channel witness remains {distance:R} mm from every commanded endpoint disc.");
     }
 
     [Fact]
@@ -399,7 +430,8 @@ public sealed class VCarveSmoothingTests
             new[] { (IReadOnlyList<PointD>)new PointD[] { new(0, 0), new(6, 0), new(6, 2), new(0, 2) } },
             new ToolGeometry(3) { BottomRadius = 0, TopRadius = 3, ConeLength = 10 }, new DepthSchedule(3, 1),
             new VCarveOptions { SmoothVCarving = true }, CancellationToken.None, null);
-        var actual = Assert.Single(result).Points;
+        Assert.Contains(result, p => p.Category == "clearing");
+        var actual = Assert.Single(result.Where(p => p.Category == "final-carve")).Points;
         Assert.Equal(path.Points[0], actual[0]);
         Assert.Equal(path.Points[^1], actual[^1]);
         foreach (var point in actual)
@@ -512,7 +544,7 @@ public sealed class VCarveSmoothingTests
     }
 
     [Fact]
-    public void SmoothCorrectionRestoresChangedChannelCoverageWithoutInteriorFill()
+    public void ZeroFillConstrainsChangedMedialAndRetainsTheCompleteSlope()
     {
         var tool = new ToolGeometry(5)
         { BottomRadius = 0, TopRadius = 5, ConeLength = 10, TipAngleRadians = 2 * Math.Atan(.5) };
@@ -525,9 +557,9 @@ public sealed class VCarveSmoothingTests
                 IncludeInteriorFill = false, DetectCurves = false }, CancellationToken.None, logs.Add);
         Assert.True(VCarveSmoothing.MaximumGrade(result) <= Math.Tan(Math.PI / 12) + 1e-8);
         Assert.Contains(result, path => path.Category == "clearing");
-        Assert.Contains(logs, message => message.Contains("widthVerified=True"));
-        Assert.Contains(logs, message => message.Contains("originalBoundaryProof=True"));
-        Assert.True(result[0].Points.Min(point => point.Z) > -3);
+        Assert.Contains(logs, message => message.Contains("stage=fill-limit event=complete")
+            && message.Contains("slopeAdditive=True"));
+        Assert.True(result.Single(p=>p.Category=="final-carve").Points.Min(point => point.Z) > -3);
     }
 
     [Theory]
@@ -559,7 +591,7 @@ public sealed class VCarveSmoothingTests
         try
         {
             result = VCarveSmoothing.Apply(raw, boundary, tool, new DepthSchedule(3, 1.5),
-                new VCarveOptions { SmoothVCarving = true, IncludeInteriorFill = false, DetectCurves = false },
+                new VCarveOptions { SmoothVCarving = true, IncludeInteriorFill = true, DetectCurves = false },
                 CancellationToken.None, logs.Add);
         }
         catch (Exception error) { throw new InvalidOperationException(string.Join(Environment.NewLine, logs), error); }

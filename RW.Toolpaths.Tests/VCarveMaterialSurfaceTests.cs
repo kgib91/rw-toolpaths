@@ -6,6 +6,118 @@ namespace RW.Toolpaths.Tests;
 public sealed class VCarveMaterialSurfaceTests
 {
     [Fact]
+    public void InheritedCellFloorsKeepLiteralProofDecisionsAtPriorSweepAndPartEdges()
+    {
+        var part=Rectangle(-6,-3,6,3);
+        var target=Rectangle(-.35,-2,.35,2);
+        var sweep=new VCarveClearedSweep(Rounded,[new(new(-4,0,-2),new(4,0,-6),0)]);
+        var control=new VCarveProjectedStock([], [target],part,Rounded,8,default,[sweep],
+            memoRefusals:false,inheritCellClearance:false);
+        var inherited=new VCarveProjectedStock([], [target],part,Rounded,8,default,[sweep],memoRefusals:false);
+        int accepted=0,refused=0;
+        foreach(bool clearedOnly in new[]{false,true})
+        foreach(bool postingReserve in new[]{false,true})
+        foreach(double depth in new[]{.5,1.5,3.5,5.5})
+        for(int x=-5;x<=5;x++)
+        foreach(double y in new[]{0,.4,2.9})
+        {
+            var a=new Point3D(x+.037,y,-depth);
+            var b=a with{X=a.X+.017,Z=a.Z+.023};
+            foreach(var end in new[]{a,b})
+            {
+                bool expected=control.Prove(a,end,clearedOnly,postingReserve);
+                Assert.Equal(expected,inherited.Prove(a,end,clearedOnly,postingReserve));
+                if(expected)accepted++;else refused++;
+            }
+        }
+        Assert.True(accepted>0);Assert.True(refused>0);
+        Assert.True(inherited.InheritedStockCellProofs>0);
+        Console.WriteLine($"[Stock.InheritedFloors] accepted={accepted} refused={refused} "
+            +$"inheritedWholeChildProofs={inherited.InheritedStockCellProofs} literalReferenceDecisions=True partAndTargetPermissionsSeparate=True");
+    }
+
+    [Fact]
+    public void ParallelMedialFitsRetainEveryOriginalSiteWithinTheExistingSurfaceBound()
+    {
+        var target=Rectangle(-5,-8,5,8);
+        var stock=new VCarveClearedStock(Sweeps(6.35),[6.35],Rectangle(-12,-12,12,12));
+        var source=Enumerable.Range(0,8).Select(row=>{
+            var points=Enumerable.Range(0,801).Select(i=>new Point3D(-4+i*.01,row*.005,-3)).ToArray();
+            if(row%2!=0)Array.Reverse(points);
+            return new TaggedToolpath(points,[],row,"final-carve",0,detectCurves:false);
+        }).ToList();
+        var serial=new VCarveMaterialSurface([target],stock,Rounded,12.7,12.7,default,null,
+            parallelMedialFits:false).Apply(source);
+        var parallel=new VCarveMaterialSurface([target],stock,Rounded,12.7,12.7,default,null).Apply(source);
+        var independent=new VCarveMaterialSurface([target],stock,Rounded,12.7,12.7,default,null,
+            parallelMedialFits:false);
+        Assert.Equal(serial.Count,parallel.Count);
+        double maximum=0;
+        for(int i=0;i<source.Count;i++)
+        {
+            var before=serial[i].Points.GroupBy(p=>(p.X,p.Y)).ToDictionary(g=>g.Key,g=>g.Min(p=>p.Z));
+            var after=parallel[i].Points.GroupBy(p=>(p.X,p.Y)).ToDictionary(g=>g.Key,g=>g.Min(p=>p.Z));
+            foreach(var point in source[i].Points)
+            {
+                Assert.True(before.ContainsKey((point.X,point.Y)));
+                Assert.True(after.ContainsKey((point.X,point.Y)));
+                maximum=Math.Max(maximum,Math.Abs(before[(point.X,point.Y)]-after[(point.X,point.Y)]));
+            }
+            foreach(var (a,b) in parallel[i].Points.Zip(parallel[i].Points.Skip(1)))
+                Assert.True(independent.IsLegalChord(a,b));
+        }
+        Assert.InRange(maximum,0,.004);
+        Console.WriteLine($"[MedialFit.Equivalence] originalSites={source.Sum(p=>p.Points.Count)} maximumSiteDepthChange={maximum:R} "
+            +"originalXYRetained=True fullIndependentNativeAndF3Proof=True surfaceBoundMm=0.004");
+    }
+
+    [Fact]
+    public void RefusalWitnessesKeepFullProofDecisionsAgainstVariableDepthPriorProfiles()
+    {
+        var sweep=new VCarveClearedSweep(Rounded,[new(new(-4,0,-1),new(4,0,-6),0)]);
+        var part=Rectangle(-12,-12,12,12);
+        var control=new VCarveProjectedStock([],[],part,Rounded,10,default,[sweep],memoRefusals:false);
+        var cached=new VCarveProjectedStock([],[],part,Rounded,10,default,[sweep]);
+        int accepted=0,refused=0;
+        foreach(double shift in new[]{-.2,.05,.15,.5})
+        for(int i=1;i<20;i++)
+        foreach(double y in new[]{.2,0,-.2,.03})
+        {
+            double t=i/20d;
+            var point=new Point3D(-4+8*t,y,-1-5*t+shift);
+            bool expected=control.Prove(point,point);
+            Assert.Equal(expected,cached.Prove(point,point));
+            if(expected)accepted++;else refused++;
+        }
+        Assert.True(accepted>0);Assert.True(refused>0);
+        Assert.True(cached.RefusalWitnessHits>0);
+    }
+
+    [Fact]
+    public void BoundedDyadicCellMemoRetainsIndependentHoleClearanceAcrossEviction()
+    {
+        var outer=Rectangle(-10,-10,10,10);
+        var hole=Rectangle(-1,-1,1,1);Array.Reverse(hole);
+        var cylinder=new VCarveCutterProfile([new(CarvingCutterSectionKind.Linear,1,1,10)],10);
+        var small=new VCarveProjectedStock([], [outer,hole],outer,cylinder,2,default,cellCacheLimit:64);
+        var control=new VCarveProjectedStock([], [outer,hole],outer,cylinder,2,default,memoRefusals:false);
+        for(int iy=-20;iy<=20;iy++)
+        for(int ix=-20;ix<=20;ix++)
+        {
+            var pose=new Point3D(ix*.3+.07,iy*.3+.11,-1);
+            double dx=Math.Max(0,Math.Abs(pose.X)-1),dy=Math.Max(0,Math.Abs(pose.Y)-1);
+            double distance=Math.Sqrt(dx*dx+dy*dy);
+            if(Math.Abs(distance-1.002)<.01)continue;
+            bool expected=distance>1.002;
+            Assert.Equal(expected,control.Prove(pose,pose));
+            Assert.Equal(expected,small.Prove(pose,pose));
+        }
+        Assert.True(small.StockCellCacheEvictions>0);
+        var outsidePackedDomain=new Point3D(1_100_000,0,-1);
+        Assert.False(small.Prove(outsidePackedDomain,outsidePackedDomain));
+    }
+
+    [Fact]
     public void ProfileForestsPreserveTheIndependentMixedToolRemovalEnvelope()
     {
         var cone=new VCarveCutterProfile([new(CarvingCutterSectionKind.Linear,0,3,6)],6);
@@ -33,82 +145,6 @@ public sealed class VCarveMaterialSurfaceTests
         }
         Assert.Equal(4,stock.ProfileForests);
         Assert.True(stock.ProfileNodesPruned>0);
-    }
-
-    [Fact]
-    public void ShoulderNominationsAcrossTheOriginalEdgeStillPointIntoTheFilledTarget()
-    {
-        var field=Field(Rectangle(-5,-8,5,8),Sweeps(6.35));
-        // A simplified concave front can cross to the protected side. The
-        // source is only a nomination; its side must not reverse compensation.
-        var nomination=new TaggedToolpath(new Point3D[]{new(-5.001,-3,-12.7),new(-5.001,3,-12.7)},
-            [],0,"clearing",0,detectCurves:false);
-        var paths=field.Apply([nomination],new HashSet<TaggedToolpath>{nomination});
-        Assert.NotEmpty(paths);
-        double radius=1.5875+(6.35-1.5875)*(3-1.5875)/20;
-        Assert.All(paths.SelectMany(p=>p.Points),p=> {
-            Assert.InRange(p.X,-5+radius,-5+radius+.004);
-            Assert.Equal(-12.7,p.Z,8);
-        });
-        var independent=Field(Rectangle(-5,-8,5,8),Sweeps(6.35));
-        Assert.All(paths.SelectMany(p=>p.Points.Zip(p.Points.Skip(1))),
-            chord=>Assert.True(independent.IsLegalChord(chord.First,chord.Second)));
-    }
-
-    [Fact]
-    public void BoundedCurvedNominationsRetainPhysicalShoulderContactAtOriginalEdges()
-    {
-        var target=Enumerable.Range(0,200).Select(i=>new PointD(6*Math.Cos(i*Math.PI/100),
-            8*Math.Sin(i*Math.PI/100))).ToArray();
-        var nominations=VCarveToolpaths.BuildShoulderBoundary(new(target),0).Select(r=> {
-            var points=r.Select(p=>new Point3D(p.x,p.y,-12.7)).ToList();points.Add(points[0]);
-            return new TaggedToolpath(points,[],0,"clearing",0,detectCurves:false);
-        }).ToList();
-        var paths=Field(target,Sweeps(6.35)).Apply(nominations,new HashSet<TaggedToolpath>(nominations));
-        Assert.NotEmpty(paths);
-        var chords=paths.SelectMany(p=>p.Points.Zip(p.Points.Skip(1))).ToArray();
-        // Independent floor-plane taper footprint; every original edge gets a
-        // contact check, regardless of which nomination vertices survived.
-        foreach(var edge in target.Zip(target.Skip(1).Append(target[0])))
-        {
-            double x=(edge.First.x+edge.Second.x)/2,y=(edge.First.y+edge.Second.y)/2;
-            double gap=chords.Min(c=> {
-                double dx=c.Second.X-c.First.X,dy=c.Second.Y-c.First.Y;
-                double l2=dx*dx+dy*dy;
-                double t=l2>0?Math.Clamp(((x-c.First.X)*dx+(y-c.First.Y)*dy)/l2,0,1):0;
-                double penetration=-(c.First.Z+t*(c.Second.Z-c.First.Z))-6.35;
-                double radius=penetration<=0?0:penetration<1.5875
-                    ?Math.Sqrt(penetration*(3.175-penetration))
-                    :1.5875+(penetration-1.5875)*(3-1.5875)/20;
-                return Math.Sqrt(Math.Pow(x-c.First.X-t*dx,2)+Math.Pow(y-c.First.Y-t*dy,2))-radius;
-            });
-            Assert.InRange(gap,-.00001,MachiningAccuracy.SurfaceDeviation);
-        }
-        var independent=Field(target,Sweeps(6.35));
-        Assert.All(chords,c=>Assert.True(independent.IsLegalChord(c.First,c.Second)));
-    }
-
-    [Fact]
-    public void CurvedShoulderNominationsRetainContactWithTheOriginalBoundary()
-    {
-        var source=Enumerable.Range(0,200).Select(i=>new PointD(6*Math.Cos(i*Math.PI/100),
-            8*Math.Sin(i*Math.PI/100))).ToArray();
-        var front=VCarveToolpaths.BuildShoulderBoundary(new(source),0);
-        double Distance(PointD p,PointD a,PointD b)
-        {
-            double dx=b.x-a.x,dy=b.y-a.y;
-            double t=Math.Clamp(((p.x-a.x)*dx+(p.y-a.y)*dy)/(dx*dx+dy*dy),0,1);
-            return Math.Sqrt(Math.Pow(p.x-a.x-t*dx,2)+Math.Pow(p.y-a.y-t*dy,2));
-        }
-        for(int i=0;i<source.Length;i++)
-        {
-            var a=source[i];var b=source[(i+1)%source.Length];var middle=new PointD((a.x+b.x)/2,(a.y+b.y)/2);
-            double distance=front.Min(r=>Enumerable.Range(0,r.Count).Min(j=>Distance(middle,r[j],r[(j+1)%r.Count])));
-            // Only nomination geometry uses this budget. Physical fitting
-            // independently projects onto and protects the original boundary.
-            double error=MachiningAccuracy.SurfaceDeviation/2+1/PathUtils.Scale;
-            Assert.InRange(distance,Math.Max(0,VCarveMaterialSurface.PlanarReserve-error),VCarveMaterialSurface.PlanarReserve+error);
-        }
     }
 
     [Fact]
@@ -359,6 +395,51 @@ public sealed class VCarveMaterialSurfaceTests
     }
 
     [Fact]
+    public void PriorStockKeepsNativePerimetersAndMedialSourcesWithoutSupplementalContours()
+    {
+        var original = new List<TaggedToolpath>();
+        var fitted = new List<TaggedToolpath>();
+        var stages = new List<string>();
+        var previous = MillingGeometryTrace.Observer.Value;
+        try
+        {
+            MillingGeometryTrace.Observer.Value = (stage, region, paths) => {
+                previous?.Invoke(stage, region, paths);
+                stages.Add(stage);
+                if (stage == "vcarve-original-sources") original.AddRange(paths);
+                if (stage == "vcarve-material-fitted") fitted.AddRange(paths);
+            };
+            VCarveToolpaths.Generate([new MillingRegion(Rectangle(-5, -8, 5, 8))],
+                new ToolGeometry(3) { VCarveProfile = Rounded },
+                new DepthSchedule(12.7, 2) { StartDepth = 12.7, SurfaceZ = 12.7 },
+                new VCarveOptions { IncludeInteriorFill = false, DetectCurves = false,
+                    CalculateSweptArea = false,
+                    ClearedStock = new(Sweeps(6.35), [6.35], Rectangle(-12, -12, 12, 12)) },
+                BoostVoronoiProvider.CreateDefault());
+        }
+        finally { MillingGeometryTrace.Observer.Value = previous; }
+
+        Assert.Contains(original, p => p.Category == "clearing");
+        Assert.Contains(original, p => p.Category == "final-carve");
+        Assert.Equal(original.Count, fitted.Count);
+        Assert.DoesNotContain("vcarve-shoulder-nominations", stages);
+        foreach (var (source, result) in original.Zip(fitted))
+        {
+            Assert.Equal(source.Category, result.Category);
+            Assert.Equal(source.DepthPassIndex, result.DepthPassIndex);
+            if (source.Category != "final-carve") Assert.Equal(source.Points, result.Points);
+            else
+            {
+                int next = 0;
+                foreach (var point in result.Points)
+                    if (next < source.Points.Count && point.X == source.Points[next].X
+                        && point.Y == source.Points[next].Y) next++;
+                Assert.Equal(source.Points.Count, next);
+            }
+        }
+    }
+
+    [Fact]
     public void PublicGenerationKeepsTheCompleteNarrowTerminalContactBelowTheLowerSurface()
     {
         var tool = new ToolGeometry(3) { VCarveProfile = Rounded };
@@ -369,19 +450,15 @@ public sealed class VCarveMaterialSurfaceTests
             new DepthSchedule(12.7, 2) { StartDepth = 12.7, SurfaceZ = 12.7 },
             options, BoostVoronoiProvider.CreateDefault());
 
-        // Terminal contact belongs to the same coherent contour family. Its
-        // source can link to the preceding lap without becoming a separate
-        // legacy medial/category path. Require its complete deepest flat Cut
-        // and the same actual material section, independent of that grouping.
-        var laps=plan.Toolpaths.Where(p=>p.Category=="clearing").SelectMany(p=>p.Spans
-            .Where(s=>s.Kind==ToolpathSpanKind.Cut).Select(s=>p.Points.Skip(s.StartIndex).Take(s.PointCount).ToArray()))
-            .Where(p=>p.Length>=4&&p[0]==p[^1]&&p.All(q=>q.Z==p[0].Z)).ToArray();
-        Assert.NotEmpty(laps);
-        double deepest=laps.Min(p=>p[0].Z);
-        var detail=Assert.Single(laps.Where(p=>p[0].Z==deepest));
-        Assert.All(detail,p=>Assert.InRange(p.Z,6.25,6.351));
-        Assert.Contains(CutContactsAtYZero(plan,"clearing"),p=>Math.Abs(p.X)<.01
-            &&p.Z>=6.25&&p.Z<=6.351);
+        var cuts=plan.Toolpaths.Where(p=>p.Category=="final-carve").SelectMany(p=>
+            (p.Spans.Count > 0 ? p.Spans : new[] { new ToolpathSpan(0, p.Points.Count - 1, ToolpathSpanKind.Cut) })
+            .Where(s=>s.Kind==ToolpathSpanKind.Cut).SelectMany(s=>Enumerable.Range(s.StartIndex,s.MoveCount)
+                .Select(i=>(A:p.Points[i],B:p.Points[i+1])))).ToArray();
+        double expectedZ=6.35-(1.5875-Math.Sqrt(1.5875*1.5875-.5*.5));
+        for(double y=-7;y<=7;y+=.5)
+            Assert.Contains(cuts,c=>Math.Min(c.A.Y,c.B.Y)<=y&&Math.Max(c.A.Y,c.B.Y)>=y
+                &&Math.Abs(c.A.X)<.01&&Math.Abs(c.B.X)<.01
+                &&Math.Abs(c.A.Z-expectedZ)<.004&&Math.Abs(c.B.Z-expectedZ)<.004);
     }
 
     [Fact]
@@ -411,122 +488,6 @@ public sealed class VCarveMaterialSurfaceTests
     private static VCarveMaterialSurface Field(PointD[] target, IReadOnlyList<VCarveRoughingChord> chords)
         => new([target], new(chords, [6.35], Rectangle(-12, -12, 12, 12)), Rounded, 12.7, 12.7, default, null);
 
-    [Theory]
-    [InlineData(8, 6.35)]
-    [InlineData(-2, 6.35)]
-    [InlineData(8, 12.7)]
-    [InlineData(-2, 12.7)]
-    public void LoweredShoulderFrontReachesStraightEdgesWithoutLosingTallWallProtection(int lastX, double scheduledStart)
-    {
-        const double floor = 6.35;
-        var stock = new VCarveClearedStock(Sweeps(floor, lastX), [floor], Rectangle(-12, -12, 12, 12));
-        var target = Rectangle(-5, -8, 5, 8);
-        var plan = VCarveToolpaths.Generate([new(target)], new ToolGeometry(3) { VCarveProfile = Rounded },
-            new DepthSchedule(12.7, 6.35) { StartDepth = scheduledStart, SurfaceZ = 12.7 },
-            new VCarveOptions { IncludeInteriorFill = false, DetectCurves = false,
-                CalculateSweptArea = false, ClearedStock = stock },
-            BoostVoronoiProvider.CreateDefault());
-        // Independently evaluate the actual taper radius at the cleared plane.
-        double radius = 1.5875 + (floor - 1.5875) * (3 - 1.5875) / 20;
-        var cuts = plan.Toolpaths.Where(p => p.Category == "clearing").SelectMany(p =>
-            p.Points.Zip(p.Points.Skip(1))).ToArray();
-        foreach (double sign in new[] { -1d, 1d })
-        {
-            double contactRadius = lastX < 0 && sign > 0
-                ? 1.5875 + (12.7 - 1.5875) * (3 - 1.5875) / 20 : radius;
-            Assert.True(cuts.Any(chord =>
-                Math.Abs(chord.First.Z) < .02 && Math.Abs(chord.Second.Z) < .02
-                && Math.Min(chord.First.Y, chord.Second.Y) <= 0 && Math.Max(chord.First.Y, chord.Second.Y) >= 0
-                && Math.Abs(chord.First.X - sign * (5 - contactRadius)) < .004
-                && Math.Abs(chord.Second.X - sign * (5 - contactRadius)) < .004),
-                $"Missing contact at x={sign * (5-contactRadius):R}; " + string.Join("; ", plan.Toolpaths
-                    .Where(p=>p.Category=="clearing").Select(p=>$"points={p.Points.Count} x={p.Points.Min(q=>q.X):R}..{p.Points.Max(q=>q.X):R} minZ={p.Points.Min(q=>q.Z):R}")));
-        }
-        var guard = new VCarveMaterialSurface([target], stock, Rounded, 12.7, 12.7, default, null);
-        foreach (var path in plan.Toolpaths)
-        foreach (var chord in path.Points.Zip(path.Points.Skip(1)))
-            Assert.True(guard.IsLegalChord(chord.First with { Z = chord.First.Z - 12.7 },
-                chord.Second with { Z = chord.Second.Z - 12.7 }));
-    }
-
-    [Fact]
-    public void FittingClearingFrontDoesNotDeepenItsScheduledPass()
-    {
-        var field = Field(Rectangle(-.5, -8, .5, 8), Sweeps(6.35));
-        var nomination = new TaggedToolpath(new Point3D[] { new(0,-3,-6.4), new(0,3,-6.4) },
-            Array.Empty<ToolpathSpan>(), 0, "clearing", 0, detectCurves:false);
-        var path = Assert.Single(field.Apply([nomination], new HashSet<TaggedToolpath> { nomination }));
-        Assert.All(path.Points, point => Assert.InRange(point.Z, -6.4, -6.399));
-    }
-
-    [Fact]
-    public void NarrowMixedHeightChannelContactsTheLowerEdgeByShiftingItsCutterAxis()
-    {
-        var stock = new VCarveClearedStock(Sweeps(6.35, -2), [6.35], Rectangle(-12,-12,12,12));
-        var plan = VCarveToolpaths.Generate([new(Rectangle(-1.9,-8,1.9,8))],
-            new ToolGeometry(3) { VCarveProfile = Rounded },
-            new DepthSchedule(12.7,6.35) { StartDepth=12.7, SurfaceZ=12.7 },
-            new VCarveOptions { IncludeInteriorFill=false, DetectCurves=false, CalculateSweptArea=false, ClearedStock=stock },
-            BoostVoronoiProvider.CreateDefault());
-        var contacts = plan.Toolpaths.Where(p=>p.Category=="clearing").SelectMany(p=>p.Points.Zip(p.Points.Skip(1)))
-            .Where(c=>Math.Min(c.First.Y,c.Second.Y)<=0 && Math.Max(c.First.Y,c.Second.Y)>=0
-                && Math.Abs(c.Second.Y-c.First.Y)>1e-12)
-            .Select(c=> {
-                double t=-c.First.Y/(c.Second.Y-c.First.Y);
-                return new Point3D(c.First.X+t*(c.Second.X-c.First.X),0,c.First.Z+t*(c.Second.Z-c.First.Z));
-            }).ToArray();
-        // Independent taper contact equations: outside = R(depth-6.35),
-        // inside = R(depth); their sum must fit the 3.8-mm opening.
-        double expectedOuterRadius=(3.8-6.35*(3-1.5875)/20)/2;
-        Assert.Contains(contacts,p=>Math.Abs(p.X-(-1.9+expectedOuterRadius))<.005
-            && 12.7-p.Z>8.9 && 12.7-p.Z<9.2);
-        Assert.Contains(contacts,p=> {
-            double penetration=12.7-p.Z-6.35;
-            if(penetration<=0)return false;
-            double footprint=penetration<=1.5875 ? Math.Sqrt(penetration*(3.175-penetration))
-                : 1.5875+(penetration-1.5875)*(3-1.5875)/20;
-            return Math.Abs(p.X+1.9-footprint)<.006;
-        });
-    }
-
-    [Fact]
-    public void StraightBallContactsALoweredEdgeWhenItsFullDiameterCannotFitTheOpening()
-    {
-        var ball = new VCarveCutterProfile([new(CarvingCutterSectionKind.Hemisphere,0,1,1),
-            new(CarvingCutterSectionKind.Linear,1,1,10)],11);
-        var plan = VCarveToolpaths.Generate([new(Rectangle(-.6,-8,.6,8))], new ToolGeometry(1) { VCarveProfile=ball },
-            new DepthSchedule(10,5) { StartDepth=10, SurfaceZ=12.7 },
-            new VCarveOptions { IncludeInteriorFill=false, DetectCurves=false, CalculateSweptArea=false,
-                ClearedStock=new(Sweeps(6.35,-2),[6.35],Rectangle(-12,-12,12,12)) }, BoostVoronoiProvider.CreateDefault());
-        double expectedDepth=6.35+1-Math.Sqrt(1-.2*.2);
-        var points=CutContactsAtYZero(plan,"clearing");
-        Assert.True(points.Any(p=>Math.Abs(p.Y)<.5 && Math.Abs(p.X+.4)<.005 && Math.Abs(12.7-p.Z-expectedDepth)<.002),
-            "Actual F3 cutting-chord contacts at Y=0: "+string.Join("; ",points.Take(15)));
-    }
-
-    [Fact]
-    public void RefusedShoulderContactAddsNoCutAndNeverCreditsADeclaredFloor()
-    {
-        var field=Field(Rectangle(-.5,-8,.5,8), []);
-        var source=new TaggedToolpath(new Point3D[] {new(-.498,-3,-12.7),new(-.498,3,-12.7)},
-            Array.Empty<ToolpathSpan>(),0,"clearing",0,detectCurves:false);
-        Assert.Empty(field.Apply([source],new HashSet<TaggedToolpath> { source }));
-    }
-
-    [Theory]
-    [InlineData(12.7)]
-    [InlineData(8)]
-    public void CylinderUsesExecutedOutsideClearanceToFinishAStripNarrowerThanItsDiameter(double priorDepth)
-    {
-        var cylinder=new VCarveCutterProfile([new(CarvingCutterSectionKind.Linear,1,1,20)],20);
-        var plan=VCarveToolpaths.Generate([new(Rectangle(-.6,-8,.6,8))],new ToolGeometry(1) { VCarveProfile=cylinder },
-            new DepthSchedule(10,5) { StartDepth=10, SurfaceZ=12.7 },
-            new VCarveOptions { IncludeInteriorFill=false,DetectCurves=false,CalculateSweptArea=false,
-                ClearedStock=new(Sweeps(priorDepth,-2),[priorDepth],Rectangle(-12,-12,12,12)) },BoostVoronoiProvider.CreateDefault());
-        Assert.Contains(CutContactsAtYZero(plan,"clearing"),
-            p=>Math.Abs(p.Y)<.5 && Math.Abs(p.X+.4)<.005 && Math.Abs(p.Z-(12.7-Math.Min(10,priorDepth)))<.003);
-    }
-
     [Fact]
     public void VerticalWithdrawalRetainsTheCompleteDeepestCutterPoseProof()
     {
@@ -539,28 +500,6 @@ public sealed class VCarveMaterialSurfaceTests
         Assert.True(field.IsLegalChord(deep,deep));
         Assert.True(field.IsLegalChord(deep,raised));
         Assert.True(field.IsLegalChord(raised,deep));
-    }
-
-    // A complete original straight edge has the same contact when represented
-    // by one chord or collinear subdivisions. Evaluate the actual F3 CUTTING
-    // locus at the original section; neither arbitrary vertex density nor a
-    // cleared-travel point establishes the physical contact requirement.
-    private static Point3D[] CutContactsAtYZero(ToolpathPlan plan,string category)
-    {
-        var result=new List<Point3D>();
-        foreach(var path in plan.Toolpaths.Where(p=>p.Category==category))
-        foreach(var span in path.Spans.Where(s=>s.Kind is ToolpathSpanKind.Cut or ToolpathSpanKind.Ramp))
-        for(int i=span.StartIndex+1;i<=span.EndIndex;i++)
-        {
-            Point3D Posted(Point3D p)=>new(ToolpathCommandRounding.Round((float)p.X),
-                ToolpathCommandRounding.Round((float)p.Y),ToolpathCommandRounding.Round((float)p.Z));
-            var a=Posted(path.Points[i-1]);var b=Posted(path.Points[i]);
-            if(Math.Min(a.Y,b.Y)>0||Math.Max(a.Y,b.Y)<0)continue;
-            if(a.Y==b.Y){result.Add(a);result.Add(b);continue;}
-            double t=-a.Y/(b.Y-a.Y);
-            result.Add(new(a.X+t*(b.X-a.X),0,a.Z+t*(b.Z-a.Z)));
-        }
-        return result.ToArray();
     }
 
     private static VCarveRoughingChord[] Sweeps(double depth, int lastX = 8)

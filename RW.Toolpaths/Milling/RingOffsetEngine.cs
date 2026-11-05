@@ -315,8 +315,8 @@ public static class RingOffsetEngine
                     ArcTolerance = Math.Min(options.Tolerances.ArcTolerance, DenseFirstArcExperimentLimit), SimplifyTolerance = 0 };
                 Console.WriteLine($"[RingOffsetEngine.FirstArcExperiment] region={regionIndex} "
                     + $"sourcePoints={preparedOffset.SourcePointCount} firstArc={firstTolerances.ArcTolerance:R} "
-                    + "construction=compensated-original-boundary-stroke originalWalls=True "
-                    + "terminalSource=complete-original coverageReserve=unchanged ordinaryJoins=native-tick");
+                    + $"construction=compensated-original-boundary-stroke originalWalls=True "
+                    + $"terminalSource=complete-original coverageReserve=unchanged ordinaryJoins=native-tick");
             }
             var firstOffset = firstTolerances is null || firstTolerances == options.Tolerances
                 ? preparedOffset
@@ -412,7 +412,7 @@ public static class RingOffsetEngine
                     stopReason="target-contact-exhausted";
                     Console.WriteLine($"[RingOffsetEngine.TargetContact] region={regionIndex} level={level} "
                         + $"lastInset={currentDistance:R} bound={options.MaximumRelevantDistance:R} "
-                        + "decision=stop-remote-clearance-levels physicalWall=False");
+                        + $"decision=stop-remote-clearance-levels physicalWall=False");
                     break;
                 }
 
@@ -537,7 +537,7 @@ public static class RingOffsetEngine
                         if (!PreparedClosedSweep.SameIntegerSweep(closedSweep, reconstructed, cancellationToken))
                         {
                             Console.Error.WriteLine($"[RingOffsetEngine.ClosedSweepMismatch] region={regionIndex} level={level} "
-                                + "kind=final-audited-complete-ordered-front exactIntegerSweep=False decision=abort");
+                                + $"kind=final-audited-complete-ordered-front exactIntegerSweep=False decision=abort");
                             throw new InvalidOperationException("Final audited closed sweep disagreed with original history construction.");
                         }
                     }
@@ -553,7 +553,7 @@ public static class RingOffsetEngine
                         + $"closedSweepReused={closedSweepReused} "
                         + $"area={Math.Abs(emittedSweepHistory.Sum(PolygonOps.SignedArea)):R} "
                         + $"owner=accepted-emitted-physical-sweeps explicitEmptySpace={options.KnownEmptyBoundary is {Count:>0}} "
-                        + "rejectedTrialsCredited=False");
+                        + $"rejectedTrialsCredited=False");
                 }
 
                 if (polygons.Count == 0)
@@ -730,7 +730,7 @@ public static class RingOffsetEngine
             + $"policyCaptured={options.ParentLocalRescueModeCaptured} "
             + $"capturedReferenceOrDisabled={!options.ParentLocalRescueProposals} "
             + $"mode={(enabled ? "qualified-proposal" : "original-search")} "
-            + "qualification=complete-original-finite-source currentFrontSizeIndependent=True");
+            + $"qualification=complete-original-finite-source currentFrontSizeIndependent=True");
         return options with { ParentLocalRescueProposals = enabled };
     }
 
@@ -885,7 +885,7 @@ public static class RingOffsetEngine
         }
         Console.WriteLine($"[RingOffsetEngine.CompletedHistory] completedChildren={completed} "
             + $"retainedContours={retained.Count} coverageError={coverageError:R} "
-            + "proof=accepted-emitted-cutter-sweeps holesPreserved=True");
+            + $"proof=accepted-emitted-cutter-sweeps holesPreserved=True");
         return retained;
     }
 
@@ -912,7 +912,7 @@ public static class RingOffsetEngine
         {
             Console.WriteLine($"[RingOffsetEngine.EmptyChildProof] decision=skip reason=no-generated-child " +
                 $"currentContours={current.Count} generatedContours=0 " +
-                "physicalCoverageComputed=False stockAuthorityComputed=False parentFrontUnchanged=True");
+                $"physicalCoverageComputed=False stockAuthorityComputed=False parentFrontUnchanged=True");
             return generated;
         }
         // Low pitches need no adaptive shell search, but a filled component whose
@@ -1086,15 +1086,15 @@ public static class RingOffsetEngine
                         + $"requestedInset={requestedDistance:R} owners={parentLocalResult.Owners} parentPoints={parentLocalResult.ParentPoints} "
                         + $"localOffsets={parentLocalResult.Attempts} tracePoints={parentLocalResult.TracePoints} "
                         + $"gapBefore={parentLocalResult.GapBefore:R} gapAfter={parentLocalResult.GapAfter:R} "
-                        + "originalRequestedSweep=True finalCommandFrontProof=True fullSignedShellProof=True "
-                        + "requestedClosedDistanceUnchanged=True rejectedProposalCredited=False");
+                        + $"originalRequestedSweep=True finalCommandFrontProof=True fullSignedShellProof=True "
+                        + $"requestedClosedDistanceUnchanged=True rejectedProposalCredited=False");
                     break;
                 }
                 parentLocalRefusals++;
                 Console.WriteLine($"[RingOffsetEngine.ParentLocalRescue] event=fallback region={regionIndex} level={parentLevel + 1} "
                     + $"requestedInset={requestedDistance:R} reason={parentLocalResult.Reason} localOffsets={parentLocalResult.Attempts} "
                     + $"gapBefore={parentLocalResult.GapBefore:R} gapAfter={parentLocalResult.GapAfter:R} "
-                    + "fallback=original-halving-and-eight-refinements rejectedProposalCredited=False");
+                    + $"fallback=original-halving-and-eight-refinements rejectedProposalCredited=False");
                 // No paths, distance, prefix or prepared closed sweep changed.
                 // Continue precisely the original search from its first refusal.
             }
@@ -1106,7 +1106,7 @@ public static class RingOffsetEngine
                 {
                     Console.WriteLine($"[RingOffsetEngine.AcceptedInsetFallback] region={regionIndex} level={parentLevel + 1} "
                         + $"shellGapArea={lastGap:R} reason=seeded-construction-advance-unproved "
-                        + "fallback=established-compacted-trial-search");
+                        + $"fallback=established-compacted-trial-search");
                     ReportStages(accepted: false);
                     return SelectCoherentFront(source, regionIndex, parentLevel, current, currentDistance,
                         requestedDistance, establishedOffsetFromSource(requestedDistance), options with {
@@ -1148,7 +1148,7 @@ public static class RingOffsetEngine
                 Console.WriteLine($"[RingOffsetEngine.CoherenceCompaction] event=fallback region={regionIndex} level={parentLevel + 1} "
                     + $"selectedInset={safe.Distance:R} compactShellGapArea={final.ShellGapArea:R} "
                     + $"selectedCleanupProposal={options.SelectedCleanupProposals} "
-                    + "reason=final-command-front-unproved fallback=established-compacted-trial-search fullMutualProofRequired=True rejectedProposalCredited=False");
+                    + $"reason=final-command-front-unproved fallback=established-compacted-trial-search fullMutualProofRequired=True rejectedProposalCredited=False");
                 ReportStages(accepted: false);
                 // Repeat the established search against precisely the original
                 // source construction and compact every attempted front. A raw
@@ -1163,7 +1163,7 @@ public static class RingOffsetEngine
             Console.WriteLine($"[RingOffsetEngine.CoherenceCompaction] event=accept region={regionIndex} level={parentLevel + 1} "
                 + $"selectedInset={safe.Distance:R} rawSearchTrials={trials} compactedCandidates=1 "
                 + $"selectedCleanupProposal={options.SelectedCleanupProposals} "
-                + "finalCommandFrontProof=True fullSignedShellProof=True rejectedRawFrontsCredited=False");
+                + $"finalCommandFrontProof=True fullSignedShellProof=True rejectedRawFrontsCredited=False");
         }
         Console.WriteLine($"[RingOffsetEngine.Coherence] event=accept region={regionIndex} level={parentLevel + 1} " +
             $"acceptedInset={safe.Distance:R} requestedAdvance={requestedAdvance:R} actualAdvance={safe.Distance - currentDistance:R} " +
@@ -1258,7 +1258,7 @@ public static class RingOffsetEngine
                         {
                             Console.Error.WriteLine($"[RingOffsetEngine.PreparedGapMismatch] region={regionIndex} level={parentLevel + 1} "
                                 + $"kind=fresh-disc witness=({witness.X},{witness.Y}) radius={currentGap!.LastWitnessRadius:R} "
-                                + "originalGap=0 decision=abort");
+                                + $"originalGap=0 decision=abort");
                             throw new InvalidOperationException("Fresh-disc child retention disagreed with original coverage morphology.");
                         }
                     }

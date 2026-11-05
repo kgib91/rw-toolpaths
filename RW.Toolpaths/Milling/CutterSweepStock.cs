@@ -5,7 +5,8 @@ using System.Diagnostics;
 namespace RW.Toolpaths.Milling;
 
 /// <summary>Whole-cutter containment in immutable, committed commanded cuts.
-/// This is final-union omission evidence, never travel or fresh-stock clearance.</summary>
+/// Omission uses its explicit allowance; travel uses positive clearance and only
+/// the executed prefix recorded by its caller. Future cuts grant no travel.</summary>
 internal sealed class CutterSweepStock
 {
     private const double Reserve=1e-7;
@@ -16,7 +17,7 @@ internal sealed class CutterSweepStock
         internal int First,Count;
         internal Node? Left,Right;
     }
-    private sealed record Block(Chord[] Chords,Node Root,PreparedPointIndex FloorIndex);
+    private sealed record Block(Chord[] Chords,Node Root,PreparedPointIndex FloorIndex,Point3D[] FloorSites);
     private readonly VCarveCutterProfile profile;
     private readonly Func<Point3D,Point3D> command;
     private readonly double surface;
@@ -41,6 +42,7 @@ internal sealed class CutterSweepStock
     private readonly double[] joints;
     private readonly bool supported;
     private readonly bool useMedianPartition;
+    private readonly bool mergeIncrementally;
     internal long PartitionVisits{get;private set;}
     internal long ReindexedChords{get;private set;}
     internal int MergeCount{get;private set;}
@@ -62,10 +64,11 @@ internal sealed class CutterSweepStock
     internal double StockIndexBuildMilliseconds=>1000d*stockBuildTicks/Stopwatch.Frequency;
 
     internal CutterSweepStock(VCarveCutterProfile profile,Func<Point3D,Point3D> command,double surface,CancellationToken token,
-        bool useMedianPartition=true)
+        bool useMedianPartition=true,bool mergeIncrementally=false)
     {
         this.profile=profile;this.command=command;this.surface=surface;this.token=token;
         this.useMedianPartition=useMedianPartition;
+        this.mergeIncrementally=mergeIncrementally;
         floorRadius=h=>floorNormal?OffsetRadius(h-floorTolerance,floorTolerance):profile.PhysicalRadiusAtDepth(h);
         floorPredicate=p=>{
             double h=-p.Z-floorWanted;if(h<0)return false;
@@ -123,7 +126,7 @@ internal sealed class CutterSweepStock
     {
         if(pending.Count==0)return;
         Chord[] rows;
-        bool merge=blocks.Count>=8;
+        bool merge=!mergeIncrementally&&blocks.Count>=8;
         Point3D[] floorRows;
         if(merge)
         {
@@ -131,6 +134,18 @@ internal sealed class CutterSweepStock
             ReindexedChords+=blocks.Sum(b=>(long)b.Chords.Length);blocks.Clear();MergeCount++;
         }
         else{rows=pending.ToArray();floorRows=pendingFloorSites.Values.ToArray();}
+        if(mergeIncrementally)
+        {
+            // Size-based immutable runs retain all committed chords. A small
+            // new visit must not repeatedly rebuild the entire executed prefix.
+            while(blocks.Count>0&&blocks[^1].Chords.Length<=rows.Length)
+            {
+                token.ThrowIfCancellationRequested();var previous=blocks[^1];blocks.RemoveAt(blocks.Count-1);
+                ReindexedChords+=previous.Chords.Length;MergeCount++;
+                rows=previous.Chords.Concat(rows).ToArray();
+                floorRows=previous.FloorSites.Concat(floorRows).ToArray();
+            }
+        }
         pending.Clear();
         Node Build(int first,int count)
         {
@@ -161,8 +176,26 @@ internal sealed class CutterSweepStock
         // endpoint index after every ring repeats work on unchanged old cuts.
         var floorIndex=new PreparedPointIndex(floorRows,token);
         pendingFloorSites.Clear();floorBuildTicks+=Stopwatch.GetTimestamp()-started;
-        blocks.Add(new(rows,root,floorIndex));
+        blocks.Add(new(rows,root,floorIndex,floorRows));
         MaximumBlocks=Math.Max(MaximumBlocks,blocks.Count);
+    }
+
+    /// <summary>One actual, fully anchored posted cut in stock-relative axes.</summary>
+    internal void RecordExecuted(Point3D a,Point3D b)
+    {
+        token.ThrowIfCancellationRequested();
+        if(!supported||!Finite(a)||!Finite(b)||all.Count>=2_000_000||Math.Min(a.Z,b.Z)>=0)return;
+        var chord=new Chord(a,b);all.Add(chord);pending.Add(chord);
+        maximumDepth=Math.Max(maximumDepth,Math.Max(-a.Z,-b.Z));
+    }
+
+    internal bool ContainsTravel(Point3D a,Point3D b,double clearance)
+    {
+        if(!(clearance>0)||!double.IsFinite(clearance))return false;
+        // Even above-surface local links need an already removed channel below
+        // stock. Free air must not license a shortcut across a protected island.
+        a=a with{Z=Math.Min(0,a.Z)-clearance};b=b with{Z=Math.Min(0,b.Z)-clearance};
+        return Contains(a,b,0,clearance);
     }
 
     internal bool Contains(Point3D a,Point3D b,double tolerance,double radialReserve=0)

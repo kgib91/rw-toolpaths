@@ -4,9 +4,41 @@ using RW.Toolpaths.Geometry;
 
 namespace RW.Toolpaths.Milling;
 
+public enum VCarveProfileDirection { TopDown, BottomUp }
+
 /// <summary>Configuration for medial-axis V-carving.</summary>
 public sealed record VCarveOptions
 {
+    /// <summary>Per-operation residual/approximation allowance, not physical clearance.</summary>
+    public double PathToleranceMm { get; init; } = .03;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public double CompletionGapRadiusMm
+    {
+        get
+        {
+            if(!double.IsFinite(PathToleranceMm)||PathToleranceMm<=1e-8)throw new ArgumentOutOfRangeException(nameof(PathToleranceMm));
+            return PathToleranceMm/2;
+        }
+    }
+    public double OutputChordToleranceMm { get; init; } = .002;
+    /// <summary>Common machine rates, transfer plane and optional earlier-stock proof.
+    /// Null retains geometric routing when machine context is unavailable.</summary>
+    public MillingMotionSettings? Motion { get; init; }
+    public VCarveProfileDirection ProfileDirection { get; init; }
+    // Bounded feature study: use the existing literal excursion stack even
+    // when its return costs more than an independent entry. Physical/engagement
+    // proofs and stack work limits remain unchanged. Production keeps false.
+    internal bool PreferContinuousContourTraversal { get; init; }
+    // Runtime routing policy. Normal smooth generation enables this when
+    // machine rates are available; direct router studies may select a control.
+    internal bool OptimizeContourConnections { get; init; }
+    // Isolated ordering study. Whole-wall level batches regress clipped-front
+    // travel; normal generation retains connected local strips.
+    internal bool PreserveContourWallIdentity { get; init; }
+    // Adapter-proved, already traversable upper outline. A carrier does not
+    // become additional cutting demand or earlier machining stock. Its physical
+    // authority is independent of PreferContinuousContourTraversal's cost policy.
+    internal TaggedToolpath? UpperContourCarrier { get; init; }
     public MillingBoundaryAccess? BoundaryAccess { get; init; }
     internal MillingBoundaryAccess.Resolved? AccessTarget { get; init; }
     // Pocket-only preparation: a finite flat tip cannot enter a component
@@ -16,7 +48,8 @@ public sealed record VCarveOptions
     // are unchanged. It is intentionally absent from geometry fingerprints.
     internal bool ParallelOriginalSourceSampling { get; init; }=true;
     internal bool ParallelFloorQueryPreparation { get; init; }=true;
-    /// <summary>Limits cutting depth gradients and clears the resulting missed channel coverage.</summary>
+    /// <summary>Limits cutting depth gradients and follows inner outlines with
+    /// complete concentric ramp rows followed by selected floor cleanup.</summary>
     public bool SmoothVCarving { get; init; }
 
     /// <summary>Maximum cutting grade in degrees for smooth V-carving.</summary>
@@ -59,23 +92,35 @@ public sealed record VCarveOptions
     public bool IncludeInteriorFill { get; init; } = true;
 
     /// <summary>
-    /// Inward offset from the original boundary at which additional fill centerlines
-    /// stop when full clearing is disabled. Zero retains perimeter and medial detail only.
-    /// The cutoff follows existing boundary normalization and stock-allowance offset
-    /// tolerances rather than an exact Euclidean distance from the authored geometry.
+    /// Without smoothing, inward boundary offset limiting additional fill when
+    /// full clearing is disabled. With smoothing, centre-to-nearest-edge distance
+    /// into the remaining floor, measured from the completed slope front.
+    /// Concentric rows fill that band without diameter conversion. The separate
+    /// ExcludeDiscSweep option can subtract virtual disc reach. Zero disables floor cleanup but
+    /// retains the full slope and medial detail. Boundary stock allowance has
+    /// already been applied when measuring that floor distance.
     /// </summary>
     public double EdgeFillWidth { get; init; }
 
-    /// <summary>Transient extra clearing reach requested by a matching rougher.
-    /// Extends nominations without changing the authored band or analytical floor.</summary>
+    /// <summary>Subtract virtual disc reach on the material floor, confirmed by
+    /// actual preceding rougher removal, then contour the remaining Fill Limit
+    /// area as closed loops. Smooth disc fit shares Pocket's material plateau;
+    /// Fill Limit still measures from the finishing cutter's centre front.</summary>
+    public bool ExcludeDiscSweep { get; init; }
+    public double DiscRadius { get; init; } = 3.175;
+
+    /// <summary>Transient rougher coordination reach, retained in strategy/cache identity.
+    /// It does not add supplemental fragments or widen the authored ring band.</summary>
     public double RoughingRestWidth { get; init; }
 
-    /// <summary>Actual preceding flat-tip sweeps used only to avoid redundant rest nominations.</summary>
+    /// <summary>Actual preceding flat-tip sweeps for physical stock queries.
+    /// They bound optional rest-fill exclusion without splitting source rings.</summary>
     public IReadOnlyList<VCarveRoughingChord> RoughingRestChords { get; init; } = Array.Empty<VCarveRoughingChord>();
     /// <summary>Height-dependent actual prior material removal for ordinary finishing.
     /// StartingDepth remains an entry/pass floor; it is not a global geometry shift.</summary>
     public VCarveClearedStock? ClearedStock { get; init; }
     internal ClearedColumnStock? PriorStock { get; init; }
+    internal VCarvePostedFloorSweep? RestFillStock { get; init; }
     internal VCarveOptions WithPriorStock(CancellationToken token) => PriorStock is not null || RoughingRestChords.Count == 0
         ? this : this with { PriorStock = new ClearedColumnStock(RoughingRestChords.Select(c =>
             new ClearedColumnStock.Column(c.A, c.B, c.ClearedColumnRadius)), token) };
@@ -108,10 +153,6 @@ public sealed record VCarveOptions
     /// <summary>Transient host travel/cutting feed ratio for cleared-route cost.
     /// One retains geometric distance ordering when machine rates are unknown.</summary>
     public double ClearedTravelCostRatio {get;init;}=1;
-    /// <summary>Host's actual global transfer plane and cut/rapid feed ratio.
-    /// NaN means no transfer-time allowance for callers without machine context.</summary>
-    public double ContinuationSafeZ {get;init;}=double.NaN;
-    public double EntryTransferCostRatio {get;init;}=1;
 
     /// <summary>
     /// Experimental opt-in for avoiding optional terminal rays dominated by a
@@ -128,7 +169,8 @@ public sealed record VCarveOptions
     /// <summary>Optional completed original graph shared by matching roughing and Detail compilation.</summary>
     public VCarvePreparation? Preparation { get; init; }
     /// <summary>Reuse the complete analytical graph for nominal paths. Disable when
-    /// sharing only the physical floor while retaining the ordinary optimized nomination.</summary>
+    /// sharing only the physical floor and constructing ordinary or smooth nominal
+    /// paths through the shared prepared medial pipeline.</summary>
     public bool UsePreparationGraphForNominalPaths { get; init; } = true;
 
     /// <summary>Transient captured initial-generation policy; no document setting or physical proof authority.</summary>
@@ -154,6 +196,60 @@ public static class VCarveToolpaths
 {
     public const string Category = "vcarve";
     private static long _generationSequence;
+
+    /// <summary>Revalidate fast feeds and apply travel feeds to proved-empty entry chords.
+    /// The caller supplies final absolute XYZ paths AFTER all geometric emission
+    /// preparation; no subsequent geometric reduction may inherit these proofs.
+    /// Coordinates, cutting feed settings and traversal order are unchanged.</summary>
+    public static IReadOnlyList<TaggedToolpath> OptimizeAirRampFeeds(IReadOnlyList<TaggedToolpath> source,
+        VCarveCutterProfile profile,double surface,MillingMotionSettings motion,
+        CancellationToken cancellationToken=default,Action<string>? diagnostic=null)
+    {
+        if(VCarvePathRouter.ConnectionOptimizationOverride.Value==false
+            ||VCarvePathRouter.AirRampFeedOptimizationOverride.Value==false)return source;
+        MillingGeometryTrace.Capture("air-ramp-source",0,source);
+        List<TaggedToolpath> result;
+        if(source.Any(p=>p.DetectCurves||p.Moves is not LineToolMoves))
+            result=ControlledFallback("nonlinear-motion");
+        else{
+            result=VCarveAirRampFeed.Improve(source,profile,surface,motion,cancellationToken,diagnostic);
+            try{
+                Point3D? previous=null;
+                for(int first=0;first<result.Count;){
+                    int last=first+1;while(last<result.Count&&result[last].RegionIndex==result[first].RegionIndex)last++;
+                    var block=result.Skip(first).Take(last-first).ToArray();
+                    VCarveReturnTravel.VerifyFinalTravel(block,profile,surface,cancellationToken,diagnostic,
+                        double.IsFinite(motion.MaterialSurfaceZ)?motion.MaterialSurfaceZ:surface,previous,finalCompactionComplete:true);
+                    previous=block[^1].Points[^1];first=last;
+                }
+            }catch(InvalidOperationException error){
+                result=ControlledFallback("final-prefix-proof",error.Message);
+            }
+        }
+        MillingGeometryTrace.Capture("air-ramp-result",0,result);
+        return result;
+
+        List<TaggedToolpath> ControlledFallback(string reason,string? detail=null){
+            // Final surface preparation may already have invalidated an old
+            // source fast tag. Rolling back new Ramp promotions must not restore
+            // that stale permission. Geometry/order and original contact kinds
+            // remain literal; only all source fast permissions are revoked.
+            long demoted=0;var fallback=new List<TaggedToolpath>(source.Count);
+            foreach(var path in source){
+                cancellationToken.ThrowIfCancellationRequested();
+                var kinds=ToolpathSpanKinds.Expand(path);
+                if(!kinds.Contains(ToolpathSpanKind.ClearedTravel)){fallback.Add(path);continue;}
+                for(int i=0;i<kinds.Length;i++)if(kinds[i]==ToolpathSpanKind.ClearedTravel){kinds[i]=ToolpathSpanKind.Link;demoted++;}
+                var spans=new List<ToolpathSpan>();int first=0;
+                for(int i=1;i<=kinds.Length;i++)if(i==kinds.Length||kinds[i]!=kinds[first]){
+                    spans.Add(new(first,i,kinds[first]));first=i;}
+                fallback.Add(path with{Spans=spans});
+            }
+            diagnostic?.Invoke($"stage=air-ramp-feed accepted=False reason={reason} fallback=controlled-source-feed demotedFastChords={demoted} "
+                +$"originalCoordinatesAndOrderRetained=True originalRampAndCutKindsRetained=True allFastFeedPermissionsRevoked=True detail='{detail}'");
+            return fallback;
+        }
+    }
 
     public static VCarvePreparation Prepare(IReadOnlyList<MillingRegion> regions, ToolGeometry tool,
         DepthSchedule depth, VCarveOptions options, IMedialAxisProvider provider,
@@ -186,14 +282,22 @@ public static class VCarveToolpaths
             options = options with { BoundaryAccess=null,AccessTarget=access };
         }
         VCarveSmoothing.ValidateCorrectionArcTolerance(options.CorrectionArcTolerance);
+        if (options.ExcludeDiscSweep && (!double.IsFinite(options.DiscRadius) || options.DiscRadius <= 0))
+            throw new ArgumentOutOfRangeException(nameof(options), "Disc radius must be finite and greater than zero.");
         options = options.WithPriorStock(cancellationToken);
+        if(options.ExcludeDiscSweep)
+            options=options with {RestFillStock=new VCarvePostedFloorSweep(
+                options.RoughingRestChords.Concat(options.ClearedStock?.Chords??Array.Empty<VCarveRoughingChord>()))};
         if (options.SmoothVCarving && (!double.IsFinite(options.SmoothRampAngleDegrees)
             || options.SmoothRampAngleDegrees <= 0 || options.SmoothRampAngleDegrees >= 90))
             throw new ArgumentOutOfRangeException(nameof(options), "Smooth V-carving requires a ramp angle greater than zero and less than 90 degrees.");
         if (options.SmoothVCarving && (!double.IsFinite(options.StepOver) || options.StepOver <= 0 || options.StepOver > 1))
             throw new ArgumentOutOfRangeException(nameof(options), "Smooth V-carving requires a stepover greater than zero and no more than one.");
         if (options.SmoothVCarving)
-            options = options with { DetectCurves = false };
+            options = options with { DetectCurves = false,
+                OptimizeContourConnections = VCarvePathRouter.ConnectionOptimizationOverride.Value??options.Motion is not null,
+                PreserveContourWallIdentity = options.PreserveContourWallIdentity
+                    && (VCarvePathRouter.ConnectionOptimizationOverride.Value??options.Motion is not null) };
         RW.Toolpaths.Milling.Acceleration.RawInitialClearingInsetNomination? initialInsetNomination = null;
         if (!options.IncludeInteriorFill && (!double.IsFinite(options.EdgeFillWidth) || options.EdgeFillWidth < 0))
             throw new ArgumentOutOfRangeException(nameof(options), "Edge fill width must be finite and nonnegative.");
@@ -226,6 +330,7 @@ public static class VCarveToolpaths
             $"smoothVCarving={options.SmoothVCarving} smoothRampAngleDegrees={options.SmoothRampAngleDegrees:R} " +
             $"curvePolicy={(options.SmoothVCarving ? "certified-lines" : "authored")} " +
             $"regions={regions.Count} interiorFill={options.IncludeInteriorFill} edgeFillWidth={options.EdgeFillWidth:R} detectCurves={options.DetectCurves} stockToLeave={options.StockToLeave:R} " +
+            $"excludeDiscSweep={options.ExcludeDiscSweep} discRadius={options.DiscRadius:R} " +
             $"preferOriginalInsetConstruction={options.PreferOriginalInsetConstruction} " +
             $"correctionArcTolerance={options.CorrectionArcTolerance:R} " +
             $"useOrdinaryCorrectionCandidates={options.UseOrdinaryCorrectionCandidates} " +
@@ -314,16 +419,29 @@ public static class VCarveToolpaths
                 return ToolpathPlan.Empty;
             }
 
+            if(options.Motion is {} machineMotion)
+            {
+                var entryTravel=VCarveContinuationAdapter.CreatePriorStockTravelGuard(options,
+                    VCarvePhysicalSweep.ProfileFor(tool,maximumDepth),depth.SurfaceZ,cancellationToken,Trace);
+                if(entryTravel is not null)options=options with{Motion=machineMotion with{ClearedTravelGuard=entryTravel}};
+            }
+
             var materialSurface = !options.SmoothVCarving && options.AccessTarget is null
                 && depth.StartDepth > 0 && options.ClearedStock is { } stock
                 && (stock.Chords.Count > 0 || stock.ProfileSweeps?.Count > 0)
                 ? new VCarveMaterialSurface(carveRegions.SelectMany(r => r.Rings), stock,
                     VCarvePhysicalSweep.ProfileFor(tool, maximumDepth), maximumDepth,
                     depth.SurfaceZ, cancellationToken, Trace) : null;
+            var entrySurface = materialSurface ?? (options.SmoothVCarving && options.ClearedStock is { } smoothStock
+                ? new VCarveMaterialSurface(carveRegions.SelectMany(r=>r.Rings),smoothStock,
+                    VCarvePhysicalSweep.ProfileFor(tool,maximumDepth),maximumDepth,depth.SurfaceZ,cancellationToken,Trace) : null);
             if (!options.SmoothVCarving && depth.StartDepth > 0 && materialSurface is null)
                 Trace("stage=material-surface event=original-stock-fallback reason=no-compatible-posted-stock "
                     + "originalBranchesRetained=True declaredStartingDepthNotCreditedAsRemoval=True");
 
+            var priorRemoved = options.SmoothVCarving && options.ClearedStock is { } priorStock
+                ? new VCarveMaterialSurface(Array.Empty<IReadOnlyList<PointD>>(),priorStock,
+                    VCarvePhysicalSweep.ProfileFor(tool,maximumDepth),maximumDepth,depth.SurfaceZ,cancellationToken,Trace) : null;
             Trace("stage=travel-order event=start");
             Report(0.08, "Ordering V-carve regions", true);
             int[] visitOrder = TravelOptimizer.Order(
@@ -352,12 +470,15 @@ public static class VCarveToolpaths
                 // ocean's authored clearing layers/reference channel. Its
                 // supplemental full clearing separately begins at the surface.
                 var regionDepth = entireProtected ? effectiveDepth with { StartDepth = 0, SkipDepthPasses = 0 } : effectiveDepth;
-                var regionOptions = entireProtected ? options with { IncludeInteriorFill = true } : options;
+                // Protected fresh stock changes entry scheduling, never the
+                // operator's concentric fill cutoff.
+                var regionOptions = options;
                 Trace($"stage=coordination region={regionIndex} analysisReuse={preparedRegion is not null} " +
                     $"protectedFreshStock={freshStock} entireSource={entireProtected} " +
                     $"authoredStartingDepth={depth.StartDepth:R} ordinaryStartingDepth={regionDepth.StartDepth:R} " +
                     $"effectiveStartingDepth={(options.SmoothVCarving || freshStock ? 0 : regionDepth.StartDepth):R} " +
-                    $"assignedStepdown={regionDepth.DepthPerPass:R} sourceBoundaryAndGraphPreserved=True " +
+                    $"assignedStepdown={regionDepth.DepthPerPass:R} sourceBoundaryPreserved=True " +
+                    $"nominalGraphPolicy={(options.SmoothVCarving && options.UsePreparationGraphForNominalPaths ? "original-source" : VCarveMedialConstruction.Policy)} " +
                     $"ownSurfaceOriginScheduling={options.SmoothVCarving} upstreamMetadataRequired=False");
                 double regionWeight = boundary.Sum(ring => ring.Count);
                 void RegionProgress(double fraction, string description, bool indeterminate)
@@ -370,6 +491,22 @@ public static class VCarveToolpaths
                 Trace($"stage=roughing-rest-reach region={regionIndex} authoredFillWidth={options.EdgeFillWidth:R} "
                     + $"requestedRestWidth={options.RoughingRestWidth:R} nominationWidth={nominationWidth:R} "
                     + "sourceBoundaryAndFloorUnchanged=True priorRemovalCredit=False originalGuardsRequired=True");
+                IReadOnlyList<MedialSegment>? nominalMedial = options.UsePreparationGraphForNominalPaths
+                    ? preparedRegion?.OriginalMedialGraph : null;
+                // A shared physical floor is not a nominal cutting graph. Hosts
+                // opting out of analytical-graph reuse use the same prepared
+                // source construction in ordinary and smooth modes. The fine
+                // boundary and original preparation still own physical guards.
+                if (nominalMedial is null && (!options.SmoothVCarving || !options.UsePreparationGraphForNominalPaths))
+                {
+                    var nominalBoundary = regions[regionIndex].VCarveNominalBoundary;
+                    if (nominalBoundary is not null && options.StockToLeave != 0)
+                        nominalBoundary = BuildBoundary(new MillingRegion(nominalBoundary[0], nominalBoundary.Skip(1).ToList()), options.StockToLeave);
+                    nominalMedial = VCarveMedialConstruction.Construct(provider, nominalBoundary ?? boundary,
+                        VCarvePhysicalSweep.ProfileFor(tool, maximumDepth).RadiusAtDepth(regionDepth.DepthPerPass),
+                        cancellationToken, detail => Trace($"region={regionIndex} {detail}"), options.Tolerance, RegionProgress,
+                        sourceIsPreparedLayer: regions[regionIndex].VCarveNominalLayerPrepared && options.StockToLeave == 0);
+                }
                 List<TaggedToolpath> generated = MedialAxisToolpaths.GenerateVCarveTagged(
                     options.PreferOriginalInsetConstruction,
                     provider,
@@ -397,62 +534,37 @@ public static class VCarveToolpaths
                     outputSurfaceZ: depth.SurfaceZ,
                     skipDepthPasses: regionDepth.SkipDepthPasses,
                     startingDepth: regionDepth.StartDepth,
-                    preparedMedialGraph: options.UsePreparationGraphForNominalPaths ? preparedRegion?.OriginalMedialGraph : null,
+                    preparedMedialGraph: nominalMedial,
                     initialInsetNomination: initialInsetNomination,
-                    supplementalInitialBand: options.RoughingRestWidth <= 0);
-
-                HashSet<TaggedToolpath>? shoulderNominations = null;
-                if (materialSurface is not null)
-                {
-                    var physical = VCarvePhysicalSweep.ProfileFor(tool, maximumDepth);
-                    // The original-stock perimeter misses the band exposed by a
-                    // lower adjacent shoulder. Nominate that outer contact front;
-                    // the actual stock field still proves every full-tool chord.
-                    // Keep the original front for portions beside untouched walls.
-                    double originalRadius = physical.RadiusAtDepth(maximumDepth);
-                    {
-                        // Boundary samples nominate contact rays, including
-                        // channels narrower than the full-depth cutter diameter.
-                        // Actual XY and Z are solved by the full physical guard.
-                        var shoulderBoundary = BuildShoulderBoundary(regions[regionIndex],options.StockToLeave);
-                        var shoulder = new List<TaggedToolpath>();
-                        for (int pass = 0; pass < regionDepth.PassCount; pass++)
-                        {
-                            double cutDepth = depth.SurfaceZ - regionDepth.PassBottomZ(pass);
-                            foreach (var ring in shoulderBoundary)
-                            {
-                                var points = ring.Select(p => new Point3D(p.x, p.y, -cutDepth)).ToList();
-                                if (points.Count < 3) continue;
-                                if (points[^1] != points[0]) points.Add(points[0]);
-                                var nomination = new TaggedToolpath(points, Array.Empty<ToolpathSpan>(),
-                                    regionIndex, "clearing", pass, detectCurves: false);
-                                shoulder.Add(nomination);
-                                (shoulderNominations ??= new()).Add(nomination);
-                            }
-                        }
-                        int detailStart = generated.FindIndex(path => path.Category == "final-carve");
-                        generated.InsertRange(detailStart >= 0 ? detailStart : generated.Count, shoulder);
-                        Trace($"stage=material-surface event=shoulder-front region={regionIndex} paths={shoulder.Count} "
-                            + $"scheduledStartingDepth={regionDepth.StartDepth:R} originalRadius={originalRadius:R} "
-                            + $"nominationPoints={shoulderBoundary.Sum(r=>r.Count)} contourSimplification={MachiningAccuracy.SurfaceDeviation/2:R} "
-                            + "floorSource=actual-posted-sweeps fullPhysicalStockGuardRequired=True originalWallFrontRetained=True");
-                    }
-                }
+                    supplementalInitialBand: !options.SmoothVCarving && options.IncludeInteriorFill && options.RoughingRestWidth <= 0,
+                    concentricClearingOnly: options.SmoothVCarving,
+                    includeClearingPasses: !options.SmoothVCarving || !options.IncludeInteriorFill
+                        && options.EdgeFillWidth <= AppliedStockAllowance(options.StockToLeave),
+                    excludedDiscRadius: !options.SmoothVCarving && options.ExcludeDiscSweep ? options.DiscRadius : 0,
+                    restFillStock: options.RestFillStock,
+                    materialClearingInset: materialSurface?.CreateClearingInset(boundary,regionIndex,options.PreferOriginalInsetConstruction));
+                MillingGeometryTrace.Capture("vcarve-original-sources", regionIndex, generated);
 
                 if (options.AccessTarget is { } accessTarget)
                 {
                     var physical = VCarvePhysicalSweep.ProfileFor(tool, maximumDepth);
-                    // New full-depth demand exists only along interfaces opened by permission.
-                    // Existing optional filling elsewhere keeps its authored policy.
-                    outsideEdgeNominations ??= accessTarget.NominateOpenEdges(physical,regionDepth,options.StepOver,
-                        options.StockToLeave,cancellationToken);
-                    var componentIndex = new PolygonOps.BoundarySegmentIndex(PathUtils.ToClipper(boundary));
-                    var openFill = accessTarget.Trim(outsideEdgeNominations,_=>0,cancellationToken,clipIndex:componentIndex);
-                    generated.AddRange(openFill.Select(path=>path with {RegionIndex=regionIndex}));
+                    // Approved air permits contact but does not request finishing
+                    // along a smooth V-carve shoulder. Only retained walls nominate
+                    // those visits unless outside ramps were explicitly restored.
+                    if (!options.SmoothVCarving || options.RampOutsideEdges)
+                    {
+                        outsideEdgeNominations ??= accessTarget.NominateOpenEdges(physical,regionDepth,options.StepOver,
+                            options.StockToLeave,cancellationToken);
+                        var componentIndex = new PolygonOps.BoundarySegmentIndex(PathUtils.ToClipper(boundary));
+                        var openFill = accessTarget.Trim(outsideEdgeNominations,_=>0,cancellationToken,clipIndex:componentIndex);
+                        generated.AddRange(openFill.Select(path=>path with {RegionIndex=regionIndex}));
+                    }
+                    else Trace($"stage=outside-edges event=skip-shoulder-fill region={regionIndex} "
+                        + "reason=outside-ramps-disabled retainedWallFrontsAndMedialPreserved=True clearanceIsDemand=False");
                     generated=accessTarget.Trim(generated,physical.PhysicalRadiusAtDepth,cancellationToken);
                 }
 
-                if (freshStock)
+                if (freshStock && !options.SmoothVCarving)
                 {
                     if (!entireProtected && !options.IncludeInteriorFill)
                     {
@@ -474,10 +586,13 @@ public static class VCarveToolpaths
                         var fullClearing = MedialAxisToolpaths.GenerateClearingPassesTagged(boundary,
                             0, maximumDepth, tool.TipAngleRadians ?? 0, regionDepth.DepthPerPass,
                             options.StepOver, regionIndex, tool.BottomRadius, tool.TopRadius, tool.ConeLength,
-                            includeInteriorFill: true, detectCurves: false,
+                            includeInteriorFill: options.IncludeInteriorFill, detectCurves: false,
                             diagnostic: detail => Trace($"region={regionIndex} protected-clearing {detail}"),
                             cutterProfile: tool.VCarveProfile, cancellationToken: cancellationToken,
-                            outputSurfaceZ: depth.SurfaceZ);
+                            outputSurfaceZ: depth.SurfaceZ,
+                            edgeFillWidth: Math.Max(0, options.EdgeFillWidth - AppliedStockAllowance(options.StockToLeave)),
+                            excludedDiscRadius: options.ExcludeDiscSweep ? options.DiscRadius : 0,
+                            roughingChords:options.RoughingRestChords);
                         generated.AddRange(SelectProtectedClearing(fullClearing, protectedClearingSelector,
                             tool, maximumDepth, options.ProtectedClearingMargin, cancellationToken,
                             detail => Trace($"region={regionIndex} {detail}")));
@@ -490,7 +605,11 @@ public static class VCarveToolpaths
                 Func<IReadOnlyList<TaggedToolpath>,List<TaggedToolpath>>? clippedPathProtection=null;
                 if (materialSurface is not null)
                 {
-                    generated = materialSurface.Apply(generated, shoulderNominations);
+                    Trace($"stage=material-surface event=source-policy region={regionIndex} "
+                        + $"nativePaths={generated.Count} nativePerimeters={generated.Count(p => p.Category == "clearing")} "
+                        + $"nativeMedialPaths={generated.Count(p => p.Category == "final-carve")} supplementalShoulder=False");
+                    generated = materialSurface.Apply(generated);
+                    MillingGeometryTrace.Capture("vcarve-material-fitted", regionIndex, generated);
                     continuationGuard = (a,b) => materialSurface.IsLegalChord(
                         new(a.X,a.Y,a.Z-depth.SurfaceZ),new(b.X,b.Y,b.Z-depth.SurfaceZ));
                 }
@@ -500,7 +619,8 @@ public static class VCarveToolpaths
                         (fraction, description, indeterminate) => RegionProgress(
                             .5 + .45 * fraction, description, indeterminate), preparedRegion,
                         captureContinuationGuard: guard => continuationGuard = guard,
-                        captureClippedPathProtection: protect=>clippedPathProtection=protect);
+                        captureClippedPathProtection: protect=>clippedPathProtection=protect,
+                        sourceRegionIndex: regionIndex);
 
                 if(options.AccessTarget is { } centreAccess)
                 {
@@ -530,6 +650,12 @@ public static class VCarveToolpaths
 
                 if (options.SmoothVCarving || freshStock)
                 {
+                    if(options.SmoothVCarving&&VCarveWallContours.Selection.Value is not null&&clippedPathProtection is not null&&continuationGuard is not null)
+                    {
+                        VCarveWallContours.ContextObserver.Value?.Invoke(new(generated,boundary,tool,regionDepth,options,clippedPathProtection,continuationGuard));
+                        generated=VCarveWallContours.Replace(generated,boundary,tool,regionDepth,options,
+                            clippedPathProtection,continuationGuard,cancellationToken,Trace);
+                    }
                     if (continuationGuard is not null)
                     {
                         // Protection adds proof subdivisions, not new design
@@ -547,42 +673,47 @@ public static class VCarveToolpaths
                             if(!accepted)refusals++;
                             return accepted;
                         }
-                        generated=generated.Select(path=>SurfaceToolpathSimplifier.Simplify(path,
-                            MachiningAccuracy.PathChord,cancellationToken,AcceptSurfaceChord)).ToList();
-                        Trace($"stage=surface-simplification event=protected-before-circuits paths={generated.Count} "
+                        // A small tip displacement at shallow rounded engagement
+                        // can erase a much wider contact disc. Keep the original
+                        // medial trace; floor/wall legality alone does not prove
+                        // that its removal survives an approximation.
+                        generated=generated.Select(path=>path.Category == "final-carve" ? path
+                            : SurfaceToolpathSimplifier.Simplify(path,
+                                options.OutputChordToleranceMm,cancellationToken,AcceptSurfaceChord)).ToList();
+                        Trace($"stage=surface-simplification event=protected-sources paths={generated.Count} "
                             +$"sourcePoints={beforePoints} retainedPoints={generated.Sum(p=>(long)p.Points.Count)} "
-                            +$"chordBoundMm={MachiningAccuracy.PathChord:R} proposals={proposals} refusedChords={refusals} "
+                            +$"chordBoundMm={options.OutputChordToleranceMm:R} proposals={proposals} refusedChords={refusals} medialTracePreserved=True "
                             +$"elapsedMs={Stopwatch.GetElapsedTime(compactStarted).TotalMilliseconds:F1} "
-                            +"sameNativeAndPostedFloorWallGradeRequired=True circuitVertexBudgetUnchanged=True motionKindsPreserved=True");
-                        double firstStep=regionDepth.DepthPerPass>0 ? regionDepth.DepthPerPass : regionDepth.Depth;
-                        var profile=VCarvePhysicalSweep.ProfileFor(tool,regionDepth.Depth);
-                        // Required cuts come from the protected surface. The
-                        // circuit builder alone owns connecting motion; a prior
-                        // endpoint stitcher must not add crossing finishing cuts.
-                        if(options.RoughingRestWidth>0)
-                        {
-                            generated=VCarveVisitStockPruner.Filter(generated,profile,options.RoughingRestChords,
-                                p=>new(VCarveCommandRounding.Round((float)p.X),VCarveCommandRounding.Round((float)p.Y),
-                                    VCarveCommandRounding.Round((float)(depth.SurfaceZ+p.Z)-(float)depth.SurfaceZ)),
-                                0,cancellationToken,Trace,options.PriorStock,depth.SurfaceZ);
-                        }
-                        double portalDistance=Math.Max(.1,2*options.StepOver*Math.Max(profile.ClearingDiameter,
-                            2*profile.PhysicalRadiusAtDepth(Math.Min(regionDepth.Depth,firstStep))));
+                            +"sameNativeAndPostedFloorWallGradeRequired=True sourceTopologyRetained=True motionKindsPreserved=True");
                         MillingGeometryTrace.Capture("stock-selected",0,generated);
-                        // A terminal chord certificate covers its shallower
-                        // same-XY caps: this profile is radially nondecreasing,
-                        // and native/posted endpoint rises only decrease grade.
-                        // Re-proving each cap repeats the same containment work.
-                        generated=ToolpathCircuitBuilder.Build(generated,continuationGuard,portalDistance,cancellationToken,Trace,
-                            toolpaths.Count==0 ? null : toolpaths[^1].Points[^1],
+                        generated=ToolpathSourceTraversal.Detours(generated,cancellationToken,Trace,continuationGuard,
                             Math.Tan(options.SmoothRampAngleDegrees*Math.PI/180));
-                        MillingGeometryTrace.Capture("source-circuits",0,generated);
+                        var profile=VCarvePhysicalSweep.ProfileFor(tool,regionDepth.Depth);
+                        double firstStep=regionDepth.DepthPerPass>0?regionDepth.DepthPerPass:regionDepth.Depth;
+                        double engaged=2*profile.PhysicalRadiusAtDepth(Math.Min(firstStep,regionDepth.Depth));
+                        double radial=profile.RoundedTip?profile.NoseLimitedPitch(engaged,options.StepOver):engaged*options.StepOver;
+                        double grade=Math.Tan(options.SmoothRampAngleDegrees*Math.PI/180);
+                        IReadOnlyList<ToolpathContinuationComponents.Edge>? ringPortals=null;
+                        if(radial>0&&continuationGuard is not null)
+                            generated=ToolpathSourceTraversal.RingPortals(generated,radial,p=>p with{Z=Math.Max(p.Z,-firstStep)},
+                                continuationGuard,cancellationToken,Trace,options.SmoothVCarving?portals=>ringPortals=portals:null);
+                        if(radial>0 && continuationGuard is not null)
+                            generated=ToolpathSourceTraversal.Components(generated,p=>p with{Z=Math.Max(p.Z,-firstStep)},
+                                continuationGuard,Math.Sqrt(radial*radial+firstStep*firstStep),cancellationToken,Trace,
+                                toolpaths.Count==0?null:toolpaths[^1].Points[^1],
+                                (a,b)=>Math.Pow(a.X-b.X,2)+Math.Pow(a.Y-b.Y,2)<=radial*radial
+                                    &&Math.Abs(a.Z-b.Z)<=grade*Math.Sqrt(Math.Pow(a.X-b.X,2)+Math.Pow(a.Y-b.Y,2)),
+                                nominatedPortals:ringPortals);
+                        MillingGeometryTrace.Capture("connected-source-families",0,generated);
+                        Trace($"stage=source-routing event=selected paths={generated.Count} "
+                            + "families=original-medial-and-concentric newCutsRequireRuntimeProof=True componentBeforeDepth=True");
                     }
                     Trace($"stage=surface-origin-scheduling region={regionIndex} owner=current-vcarve "
                         + $"smooth={options.SmoothVCarving} assignedStepdown={regionDepth.DepthPerPass:R} "
                         + "upstreamStockMetadataRequired=False originalFillSettingsPreserved=True");
-                    if(!generated.All(p=>p.ContinuationCircuitDefinition is not null))
-                        generated = ScheduleFreshStockVisits(generated, regionDepth, cancellationToken, Trace);
+                    if(options.SmoothVCarving || !generated.All(p=>p.ContinuationCircuitDefinition is not null))
+                        generated = ScheduleFreshStockVisits(generated, regionDepth, cancellationToken, Trace,
+                            preserveSourceOrder: options.SmoothVCarving, priorRemoved: priorRemoved is null ? null : (a,b)=>priorRemoved.IsLegalChord(a,b));
                 }
 
                 Trace($"stage=compaction event=start region={regionIndex} paths={generated.Count} " +
@@ -628,7 +759,8 @@ public static class VCarveToolpaths
                         path.VisitIdentity,
                         detectCurves: options.DetectCurves) {ContinuationComponentIndex=path.ContinuationComponentIndex,
                         ContinuationPlan=path.ContinuationPlan,ContinuationSourceOrdinal=path.ContinuationSourceOrdinal,
-                        ContinuationCircuit=path.ContinuationCircuit,ContinuationCircuitDefinition=path.ContinuationCircuitDefinition});
+                        ContinuationCircuit=path.ContinuationCircuit,ContinuationCircuitDefinition=path.ContinuationCircuitDefinition,
+                        ConcentricSource=path.ConcentricSource});
                 }
                 Trace($"stage=compaction event=complete region={regionIndex} retainedVisits={compactedPaths.Count} " +
                     $"zeroCommandedPenetrationVisits={noPenetrationVisits} zDecimals=3 stockRelative=True");
@@ -637,20 +769,20 @@ public static class VCarveToolpaths
                     regionOptions, !regionOptions.IncludeInteriorFill && options.EdgeFillWidth > 0
                         ? Math.Max(0, options.EdgeFillWidth - AppliedStockAllowance(options.StockToLeave)) : 0,
                     toolpaths.Count == 0 ? null : toolpaths[^1].Points[^1], cancellationToken, Trace,
-                    continuationGuard, materialSurface is null ? null : materialSurface.EntryHeight);
-                if(options.SmoothVCarving)MillingGeometryTrace.Capture("routed-depth-passes",0,routed);
+                    continuationGuard, entrySurface is null ? null : entrySurface.EntryHeight);
+                MillingGeometryTrace.Capture("routed-depth-passes", 0, routed);
                 long routedPoints = 0, retainedPoints = 0;
                 foreach (var path in routed)
                 {
                     routedPoints += path.Points.Count;
-                    var retained = options.SmoothVCarving && options.CompactCollinearCommands
+                    var retained = options.CompactCollinearCommands
                         ? ToolpathCollinearCompactor.Compact(path, depth.SurfaceZ, cancellationToken) : path;
                     retainedPoints += retained.Points.Count;
                     toolpaths.Add(retained with { VisitIdentity = toolpaths.Count });
                 }
                 Trace($"stage=command-collinear-compaction region={regionIndex} sourcePoints={routedPoints} " +
                     $"retainedPoints={retainedPoints} removedPoints={routedPoints - retainedPoints} " +
-                    $"enabled={options.SmoothVCarving && options.CompactCollinearCommands} postedPlanarAnchorRequired=True " +
+                    $"enabled={options.CompactCollinearCommands} postedPlanarAnchorRequired=True " +
                     "nativeDirectedChord=True exactF3DirectedChord=True spanBoundariesAndMotionModePreserved=True stockAtEveryHeightPreserved=True");
                 Trace($"stage=region event=complete region={regionIndex} accumulatedPaths={toolpaths.Count} " +
                     $"sourcePoints={sourcePointCount} compactedPoints={compactedPointCount}");
@@ -659,6 +791,7 @@ public static class VCarveToolpaths
             toolpaths=VCarvePathRouter.OrderRegions(toolpaths,cancellationToken,Trace);
             options.AccessTarget?.Verify(toolpaths,tool,depth,options.StockToLeave,cancellationToken);
             materialSurface?.Verify(toolpaths);
+            MillingGeometryTrace.Capture("vcarve-final-plan", 0, toolpaths);
 
             cancellationToken.ThrowIfCancellationRequested();
             List<List<PointD>> sweptArea = new();
@@ -698,9 +831,14 @@ public static class VCarveToolpaths
 
             var emissionWalls=materialSurface is null ? new VCarveSmoothing.CommandClearance(
                 carveRegions.SelectMany(r=>r.Rings).ToArray(),
-                VCarvePhysicalSweep.ProfileFor(tool,maximumDepth),depth.SurfaceZ,cancellationToken,Trace) : null;
+                VCarvePhysicalSweep.ProfileFor(tool,maximumDepth),depth.SurfaceZ,cancellationToken,Trace,stockContact:entrySurface) : null;
             return new ToolpathPlan(toolpaths, sweptArea, diagnostics)
             {
+                ClearedTravelGuard=VCarveContinuationAdapter.CreatePriorStockTravelGuard(options,
+                    VCarvePhysicalSweep.ProfileFor(tool,maximumDepth),depth.SurfaceZ,cancellationToken,Trace),
+                NativeReplacementChordGuard=materialSurface is null?null:(a,b)=>materialSurface.IsLegalNativeChord(
+                    new(a.X,a.Y,a.Z-depth.SurfaceZ),new(b.X,b.Y,b.Z-depth.SurfaceZ)),
+                NativeReplacementCurveGuard=materialSurface is null?null:m=>materialSurface.IsLegalNativeCurve(VCarveNativeCurveMath.TranslateZ(m,-depth.SurfaceZ)),
                 ReplacementChordGuard=(a,b)=>materialSurface is not null
                     ? materialSurface.IsLegalChord(new(a.X,a.Y,a.Z-depth.SurfaceZ),new(b.X,b.Y,b.Z-depth.SurfaceZ))
                     : emissionWalls!.IsLegalCommandedChord(new(a.X,a.Y,a.Z-depth.SurfaceZ),new(b.X,b.Y,b.Z-depth.SurfaceZ))
@@ -723,7 +861,8 @@ public static class VCarveToolpaths
     }
 
     internal static List<TaggedToolpath> ScheduleFreshStockVisits(IReadOnlyList<TaggedToolpath> source,
-        DepthSchedule schedule, CancellationToken token, Action<string>? diagnostic)
+        DepthSchedule schedule, CancellationToken token, Action<string>? diagnostic,
+        bool preserveSourceOrder = false, Func<Point3D,Point3D,bool>? priorRemoved = null)
     {
         // Every post-smoothing visit participates, including newly discovered correction rings
         // and terminal rays. The same XY with a shallower tip removes a subset of the physical
@@ -734,7 +873,9 @@ public static class VCarveToolpaths
         double commandStep = Math.Floor(assignedStep * 1000 + 1e-9) / 1000;
         double CommandDepth(double nominal) => -VCarveCommandRounding.Round((float)(schedule.SurfaceZ - nominal) - (float)schedule.SurfaceZ);
         var result = new List<TaggedToolpath>();
-        int precursors = 0;
+        int precursors = 0, omittedAirVisits=0;
+        bool AlreadyRemoved(IReadOnlyList<Point3D> p)=>priorRemoved is not null && p.Count>1
+            && p.Zip(p.Skip(1)).All(e=>priorRemoved(e.First,e.Second));
         foreach (TaggedToolpath sourcePath in source)
         {
             var path=sourcePath;
@@ -745,10 +886,12 @@ public static class VCarveToolpaths
                 var capped = path.ContinuationCircuitDefinition?.AtDepth(layers[pass].Nominal,
                     pass==0 ? -1 : layers[pass-1].Nominal,token)
                     ?? path.Points.Select(point => point with { Z = Math.Max(point.Z, -layers[pass].Nominal) }).ToArray();
+                if(AlreadyRemoved(capped)){omittedAirVisits++;continue;}
                 result.Add(new TaggedToolpath(capped,
                     Array.Empty<ToolpathSpan>(), path.RegionIndex, "clearing", pass, detectCurves: false)
                     {ContinuationComponentIndex=path.ContinuationComponentIndex,ContinuationPlan=path.ContinuationPlan,
-                        ContinuationSourceOrdinal=path.ContinuationSourceOrdinal,ContinuationCircuit=path.ContinuationCircuit});
+                        ContinuationSourceOrdinal=path.ContinuationSourceOrdinal,ContinuationCircuit=path.ContinuationCircuit,
+                        ConcentricSource=path.ConcentricSource});
                 precursors++;
             }
             int targetPass = layers.Count(layer => layer.Command < deepest - 1e-10);
@@ -757,15 +900,22 @@ public static class VCarveToolpaths
                 var points=definition.AtDepth(double.PositiveInfinity,targetPass==0 ? -1 : layers[targetPass-1].Nominal,token);
                 path=path with {Points=points,Moves=new LineToolMoves(points)};
             }
+            if(AlreadyRemoved(path.Points)){omittedAirVisits++;continue;}
             result.Add(path.Category == "final-carve" ? path : path with { DepthPassIndex = targetPass });
         }
         diagnostic?.Invoke($"stage=coordination event=fresh-stock-passes sourceVisits={source.Count} " +
-            $"precursorVisits={precursors} outputVisits={result.Count} surfaceOrigin=True " +
+            $"precursorVisits={precursors} omittedPriorRemovedVisits={omittedAirVisits} outputVisits={result.Count} surfaceOrigin=True " +
             $"assignedStepdown={assignedStep:R} commandedStep={commandStep:R} " +
             "allCorrectionAndTerminalVisits=True fullPhysicalFootprintSameXY=True originalWallsAndGradePreserved=True");
         // A shallow detail stroke can be completed in the first physical layer;
         // executing it there establishes its real connecting trace before deeper
         // branches, without duplicating it or changing its cut/category metadata.
+        if (preserveSourceOrder)
+        {
+            diagnostic?.Invoke($"stage=source-depth-order visits={result.Count} precursors={precursors} "
+                + "completeSourceBeforeNext=True concentricOffsetOrderPreserved=True");
+            return result;
+        }
         bool EarlyDetail(TaggedToolpath p)=>p.ContinuationComponentIndex.HasValue && p.Category=="final-carve"
             && p.Points.All(point=>CommandDepth(-point.Z)<=assignedStep+1e-10);
         return result.OrderBy(path=>path.ContinuationComponentIndex ?? 0)
@@ -947,16 +1097,6 @@ public static class VCarveToolpaths
     }
 
     internal static double AppliedStockAllowance(double stockToLeave) => stockToLeave <= 0.0001 ? 0 : stockToLeave;
-
-    internal static List<IReadOnlyList<PointD>> BuildShoulderBoundary(MillingRegion region,double stockToLeave)
-        // These contours nominate contact rays, not permission to cut. Keep
-        // nomination error within half the existing surface budget. Projection
-        // and inward direction use the ORIGINAL filled target; each fitted
-        // native/F3 cutter sweep still earns its own complete physical proof.
-        => PolygonOps.OffsetBoundary(region.Outer,region.Holes,
-            -(stockToLeave+VCarveMaterialSurface.PlanarReserve),
-            arcTolerance:1/PathUtils.Scale,simplifyTolerance:MachiningAccuracy.SurfaceDeviation/2)
-            .Select(r=>(IReadOnlyList<PointD>)r).ToList();
 
     internal static List<IReadOnlyList<PointD>> BuildBoundary(MillingRegion region, double stockToLeave)
     {

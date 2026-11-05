@@ -6,6 +6,20 @@ namespace RW.Toolpaths.Tests;
 public sealed class MedialAxisClassificationIndexTests
 {
     [Fact]
+    public void LegacyAngleArgumentsCannotPruneInnerMedialBranches()
+    {
+        PointD[] ring = Enumerable.Range(0,16).Select(i => {
+            double angle = 2 * Math.PI * i / 16;
+            return new PointD(10000 * Math.Cos(angle), 10000 * Math.Sin(angle));
+        }).ToArray();
+        var provider = BoostVoronoiProvider.CreateDefault();
+        var complete = provider.ConstructMedialAxis(ring, [], .03, 30000, Math.PI);
+        var legacy = provider.ConstructMedialAxis(ring, [], .03, 30000, 3 * Math.PI / 4);
+        Assert.NotEmpty(complete);
+        Assert.Equal(complete, legacy);
+    }
+
+    [Fact]
     public void IndexedRayCrossingMatchesOriginalPredicateForDenseConcaveRingAndBoundaryTies()
     {
         var ring = Enumerable.Range(0, 16384).Select(i =>
@@ -119,7 +133,7 @@ public sealed class MedialAxisClassificationIndexTests
                 index, index ^ 1, true, false, false,
                 random.Next(-1, count), random.Next(-1, count), new(index, 0), new(index, 1), cell, cell)
             { Color = random.Next(5) == 0 ? Classifier.Colors.OuterPrimary : Classifier.Colors.InnerPrimary }).ToArray();
-            Assert.Equal(ReferenceTraversal(edges), Classifier.SelectInnerPrimaryTraversal(edges, Math.PI));
+            Assert.Equal(ReferenceTraversal(edges), Classifier.SelectInnerPrimaryTraversal(edges));
         }
     }
 
@@ -137,7 +151,7 @@ public sealed class MedialAxisClassificationIndexTests
             Edge(6, 0, -1, 7), Edge(7, 1, 6, -1),
             Edge(8, -1, 9, 9), Edge(9, -1, 8, 8)];
         Assert.Equal(new[] { 0, 1, 8, 9 }, ReferenceTraversal(edges));
-        Assert.Equal(ReferenceTraversal(edges), Classifier.SelectInnerPrimaryTraversal(edges, Math.PI));
+        Assert.Equal(ReferenceTraversal(edges), Classifier.SelectInnerPrimaryTraversal(edges));
     }
 
     private static List<int> ReferenceTraversal(IReadOnlyList<Classifier.EdgeData> edges)
@@ -201,4 +215,3 @@ public sealed class MedialAxisClassificationIndexTests
         return inside;
     }
 }
-

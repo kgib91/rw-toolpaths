@@ -186,7 +186,7 @@ public sealed class RampEntryStockTests
     }
 
     [Fact]
-    public void RoutingWithoutFinalCommandCoordinatesRetainsLegacyClosedExit()
+    public void SmoothRoutingOmitsRepeatedTailWithoutCommandCompaction()
     {
         Point3D[] ring = [new(0, 0, -1), new(10, 0, -1), new(10, 10, -1), new(0, 10, -1), new(0, 0, -1)];
         var source = new TaggedToolpath(ring, [], 0, "final-carve", null, 17, detectCurves: false);
@@ -195,11 +195,11 @@ public sealed class RampEntryStockTests
             new VCarveOptions { SmoothVCarving = true, DetectCurves = false }, 0, null, diagnostic: messages.Add);
         var path = Assert.Single(routed);
         var ramp = path.Spans.Single(s => s.Kind == ToolpathSpanKind.Ramp);
-        var expected = path.Points.Take(ramp.EndIndex).Concat(LegacyCut(ring, path.Points[ramp.EndIndex])).ToArray();
-        Assert.Equal(expected, path.Points);
-        Assert.Equal(ring[0], path.Points[^1]);
+        var cut=path.Points.Skip(ramp.EndIndex).ToArray();
+        AssertSweptStockEqual(PostedPoints(LegacyCut(ring,cut[0])),PostedPoints(cut));
+        Assert.Equal(ring[1], path.Points[^1]);
         Assert.Contains(messages, m => m.Contains("stage=path-routing")
-            && m.Contains("redundantPointsRemoved=0") && m.Contains("entryExitChanges=0"));
+            && m.Contains("entryExitChanges=1"));
     }
 
     [Fact]
@@ -217,7 +217,7 @@ public sealed class RampEntryStockTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void GroupBoundaryKeepsLegacyExitAndFollowingEntryDecision(bool startsAtLegacyExit)
+    public void GroupBoundaryUsesCompletedRingExitAndActualFollowingEntryDecision(bool startsAtLegacyExit)
     {
         Point3D[] ring = [new(0, 0, -1), new(10, 0, -1.2), new(10, 10, -1),
             new(0, 10, -1), new(0, 0, -1)];
@@ -236,22 +236,22 @@ public sealed class RampEntryStockTests
                 CompactCollinearCommands = true },
             0, null, diagnostic: messages.Add);
         Assert.Equal(2, routed.Count);
-        Assert.Equal(ring[0], routed[0].Points[^1]);
+        Assert.Equal(ring[1], routed[0].Points[^1]);
         Assert.Equal(17, routed[0].VisitIdentity);
         Assert.Equal(23, routed[1].VisitIdentity);
         Assert.Equal(1, routed[1].RegionIndex);
         Assert.Equal("final-carve", routed[1].Category);
         Assert.Null(routed[1].DepthPassIndex);
-        Assert.Equal(startsAtLegacyExit ? nextStart.Z : 0, routed[1].Points[0].Z);
-        Assert.Equal(!startsAtLegacyExit, routed[1].Spans.Any(s => s.Kind == ToolpathSpanKind.Ramp));
+        Assert.Equal(startsAtLegacyExit ? 0 : nextStart.Z, routed[1].Points[0].Z);
+        Assert.Equal(startsAtLegacyExit, routed[1].Spans.Any(s => s.Kind == ToolpathSpanKind.Ramp));
         Assert.DoesNotContain(routed, path => path.Spans.Any(s => s.Kind == ToolpathSpanKind.Link));
         Assert.Contains(messages, m => m.Contains("stage=path-routing region=0")
-            && m.Contains("entryExitChanges=0") && m.Contains("finalExit=(0,0,-1)")
-            && m.Contains("groupBoundaryExitGuards=1"));
+            && m.Contains("entryExitChanges=1") && m.Contains("finalExit=(10,0,-1.2)")
+            && m.Contains("groupBoundaryExitGuards=0"));
     }
 
     [Fact]
-    public void ShortenedExitCoincidenceDoesNotSuppressLegacySurfaceEntry()
+    public void ActualExitCoincidenceAvoidsUnnecessarySurfaceEntry()
     {
         Point3D[] ring = [new(0, 0, -1), new(10, 0, -1), new(10, 10, -1), new(0, 10, -1), new(0, 0, -1)];
         var sources = new[]
@@ -263,19 +263,18 @@ public sealed class RampEntryStockTests
         var legacy = RouteSmooth(sources, compact: false);
         var optimized = RouteSmooth(sources, compact: true, messages.Add);
         Assert.Equal(new int?[] { 17, 23 }, optimized.Select(path => path.VisitIdentity));
-        Assert.Equal(ring[0], legacy[0].Points[^1]);
+        Assert.Equal(ring[1], legacy[0].Points[^1]);
         Assert.Equal(ring[1], optimized[0].Points[^1]);
-        Assert.True(optimized[0].Points.Count < legacy[0].Points.Count);
-        Assert.Equal(new Point3D(10, 0, 0), optimized[1].Points[0]);
-        Assert.Contains(optimized[1].Spans, span => span.Kind == ToolpathSpanKind.Ramp);
+        Assert.Equal(optimized[0].Points,legacy[0].Points);
+        Assert.Equal(optimized[0].Points[^1],optimized[1].Points[0]);
+        Assert.DoesNotContain(optimized[1].Spans, span => span.Kind == ToolpathSpanKind.Ramp);
         AssertPostedRampsAndCutUnionEqual(legacy, optimized);
         Assert.Contains(messages, message => message.Contains("stage=path-routing")
-            && message.Contains("entryExitChanges=1")
-            && message.Contains("physicalCoincidenceWithoutLegacyContinuation=1"));
+            && message.Contains("entryExitChanges=1"));
     }
 
     [Fact]
-    public void LegacyAtDepthContinuationKeepsItsPredecessorSeamAndPostedCutUnion()
+    public void FormerSeamRequiresEntryWhenCompletedRingEndsElsewhere()
     {
         Point3D[] ring = [new(0, 0, -1), new(10, 0, -1), new(10, 10, -1), new(0, 10, -1), new(0, 0, -1)];
         var sources = new[]
@@ -287,21 +286,18 @@ public sealed class RampEntryStockTests
         var legacy = RouteSmooth(sources, compact: false);
         var optimized = RouteSmooth(sources, compact: true, messages.Add);
         Assert.Equal(new int?[] { 17, 23 }, optimized.Select(path => path.VisitIdentity));
-        Assert.Equal(ring[0], optimized[0].Points[^1]);
+        Assert.Equal(ring[1], optimized[0].Points[^1]);
         Assert.Equal(legacy[0].Points, optimized[0].Points);
-        Assert.Equal(sources[1].Points, optimized[1].Points);
-        Assert.DoesNotContain(optimized[1].Spans, span => span.Kind == ToolpathSpanKind.Ramp);
+        Assert.Equal(0,optimized[1].Points[0].Z);
+        Assert.Contains(optimized[1].Spans, span => span.Kind == ToolpathSpanKind.Ramp);
         AssertPostedRampsAndCutUnionEqual(legacy, optimized);
         Assert.Contains(messages, message => message.Contains("stage=path-routing")
-            && message.Contains("legacyContinuationExitGuards=1")
-            && message.Contains("entryExitChanges=0"));
-
-        var unsafeEntry = PlanOptimizedEntry(ring, 0, RampSettings.FromRatio(4), landAtSourceVertex: true);
-        Assert.NotEqual(sources[1].Points[0], unsafeEntry.Points[^1]);
+            && message.Contains("legacyContinuationExitGuards=0")
+            && message.Contains("entryExitChanges=2"));
     }
 
     [Fact]
-    public void GroupBoundaryRetainsLegacyNextGroupOrderAndSourceOrientation()
+    public void NextGroupOrderAndOrientationUseActualCompletedRingExit()
     {
         Point3D[] ring = [new(0, 0, -1), new(10, 0, -1), new(10, 10, -1), new(0, 10, -1), new(0, 0, -1)];
         var sources = new[]
@@ -314,20 +310,14 @@ public sealed class RampEntryStockTests
         var messages = new List<string>();
         var legacy = RouteSmooth(sources, compact: false);
         var optimized = RouteSmooth(sources, compact: true, messages.Add);
-        Assert.Equal(new int?[] { 17, 20, 23, 29 }, optimized.Select(path => path.VisitIdentity));
+        Assert.Equal(new int?[] { 17, 20, 29, 23 }, optimized.Select(path => path.VisitIdentity));
         Assert.Equal(legacy.Select(path => path.VisitIdentity), optimized.Select(path => path.VisitIdentity));
-        Assert.Equal(ring[0], optimized[0].Points[^1]);
+        Assert.Equal(ring[1], optimized[0].Points[^1]);
         Assert.Empty(optimized[1].Points);
         AssertPostedRampsAndCutUnionEqual(legacy, optimized);
-        Assert.Equal(new Point3D(8, 0, 0), optimized[3].Points[0]);
+        Assert.Equal(new Point3D(2, 0, 0), optimized[3].Points[0]);
         Assert.Contains(messages, message => message.Contains("stage=path-routing region=0")
-            && message.Contains("groupBoundaryExitGuards=1"));
-
-        // A start at the shortened exit really would choose a different order,
-        // so the legacy order/orientation comparison detects the old dependency.
-        var changedStart = RouteSmooth(sources.Skip(2).ToArray(), compact: false, start: ring[1]);
-        Assert.Equal(new int?[] { 29, 23 }, changedStart.Select(path => path.VisitIdentity));
-        Assert.Equal(new Point3D(2, 0, 0), changedStart[1].Points[0]);
+            && message.Contains("groupBoundaryExitGuards=0"));
     }
 
     [Theory]

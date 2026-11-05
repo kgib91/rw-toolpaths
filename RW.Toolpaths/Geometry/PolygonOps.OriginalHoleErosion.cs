@@ -123,7 +123,7 @@ public static partial class PolygonOps
                         Console.WriteLine($"[PolygonOps.FirstHoleErosionContact] admitted=False "
                             + $"knot=({contact.Key.X},{contact.Key.Y}) parents={parents.Length} "
                             + $"owners={string.Join(";", parents.Take(8).Select(p => $"{p}:r{owners[p].Ring}/e{owners[p].Edge}"))} "
-                            + "reason=not-one-adjacent-collinear-overlap-with-ordinary-endpoint-owner originalChainChanged=False");
+                            + $"reason=not-one-adjacent-collinear-overlap-with-ordinary-endpoint-owner originalChainChanged=False");
                         reason = "unsupported-overlap-junction"; return null;
                     }
                     adjacentCollinearKnots++;
@@ -137,7 +137,7 @@ public static partial class PolygonOps
                 + $"ordinaryEndpointKnots={ordinaryEndpointKnots} "
                 + $"contactBuildMs={contacts.BuildMilliseconds:F2} contactQueryMs={contacts.QueryMilliseconds:F2} "
                 + $"contactCertificateMs={contacts.CertificateMilliseconds:F2} completeFiniteUnion=True "
-                + "originalChainChanged=False originalSignedClassifier=unchanged noNestedPositiveIslands=True");
+                + $"originalChainChanged=False originalSignedClassifier=unchanged noNestedPositiveIslands=True");
             reason = "admitted";
             return new(new Path64(outer), positives, segments.Count);
         }
@@ -227,7 +227,7 @@ public static partial class PolygonOps
         {
             token.ThrowIfCancellationRequested();
             Console.WriteLine($"[PolygonOps.FirstHoleErosion] proposed=False reason={reason} "
-                + "fallback=complete-original-boundary-band stockAuthority=False");
+                + $"fallback=complete-original-boundary-band stockAuthority=False");
             return false;
         }
         if (!double.IsFinite(scaledDelta) || scaledDelta >= -4 || -scaledDelta > 64 * PathUtils.Scale
@@ -302,9 +302,9 @@ public static partial class PolygonOps
             + $"rejectedHole={rejectedHole} rejectedEdge={rejectedEdge} "
             + $"guard={guard / PathUtils.Scale:R} constructionMs={constructionMs:F2} filledProofMs={filledMs:F2} "
             + $"capsuleProofMs={ElapsedMilliseconds(capsuleStarted):F2} totalMs={ElapsedMilliseconds(started):F2} "
-            + "firstOriginalOnly=True originalChainChanged=False allSignedPiecesRetained=True "
-            + "inversionRepair=unchanged firstMutualCleanup=unchanged stockAuthority=False "
-            + "refusal=complete-original-boundary-band");
+            + $"firstOriginalOnly=True originalChainChanged=False allSignedPiecesRetained=True "
+            + $"inversionRepair=unchanged firstMutualCleanup=unchanged stockAuthority=False "
+            + $"refusal=complete-original-boundary-band");
         if (!capsules) return false;
         result = candidate; return true;
     }

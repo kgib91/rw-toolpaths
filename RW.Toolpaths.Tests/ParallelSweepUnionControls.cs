@@ -8,6 +8,29 @@ namespace RW.Toolpaths.Tests;
 public sealed class ParallelSweepUnionControls
 {
     [Fact]
+    public void HardwareBudgetKeepsLiteralOperandsOrderedAndNestedWorkSerial()
+    {
+        int workers = GeometryParallelism.HardwareWorkerLimit;
+        Assert.InRange(workers, 1, Math.Min(12, Environment.ProcessorCount));
+        Assert.InRange(GeometryParallelism.StockFitWorkerLimit,1,Math.Min(16,Environment.ProcessorCount));
+        Assert.True(GeometryParallelism.StockFitWorkerLimit<=Math.Max(1,GC.GetGCMemoryInfo().TotalAvailableMemoryBytes/(2L<<30)));
+        using var queue = new VCarveOrderedUnionQueue(default, workers);
+        var inputs = Enumerable.Range(0, 2 * workers).Select(i => new Paths64 {
+            Rectangle(i * 100, 0, i * 100 + 40, 40),
+            Reverse(Rectangle(i * 100 + 10, 10, i * 100 + 30, 30)) }).ToArray();
+        var slots = inputs.Select(queue.Submit).ToArray();
+        queue.Complete();
+        for (int i = 0; i < slots.Length; i++)
+            Exact(Clipper.Union(inputs[i], FillRule.NonZero), queue.Read(slots[i]));
+        Assert.InRange(queue.PeakRetainedInputBytes, 1, VCarveOrderedUnionQueue.MaximumRetainedInputBytes);
+        Assert.True(queue.OwnedWorkersJoined);
+        using var scope = GeometryParallelism.EnterWorker();
+        Assert.Equal(1, GeometryParallelism.WorkerLimit);
+        Assert.Equal(1, GeometryParallelism.StockFitWorkerLimit);
+        Assert.Throws<ArgumentOutOfRangeException>(() => new VCarveOrderedUnionQueue(default, 2));
+    }
+
+    [Fact]
     public void LargerRoughingLeavesRetainTheirSignedFillAndByteBudget()
     {
         var input=new Paths64(Enumerable.Range(0,128).Select(i=>Rectangle(i,0,i+2,10)));
@@ -190,6 +213,12 @@ public sealed class ParallelSweepUnionControls
                 profile, 0, .004, upperBound: upper, consolidateHemisphereChords: true,
                 enableTaperedRadiusRuns: true);
             ExactWorld(expected, actual);
+            // Normal production construction must adopt the same execution-only
+            // acceleration for both upper and lower dense sweeps.
+            var automatic = VCarvePhysicalSweep.BuildWithTaperedRadiusRuns(paths,
+                profile, 0, .004, upperBound: upper, consolidateHemisphereChords: true,
+                enableTaperedRadiusRuns: true);
+            ExactWorld(expected, automatic);
             using var worker = GeometryParallelism.EnterWorker();
             var nested = VCarvePhysicalSweep.BuildWithParallelLeafUnions(paths,
                 profile, 0, .004, upperBound: upper, consolidateHemisphereChords: true,

@@ -88,7 +88,7 @@ internal sealed partial class NativeSegmentArrangement
         _token.ThrowIfCancellationRequested();
         Console.WriteLine($"[BoostVoronoi.SegmentArrangement] mode=exact-rational-finite-union originalSites={_source.Length} "
             + $"atomicSites={atoms.Count} scale={scale} fractionalSites={_rationalSplits.Count} splitOriginalSites={splitSites} duplicateAtoms={duplicates} "
-            + "completeOriginalFiniteUnion=True originalSubchainsVerified=True originalOwnerMappings=True originalSignedRings=True geometryDisplacement=0");
+            + $"completeOriginalFiniteUnion=True originalSubchainsVerified=True originalOwnerMappings=True originalSignedRings=True geometryDisplacement=0");
         return new(atoms, (long)scale, splitSites, duplicates);
 
         WidePoint Promote(Point p) => Wide(p.X * scale, p.Y * scale);

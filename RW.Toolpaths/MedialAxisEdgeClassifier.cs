@@ -1,4 +1,4 @@
-﻿using Clipper2Lib;
+using Clipper2Lib;
 using System.Diagnostics;
 
 namespace RW.Toolpaths;
@@ -21,6 +21,21 @@ internal static partial class MedialAxisEdgeClassifier
     internal sealed record class SegmentSite(EdgePoint Low, EdgePoint High);
 
     internal sealed record class CellSite(bool ContainsPoint, EdgePoint? Point, SegmentSite? Segment);
+
+    internal static double? SharedCornerAngle(EdgeData edge)
+    {
+        if (edge.Cell.ContainsPoint || edge.TwinCell.ContainsPoint) return null;
+        var a = edge.Cell.Segment!; var b = edge.TwinCell.Segment!;
+        EdgePoint center, first, second;
+        if (a.Low == b.Low) { center = a.Low; first = a.High; second = b.High; }
+        else if (a.High == b.Low) { center = a.High; first = a.Low; second = b.High; }
+        else if (a.Low == b.High) { center = a.Low; first = a.High; second = b.Low; }
+        else if (a.High == b.High) { center = a.High; first = a.Low; second = b.Low; }
+        else return null;
+        double ax = first.X - center.X, ay = first.Y - center.Y;
+        double bx = second.X - center.X, by = second.Y - center.Y;
+        return Math.Acos(Math.Clamp((ax * bx + ay * by) / (Math.Sqrt(ax * ax + ay * ay) * Math.Sqrt(bx * bx + by * by)), -1, 1));
+    }
 
     internal sealed record class EdgeData(
         int Index,
@@ -163,7 +178,7 @@ internal static partial class MedialAxisEdgeClassifier
 
     internal static List<int> SelectInnerPrimaryTraversal(
         IReadOnlyList<EdgeData> edges,
-        double filteringAngle, CancellationToken cancellationToken = default,
+        CancellationToken cancellationToken = default,
         Action<string>? diagnostic = null, Action<double>? progress = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -233,13 +248,8 @@ internal static partial class MedialAxisEdgeClassifier
         }
 
         progress?.Invoke(1);
-        return walked
-            .Where(index =>
-            {
-                double? angle = GetCellsAngle(edges[index]);
-                return angle is null || angle <= filteringAngle;
-            })
-            .ToList();
+        diagnostic?.Invoke($"stage=voronoi-traversal event=policy retainedEdges={walked.Count} anglePruning=False");
+        return walked;
     }
 
     // Preserve the ray-crossing predicate exactly, including its asymmetric boundary
@@ -349,56 +359,6 @@ internal static partial class MedialAxisEdgeClassifier
         }
 
         return current;
-    }
-
-    private static double? GetCellsAngle(EdgeData edge)
-    {
-        if (edge.Cell.ContainsPoint || edge.TwinCell.ContainsPoint)
-        {
-            return null;
-        }
-
-        var left = edge.Cell.Segment ?? throw new InvalidOperationException("Expected segment site on cell");
-        var right = edge.TwinCell.Segment ?? throw new InvalidOperationException("Expected segment site on twin cell");
-
-        if (EqualPoints(left.Low, right.Low))
-        {
-            return Angle(left.High, left.Low, right.High);
-        }
-
-        if (EqualPoints(left.High, right.Low))
-        {
-            return Angle(left.Low, left.High, right.High);
-        }
-
-        if (EqualPoints(left.Low, right.High))
-        {
-            return Angle(left.High, left.Low, right.Low);
-        }
-
-        if (EqualPoints(left.High, right.High))
-        {
-            return Angle(left.Low, left.High, right.Low);
-        }
-
-        return null;
-    }
-
-    private static double Angle(EdgePoint a, EdgePoint pivot, EdgePoint b)
-    {
-        double ax = a.X - pivot.X;
-        double ay = a.Y - pivot.Y;
-        double bx = b.X - pivot.X;
-        double by = b.Y - pivot.Y;
-
-        double dot = ax * bx + ay * by;
-        double denom = Math.Sqrt((ax * ax + ay * ay) * (bx * bx + by * by));
-        if (denom <= 0)
-        {
-            return 0;
-        }
-
-        return Math.Acos(Math.Clamp(dot / denom, -1.0, 1.0));
     }
 
     internal static bool EqualPoints(EdgePoint a, EdgePoint b) =>

@@ -36,7 +36,7 @@ public sealed class LocalOriginalMedialTests
         var source = Sites();
         var query = new RectD(-400, -300, 400, 300);
         var local = Assert.IsType<BoostVoronoiProvider.LocalDiagram>(BoostVoronoiProvider.TryConstructLocalMedialAxis(
-            source, query, .05, 3 * Math.PI / 4, CancellationToken.None));
+            source, query, .05, CancellationToken.None));
         Assert.True(local.OriginalSiteOrdinals.Count < source.Sites.Count / 4);
         Assert.All(source.Sites.Where(site => site.Outer), site => Assert.Contains(site.Ordinal, local.OriginalSiteOrdinals));
         var retained = local.OriginalSiteOrdinals.Select(index => source.Sites[index]).ToArray();
@@ -56,7 +56,7 @@ public sealed class LocalOriginalMedialTests
     public void LocalQueriesOutsideTheOriginalOuterNeverOmitInfiniteEdges()
     {
         Assert.Null(BoostVoronoiProvider.TryConstructLocalMedialAxis(Sites(),
-            new RectD(9900, 9900, 10100, 10100), .05, 3 * Math.PI / 4, CancellationToken.None));
+            new RectD(9900, 9900, 10100, 10100), .05, CancellationToken.None));
     }
 
     [Fact]

@@ -67,6 +67,7 @@ public sealed class PocketConstructionPolicyTests
         ToolpathPlan actual;
         try
         {
+            using var logSelection = RW.Diagnostics.DiagnosticLog.PushNamespaces("*");
             Console.SetOut(writer);
             actual = PocketToolpaths.Generate(new[] { source }, ToolGeometry.Flat(3),
                 new DepthSchedule(1, 1), new PocketOptions { StepOver = .55, MaxRings = 2,
@@ -118,6 +119,7 @@ public sealed class PocketConstructionPolicyTests
         var writer = new StringWriter(); var previous = Console.Out;
         try
         {
+            using var logSelection = RW.Diagnostics.DiagnosticLog.PushNamespaces("*");
             Console.SetOut(writer);
             var actual = CarvingRoughingToolpaths.Generate(surface, new ToolGeometry(2), 2,
                 new CarvingOptions { StepOver = .4, SurfaceAllowance = .2, CalculateSweptArea = false });

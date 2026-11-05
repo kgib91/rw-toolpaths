@@ -44,6 +44,12 @@ public sealed class MillingRegion
 
     public IReadOnlyList<IReadOnlyList<PointD>> Holes { get; }
 
+    /// <summary>Optional world-space authored-curve tessellation for ordinary
+    /// medial construction. Outer/Holes remain the physical boundary authority.</summary>
+    public IReadOnlyList<IReadOnlyList<PointD>>? VCarveNominalBoundary { get; init; }
+    /// <summary>The nominal boundary already passed per-layer preparation and composition.</summary>
+    public bool VCarveNominalLayerPrepared { get; init; }
+
     /// <summary>Outer boundary followed by every hole, as one flat ring group.</summary>
     public List<IReadOnlyList<PointD>> AsRingGroup()
     {
@@ -60,6 +66,10 @@ public sealed class MillingRegion
 /// </summary>
 public sealed record ToolGeometry(double Radius)
 {
+    /// <summary>Literal cutter retained when Radius is its engaged pocket width.
+    /// An effective width alone does not certify cylindrical cleared stock.</summary>
+    public CarvingCutterProfile? PhysicalProfile { get; init; }
+
     /// <summary>Physical cutting sections from the actual tip, including a rounded nose.</summary>
     public VCarveCutterProfile? VCarveProfile { get; init; }
 

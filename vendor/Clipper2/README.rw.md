@@ -25,11 +25,9 @@ ordering retain upstream code. Queue administration is O(N log N).
 merge mode when each Clipper instance is constructed. Opt-in
 `RW_CLIPPER_ORDERED_SCANBEAM_TRACE=1` reports whole-list and sorted-run skip counters;
 leave it unset for timing. This does not change the public API or signing identity.
-Qualification is bound in `rw-legacy-win32/artifacts/roughing-30s/ordered-scanbeam-probe-14`:
-five alternating captured-workload pairs preserve all complete ordered intermediate
-results and decisions; the supported ClipperScaling checks preserve assembly identity,
-public API, signed/open/closed geometry, repeated execution and offsets. These are
-kernel measurements; complete phase latency and stock auditing are separate checks.
+Complete phase latency and stock auditing require separate validation from kernel
+measurements. Local investigation captures are disposable and are not prerequisites
+for building or running the supported tests.
 
 `dotnet build -p:ClipperDiagnostics=true` adds internal counters and opt-in captures.
 Ordinary builds compile them out. Diagnostic summaries expose inserted events,
@@ -40,17 +38,20 @@ checks. Set `RW_CLIPPER_CAPTURE_DIR`, `RW_CLIPPER_CAPTURE_LABEL`,
 (default 1000) to capture ordered integer inputs. Reusable-data inputs decline capture
 instead of producing incomplete fixtures. Timing runs must use ordinary builds.
 
-`benchmarks/ClipperScaling` compares assembly identities, public APIs, exact ordered
-closed/open outputs, repeated execution and offsets in isolated assembly load contexts.
-It runs five alternating timing repetitions, disjoint/equal-Y/intersection scaling and
-an isolated adversarial queue benchmark. `--diagnostic-only` checks complete executed
-scanline sequences without timing. `--fixtures=directory` includes diagnostic captures.
-Run it with an output JSON path followed by baseline/candidate DLL paths.
+The maintained regression checks are in
+[`ClipperScanlineQueueTests`](../../RW.Toolpaths.Tests/ClipperScanlineQueueTests.cs),
+[`ClipperExecutionFailureTests`](../../RW.Toolpaths.Tests/ClipperExecutionFailureTests.cs)
+and [`PolygonOpsTests`](../../RW.Toolpaths.Tests/PolygonOpsTests.cs). They cover distinct
+descending scanline order and reuse, failed-result disposal, ordered Boolean wrappers
+and polygon operations. Run the suite from the repository root:
 
-Evidence for this change is in `rw-legacy-win32/artifacts/toolpath-scaling`, including
-the unmodified-source check, frozen baseline runtime, physical-sweep and reference-opening
-captures, exact event comparisons and counters-disabled measurements. Future upstream
-updates must explicitly revalidate identity, API and ordered geometry.
+```powershell
+dotnet test .\RW.Toolpaths.Tests\RW.Toolpaths.Tests.csproj
+```
+
+Future upstream updates must explicitly revalidate assembly identity, public API and
+ordered geometry. Performance qualification must measure the full affected workload
+with diagnostics disabled.
 
 For a completely ordered scanbeam, the original Adjust pass has also computed
 the original own top-X of every non-top, non-join-left edge. The later top pass
@@ -63,11 +64,5 @@ original code and ordering.
 
 `RW_CLIPPER_SPARSE_TOP_PREFIX_REFERENCE=1` captures the complete prior top pass.
 The existing opt-in ordered trace also reports skipped prefix assignments.
-Qualification is frozen in
-`rw-legacy-win32/artifacts/roughing-30s/sparse-top-prefix-25-qualified-source-images.zip`:
-2,816 adversarial cases and 2,470 complete captured workload comparisons pass;
-ClipperScaling passes 6,528 ordered closed/open/repeated executions and 36 offsets
-with unchanged identity/API. Six real dense Boolean operands omit 5,371,953
-redundant assignments and retain complete ordered native outputs. Five alternating
-kernel pairs have material timing variance (median 19.834 -> 15.723 seconds), so
-full cold-phase latency and original-stock auditing remain separate acceptance.
+Full cold-phase latency and original-stock auditing remain separate acceptance
+criteria for changes to this optimization.

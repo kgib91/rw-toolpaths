@@ -757,7 +757,7 @@ public sealed partial class VCarvePreparation
         }
         Console.WriteLine($"[VCarve.Basins] event=prominence-complete basins={completed.Distinct().Count()} errorBound={GeometricErrorBound:R}");
         Console.WriteLine($"[VCarve.Basins] event=attachments-excluded attachments={attachments} " +
-            "owner=distinct-surviving-uphill-maxima oceanDiscPriority=True arbitraryCutoff=False");
+            $"owner=distinct-surviving-uphill-maxima oceanDiscPriority=True arbitraryCutoff=False");
         return completed;
     }
 

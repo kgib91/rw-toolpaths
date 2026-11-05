@@ -28,8 +28,11 @@ internal static class VCarveGpuDistanceFrontNominator
         internal GpuBoundarySegment Segment(int ordinal) => _segments[ordinal];
         internal int OriginalOrdinal(int ordinal) => _originalOrdinals[ordinal];
         internal bool TryCreateSampler(CancellationToken token, Action<string>? diagnostic,
-            out VCarveGpuDiscWitnessContext.BoundarySampleContext? context, out string reason)
-            => VCarveGpuDiscWitnessContext.BoundarySampleContext.TryCreate(_segments, _nodes, token, diagnostic, out context, out reason);
+            out VCarveGpuDiscWitnessContext.BoundarySampleContext? context, out string reason,
+            VCarveGenerationPolicy? policy = null)
+            => VCarveGpuDiscWitnessContext.BoundarySampleContext.TryCreate(_segments, _nodes,
+                GpuBoundaryWorkLimits.Default, (policy ?? VCarveGenerationPolicy.Capture()).GpuBoundaryFp32,
+                token, diagnostic, out context, out reason);
 
         internal static bool TryPrepare(IReadOnlyList<IReadOnlyList<PointD>> boundary, CancellationToken token,
             out BoundarySnapshot? snapshot, out string reason)

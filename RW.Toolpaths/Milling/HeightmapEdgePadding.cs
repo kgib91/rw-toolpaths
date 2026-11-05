@@ -69,7 +69,7 @@ public static class HeightmapEdgePadding
         Console.WriteLine($"[Carving.EdgeExtension] edges={edges} distance={distance:R} " +
             $"source={grid.Width}x{grid.Height} padded={paddedWidth}x{paddedHeight} " +
             $"padding={minX * pixelX:R},{maxX * pixelX:R},{minY * pixelY:R},{maxY * pixelY:R} " +
-            "boundary=edge-replication clearance=original-full-profile");
+            $"boundary=edge-replication clearance=original-full-profile");
         return (new HeightmapGrid(paddedWidth, paddedHeight, samples, mask), expandedPlacement);
     }
 }

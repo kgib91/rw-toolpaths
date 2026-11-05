@@ -8,7 +8,7 @@ public sealed class VCarveParallelCorrectionTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void ParallelCorrectionPreservesOrderedGeometryAndTerminalVisits(bool rounded)
+    public void ParallelCorrectionPreservesOrderedGeometryAndAlreadyCompleteChannels(bool rounded)
     {
         var fixture = Fixture(rounded);
         var serialLog = new List<string>();
@@ -19,17 +19,33 @@ public sealed class VCarveParallelCorrectionTests
         List<TaggedToolpath> Run(int workers, List<string> log, List<string> progress)
             => VCarveSmoothing.Apply(fixture.Paths, fixture.Boundary, fixture.Tool, new DepthSchedule(3, 1.5),
                 new VCarveOptions { SmoothVCarving = true, SmoothRampAngleDegrees = rounded ? 30 : 15,
-                    IncludeInteriorFill = false, DetectCurves = false }, CancellationToken.None,
+                    // Full fill reaches correction dispatch. Fill Limit exits
+                    // with its bounded initial cohort before correction runs.
+                    IncludeInteriorFill = true, DetectCurves = false }, CancellationToken.None,
                 message => { Assert.Equal(caller, Environment.CurrentManagedThreadId); log.Add(message); },
                 (_, message, _) => { Assert.Equal(caller, Environment.CurrentManagedThreadId); progress.Add(message); },
                 correctionWorkers: workers);
 
         var serial = Run(1, serialLog, serialProgress);
         var parallel = Run(4, parallelLog, parallelProgress);
-        Assert.Contains(parallelLog, line => line.Contains("workerPolicy=independent-components"));
-        int expectedWorkers = Math.Min(4, Environment.ProcessorCount);
-        Assert.Contains(parallelLog, line => line.Contains("event=workers-complete")
-            && line.Contains($"workers={expectedWorkers} "));
+        if(rounded)
+        {
+            // Full outline ramps already complete this rounded fixture. The
+            // scheduler must not invent correction or terminal visits merely
+            // because multiple workers were requested.
+            Assert.Contains(parallelLog,line=>line.Contains("stage=smoothing event=complete correctionRounds=0 correctionPaths=0")
+                &&line.Contains("widthVerified=True"));
+            Assert.DoesNotContain(parallelLog,line=>line.Contains("stage=smooth-concentric event=partition"));
+        }
+        else
+        {
+            Assert.True(parallelLog.Any(line => line.Contains("workerPolicy=independent-components")),
+                string.Join(Environment.NewLine,parallelLog.Where(line=>line.Contains("stage=smooth-concentric")
+                    ||line.Contains("stage=smoothing event=complete")||line.Contains("stage=smooth-residual"))));
+            int expectedWorkers = Math.Min(4, Environment.ProcessorCount);
+            Assert.Contains(parallelLog, line => line.Contains("event=workers-complete")
+                && line.Contains($"workers={expectedWorkers} "));
+        }
         Assert.Contains(parallel, path => path.Category == "clearing");
         Assert.Equal(serial.Count, parallel.Count);
         for (int i = 0; i < serial.Count; i++)
@@ -45,9 +61,7 @@ public sealed class VCarveParallelCorrectionTests
         Assert.Equal(serialProgress, parallelProgress);
         Assert.Equal(serialLog.Where(line => line.Contains("stage=smooth-concentric event=begin")),
             parallelLog.Where(line => line.Contains("stage=smooth-concentric event=begin")));
-        if (rounded)
-            Assert.Contains(parallelLog, line => line.Contains("stage=smooth-terminal-ramps")
-                && !line.Contains("candidates=0 "));
+        Assert.Contains(parallel,path=>path.Category=="final-carve");
     }
 
     [Fact]
@@ -59,7 +73,7 @@ public sealed class VCarveParallelCorrectionTests
         Assert.Throws<OperationCanceledException>(() => VCarveSmoothing.Apply(fixture.Paths, fixture.Boundary,
             fixture.Tool, new DepthSchedule(3, 1.5),
             new VCarveOptions { SmoothVCarving = true, SmoothRampAngleDegrees = 15,
-                IncludeInteriorFill = false, DetectCurves = false }, cancellation.Token, message =>
+                IncludeInteriorFill = true, DetectCurves = false }, cancellation.Token, message =>
             {
                 if (!message.Contains("stage=smooth-concentric event=partition")) return;
                 reachedCorrection = true;

@@ -117,6 +117,23 @@ public sealed class VCarveCutterProfileTests
         ], 3));
     }
 
+    [Theory]
+    [InlineData(20, false)]
+    [InlineData(19.999, true)]
+    public void SectionStartingAtTheContactPlaneCannotEscapeValidation(double contactDepth, bool accepted)
+    {
+        CarvingCutterSection[] sections = [new(CarvingCutterSectionKind.Linear, .75, .75, 20),
+            new(CarvingCutterSectionKind.Linear, .793, 3, 10)];
+        if (accepted)
+        {
+            var profile = new VCarveCutterProfile(sections, contactDepth);
+            Assert.Equal(.75, profile.RadiusAtDepth(contactDepth));
+            Assert.Equal(2, profile.Sections.Count);
+            Assert.Equal(.793, profile.PhysicalRadiusAtDepth(20));
+        }
+        else Assert.Throws<ArgumentException>(() => new VCarveCutterProfile(sections, contactDepth));
+    }
+
     private static VCarveCutterProfile TaperedBall() => new([
         new(CarvingCutterSectionKind.Hemisphere, 0, 0.79, 0.79),
         new(CarvingCutterSectionKind.Linear, 0.79, 3, 20),

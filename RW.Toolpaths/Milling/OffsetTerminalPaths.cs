@@ -58,9 +58,9 @@ internal static class OffsetTerminalPaths
             source.Outer.Max(point => point.y) - source.Outer.Min(point => point.y));
         if (boundOriginalSource)
             return MedialAxisGeometry.BuildBoundedSource(source.Outer, source.Holes,
-                .01, Math.Max(1, span * 2), 3 * Math.PI / 4, token, preserveNativeGrid: preserveNativeGrid);
+                .01, Math.Max(1, span * 2), Math.PI, token, preserveNativeGrid: preserveNativeGrid);
         return MedialAxisGeometry.Build(source.Outer, source.Holes, BoostVoronoiProvider.CreateDefault(),
-            .01, Math.Max(1, span * 2), 3 * Math.PI / 4, token, preserveNativeGrid: preserveNativeGrid);
+            .01, Math.Max(1, span * 2), Math.PI, token, preserveNativeGrid: preserveNativeGrid);
     }
 
     /// <summary>
@@ -93,7 +93,7 @@ internal static class OffsetTerminalPaths
         {
             Console.WriteLine($"[Offset.Terminal.Component] region={context.RegionIndex} parentLevel={context.ParentLevel} "
                 + $"offset={context.CurrentOffsetDistance:R} candidateOffset={context.CandidateOffsetDistance:R} "
-                + "result=current-front-already-covers-component source=collapsed-component");
+                + $"result=current-front-already-covers-component source=collapsed-component");
             PerfLog.Stop("Offset.Terminal.Component", started, "core=empty medialRequested=False");
             return Array.Empty<IReadOnlyList<PointD>>();
         }
@@ -154,7 +154,7 @@ internal static class OffsetTerminalPaths
             Console.WriteLine($"[Offset.Terminal.LocalCoverage] region={context.RegionIndex} "
                 + $"level={context.ParentLevel} paths={paths.Count} unresolvedContours={interior.Count} "
                 + $"reserve={.003 + GridReserve:R} certified={certified} originalWalls=unchanged "
-                + "completeCurrentMaterial=True fallback=full-original-sites");
+                + $"completeCurrentMaterial=True fallback=full-original-sites");
             if (!certified) return BuildCollapsedComponentCore(context, sourceMedial, firstInset, clipBoundary, token, true);
         }
         Console.WriteLine($"[Offset.Terminal.Component] region={context.RegionIndex} parentLevel={context.ParentLevel} "
@@ -165,7 +165,7 @@ internal static class OffsetTerminalPaths
             + $"neededFragments={candidates.Count} retainedFragments={retained.Count} redundant={redundant} "
             + $"restoredNativeEdges={restored} nativeComponents={nativeComponents} paths={paths.Count} "
             + $"rejectedChords={rejected} sweepComparisonError={SweepComparisonError(arc):R} "
-            + "endpointExtrapolation=0 inventedBridges=0");
+            + $"endpointExtrapolation=0 inventedBridges=0");
         PerfLog.Stop("Offset.Terminal.Select", selectStarted, $"candidates={candidates.Count} retained={retained.Count} paths={paths.Count}");
         PerfLog.Stop("Offset.Terminal.Component", started, $"core=nonempty medialRequested=True paths={paths.Count}");
         return paths;

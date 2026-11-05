@@ -98,7 +98,7 @@ internal sealed class CarvingClearanceField
     {
         if (_outsideSamples != 0 || _outsideChords != 0)
             Console.WriteLine($"[Carving.FieldFallback] samples={_outsideSamples} chords={_outsideChords} " +
-                "clearance=original-source-full-profile");
+                $"clearance=original-source-full-profile");
     }
 
     /// <summary>Exact guide-field maximum above a chord: the interpolated height is
@@ -146,4 +146,3 @@ internal sealed class CarvingClearanceField
         return maximum + 1e-9;
     }
 }
-

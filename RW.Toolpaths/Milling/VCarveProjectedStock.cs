@@ -14,7 +14,8 @@ internal sealed class VCarveProjectedStock
     private readonly record struct Node(double Left, double Bottom, double Right, double Top,
         double Depth, int First, int Count, int Low, int High,
         double SourceLeft,double SourceBottom,double SourceRight,double SourceTop,VCarveCutterProfile? CommonProfile);
-    private readonly record struct Cell(double Left, double Bottom, double Right, double Top, int Level);
+    private readonly record struct Cell(double Left, double Bottom, double Right, double Top, int Level,
+        int GeometryFlags=0,double FloorLower=0);
     private readonly record struct StockChord(Point3D A, Point3D B, double Radius, VCarveCutterProfile? Profile = null);
     private readonly StockChord[] columns;
     private readonly Node[] nodes;
@@ -25,6 +26,16 @@ internal sealed class VCarveProjectedStock
     private readonly CancellationToken token;
     private readonly Action<string>? diagnostic;
     private readonly double maximumDepth;
+    private readonly object queryDomain = new();
+    private readonly bool memoRefusals=true;
+    private readonly bool inheritCellClearance=true;
+    internal long InheritedStockCellProofs;
+    internal long InheritedRegionDistanceQueriesAvoided;
+    internal long ReusedCellIntersectionPredicates;
+    private readonly record struct RefusalWitness(double X,double Y,double UpperDepth,bool ClearedOnly);
+    private readonly RefusalWitness[] refusalWitnesses=new RefusalWitness[16];
+    private int refusalWitnessCount,nextRefusalWitness;
+    internal long RefusalWitnessHits,RefusalWitnessPublications,RefusalWitnessTrials;
     private readonly Dictionary<(Point3D, Point3D, bool, bool), bool> proofs = new();
     private readonly Queue<(Point3D, Point3D, bool, bool)> proofOrder = new();
     private readonly Dictionary<(double, double, bool), double> depths = new();
@@ -36,10 +47,25 @@ internal sealed class VCarveProjectedStock
     {
         internal double PartDistance, TargetDistance, Clearance, PointClearance, SeedClearance;
     }
-    private readonly Dictionary<(double Left,double Bottom,int Level),CellFacts> stockCells = new();
-    private readonly Queue<(double Left,double Bottom,int Level)> stockCellOrder = new();
+    // Every dyadic cell through level 14 has an exact centre on the 1/2048 mm
+    // grid. Its two centre coordinates identify BOTH position and level (the
+    // lowest set centre bit identifies the cell width), without a tuple hash.
+    // UInt64's default hash XORs its two halves. Here those halves are X and Y:
+    // a complete N by N dyadic grid can collapse to only O(N) hashes. Mix both
+    // coordinates before indexing; equality and FIFO admission remain literal.
+    private readonly record struct CellKey(ulong Packed)
+    {
+        // A value key keeps Dictionary's hash/equality path statically known;
+        // the mixed hash and literal packed equality do not need virtual calls.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public override int GetHashCode() => System.HashCode.Combine((uint)Packed, (uint)(Packed >> 32));
+    }
+    private readonly Dictionary<CellKey,CellFacts> stockCells = new();
+    private readonly Queue<CellKey> stockCellOrder = new();
+    private CellFacts uncachedCellFacts;
     private const double StockCellRootWidth = 16;
     private const int StockCellCacheLimit = 1048576;
+    private readonly int stockCellCacheLimit = StockCellCacheLimit;
     internal long StockCellCacheHits, StockCellCacheMisses, StockCellCacheEvictions;
     internal long CellGeometryCacheHits, CellGeometryCacheMisses;
     internal long ProfileCandidatesPruned;
@@ -55,6 +81,7 @@ internal sealed class VCarveProjectedStock
     internal long DepthWitnessQueries,DepthWitnessBounds,DepthWitnessSeedFits;
     private (double X,double Y,double Depth,bool ClearedOnly)? lastFittedDepth;
     internal long NearbyDepthTrials,NearbyDepthFits,NearbyDepthRefusals;
+    internal long RejectedHighDepthTrials,IntermediateDepthFits;
     // Entry interpolation can introduce new F3 XY points inside a proved source
     // chord. Reserve their planar rounding shell throughout the continuous proof.
     private const double PlanarMargin = .002;
@@ -63,11 +90,61 @@ internal sealed class VCarveProjectedStock
     internal int ProfileChords { get; }
     internal int IndexedChords => columns.Length;
 
+    // The geometric index and regions are immutable. Query workers share them
+    // while retaining private adaptive cells, certificates and search hints.
+    internal VCarveProjectedStock CreateQueryWorker() => new(this);
+
+    internal bool TryPositiveProof(Point3D a,Point3D b,bool postingReserve=true)
+    {
+        if(proofs.TryGetValue((a,b,false,postingReserve),out bool exact)&&exact
+            ||a!=b&&proofs.TryGetValue((b,a,false,postingReserve),out bool reversed)&&reversed
+            ||!postingReserve&&(proofs.TryGetValue((a,b,false,true),out bool stronger)&&stronger
+                ||a!=b&&proofs.TryGetValue((b,a,false,true),out stronger)&&stronger))
+        {CacheHits++;return true;}
+        return false;
+    }
+
+    internal long ImportPositiveProofs(VCarveProjectedStock worker)
+    {
+        if (!ReferenceEquals(queryDomain, worker.queryDomain))
+            throw new ArgumentException("Stock certificates require the identical immutable query domain.", nameof(worker));
+        long imported = 0;
+        foreach (var (key, result) in worker.proofs)
+        {
+            token.ThrowIfCancellationRequested();
+            if (!result) continue;
+            if (proofs.ContainsKey(key)) { proofs[key] = true; continue; }
+            if (proofs.Count >= SweepProofCacheLimit)
+            { proofs.Remove(proofOrder.Dequeue()); SweepProofCacheEvictions++; }
+            proofs.Add(key, true); proofOrder.Enqueue(key); imported++;
+        }
+        return imported;
+    }
+
+    private VCarveProjectedStock(VCarveProjectedStock source)
+    {
+        columns = source.columns; nodes = source.nodes; roots = source.roots;
+        queryDomain = source.queryDomain;
+        target = source.target.CreateQueryWorker(); part = source.part.CreateQueryWorker(); profile = source.profile;
+        maximumDepth = source.maximumDepth; token = source.token;
+        stockCellCacheLimit = source.stockCellCacheLimit;
+        memoRefusals = source.memoRefusals;
+        inheritCellClearance = source.inheritCellClearance;
+        ProfileChords = source.ProfileChords;
+        diagnostic = null;
+
+    }
+
     internal VCarveProjectedStock(VCarveRoughingChord[] columns,
         IEnumerable<IReadOnlyList<PointD>> target, IReadOnlyList<PointD> part,
         VCarveCutterProfile profile, double maximumDepth, CancellationToken token,
-        IReadOnlyList<VCarveClearedSweep>? profileSweeps = null,Action<string>? diagnostic=null)
+        IReadOnlyList<VCarveClearedSweep>? profileSweeps = null,Action<string>? diagnostic=null,
+        int cellCacheLimit=StockCellCacheLimit,bool memoRefusals=true,bool inheritCellClearance=true,IReadOnlyList<VCarveRemovalGaugePose>? removalGauge=null)
     {
+        if(cellCacheLimit<1||cellCacheLimit>StockCellCacheLimit)throw new ArgumentOutOfRangeException(nameof(cellCacheLimit));
+        stockCellCacheLimit=cellCacheLimit;
+        this.memoRefusals=memoRefusals;
+        this.inheritCellClearance=inheritCellClearance;
         bool Posted(Point3D p) => double.IsFinite(p.X+p.Y+p.Z) && Math.Abs(p.X)<=10000 && Math.Abs(p.Y)<=10000 && Math.Abs(p.Z)<=100
             && p.X==Math.Round(p.X*1000)/1000d && p.Y==Math.Round(p.Y*1000)/1000d && p.Z==Math.Round(p.Z*1000)/1000d;
         var rows = new List<StockChord>();
@@ -121,11 +198,19 @@ internal sealed class VCarveProjectedStock
         // flat columns and profiled sweeps makes CommonProfile null throughout
         // overlapping branches and defeats their existing nonlinear upper bound.
         // This changes search order only; every original retained chord remains.
+        // Proof-only removal-deviation gauges bypass posted F3 merging. Never
+        // feed these translated solids to the physical no-gouge authority.
+        foreach(var evidence in removalGauge??Array.Empty<VCarveRemovalGaugePose>())
+        {
+            var pose=evidence.Pose;
+            if(!double.IsFinite(pose.X+pose.Y+pose.Z))throw new ArgumentException("Nonfinite removal gauge");
+            retained.Add(new(pose,pose,evidence.Profile.PhysicalRadiusAtDepth(-pose.Z),evidence.Profile));ProfileChords++;
+        }
         var groups=retained.GroupBy(c=>c.Profile).OrderBy(g=>g.Key is null?0:1).ToArray();
         this.columns = groups.SelectMany(g=>g).ToArray(); this.target = new(target); this.part = new(new[] { part });
         this.profile = profile; this.maximumDepth = maximumDepth; this.token = token;this.diagnostic=diagnostic;
         diagnostic?.Invoke($"stage=material-surface-index ignoredZeroVolumeColumns={ignoredEmptyColumns} indexedChords={this.columns.Length} "
-            +$"profileChords={ProfileChords} emptyColumnsGrantNoStock=True homogeneousProfileBoundsRetained=True");
+            +$"profileChords={ProfileChords} emptyColumnsGrantNoStock=True homogeneousProfileBoundsRetained=True cellMemoHash=full-xy-mix");
         if (this.columns.Length == 0) { nodes = Array.Empty<Node>(); roots=Array.Empty<int>(); return; }
         var tree = new List<Node>();var forest=new List<int>();int offset=0;
         foreach(var group in groups){forest.Add(Build(offset,group.Count()));offset+=group.Count();}
@@ -337,7 +422,10 @@ internal sealed class VCarveProjectedStock
                 ? ClearedDepth(q.x,q.y,0,innerReserve:false) : 0;
             double radius = Math.Sqrt(Math.Pow(x-q.x,2)+Math.Pow(y-q.y,2));
             double ceiling = floor + profile.DepthAtRadius(radius + PreparedRegionDistance.Uncertainty);
-            if (ceiling <= flatCeiling + .002)
+            // This witness can exclude improvement only above the CURRENT
+            // reserved lower result. The unreserved inverse-profile ceiling
+            // can itself jump to the depth cap at a full-radius plateau.
+            if (ceiling <= original + .002)
             {
                 FlatWitnessRefusals++;
                 return original;
@@ -348,10 +436,11 @@ internal sealed class VCarveProjectedStock
         bool witnessedUpper=TryDepthUpper(x,y,clearedOnly,witness,original,out double witnessedDepth);
         if(witnessedUpper)high=witnessedDepth;
         bool boundedUpper=witnessedUpper;
-        // First ask whether REAL intermediate stock permits more than the
-        // unreserved flat-slice ceiling. This is a nomination shortcut only;
-        // an unsuccessful proof retains the already certified original depth.
-        double trial = Math.Min(maximumDepth, Math.Max(original + .004, flatCeiling + .002));
+        // The unreserved inverse profile can jump across a cylindrical plateau.
+        // Its high proposal is only a nomination, never a test of every depth
+        // between it and the reserved layer result. Keep the complete bracket
+        // even when that proposal exceeds a witnessed upper or fails proof.
+        double trial = Math.Min(high, Math.Max(original + .004, flatCeiling + .002));
         if(lastFittedDepth is { } previous&&previous.ClearedOnly==clearedOnly
             &&(previous.X-x)*(previous.X-x)+(previous.Y-y)*(previous.Y-y)<=.02*.02)
         {
@@ -385,9 +474,19 @@ internal sealed class VCarveProjectedStock
             if(seed>trial&&Prove(new(x,y,-seed),new(x,y,-seed),clearedOnly))
             {low=seed;DepthWitnessSeedFits++;}
         }
-        if (high>=trial&&(low>original||Prove(new(x,y,-trial),new(x,y,-trial),clearedOnly)))
+        bool rejectedHighTrial=false;
+        if(low<=original&&high-low>.002)
         {
-            low = Math.Max(low,trial);
+            trial=Math.Min(trial,high);
+            if(Prove(new(x,y,-trial),new(x,y,-trial),clearedOnly))low=trial;
+            else
+            {
+                high=trial;boundedUpper=true;rejectedHighTrial=true;
+                RejectedHighDepthTrials++;
+            }
+        }
+        if(high-low>.002)
+        {
             if (!boundedUpper&&Prove(new(x,y,-high),new(x,y,-high),clearedOnly)) low = high;
             else for (int i = 0; i < 13 && high - low > .002; i++)
             {
@@ -395,6 +494,12 @@ internal sealed class VCarveProjectedStock
                 if (Prove(new(x,y,-middle),new(x,y,-middle),clearedOnly)) low = middle;
                 else high = middle;
             }
+        }
+        if(rejectedHighTrial&&low>original+.003)
+        {
+            if(++IntermediateDepthFits<=8)diagnostic?.Invoke($"stage=material-surface event=intermediate-depth-fit x={x:R} y={y:R} "
+                +$"originalDepth={original:R} unreservedCeiling={flatCeiling:R} rejectedTrial={trial:R} fittedDepth={low:R} "
+                +"highTrialWasNotNecessityProof=True completePhysicalProofRequired=True");
         }
         if (low > original + .003) { ImprovedSites++; LargestImprovement = Math.Max(LargestImprovement, low - original); }
         if (depths.Count >= CacheLimit) depths.Remove(depthOrder.Dequeue());
@@ -468,15 +573,45 @@ internal sealed class VCarveProjectedStock
         return result;
     }
 
-    private bool ProveCore(Point3D a, Point3D b, bool clearedOnly, bool postingReserve)
+    internal bool ProveNativeEnvelope(Point3D a,Point3D b,double additionalPlanarMargin)
     {
-        double margin=postingReserve?PlanarMargin:0;
-        double radius = profile.PhysicalRadiusAtDepth(Math.Max(-a.Z, -b.Z)) + margin;
+        if(!double.IsFinite(additionalPlanarMargin)||additionalPlanarMargin<0)return false;
+        double depth=Math.Max(-a.Z,-b.Z);
+        if(!double.IsFinite(depth)||depth>profile.Sections.Sum(s=>s.Height))return false;
+        // A deepened enclosing chord can exceed the actual operation depth.
+        // Extend the QUERY profile so its body is never accidentally truncated;
+        // the actual native curve's exact depth is checked separately.
+        var envelope=depth>profile.MaximumDepth?new VCarveCutterProfile(profile.Sections,depth):profile;
+        return ProveCore(a,b,false,true,additionalPlanarMargin,envelope);
+    }
+    internal bool DiagnoseProof(Point3D a,Point3D b,Action<string> trace)
+        =>ProveCore(a,b,false,true,refusalDiagnostic:trace);
+
+    private bool ProveCore(Point3D a, Point3D b, bool clearedOnly, bool postingReserve, double additionalMargin=0,VCarveCutterProfile? envelopeProfile=null,Action<string>? refusalDiagnostic=null)
+    {
+        var cutter=envelopeProfile??profile;
+        double margin=(postingReserve?PlanarMargin:0)+additionalMargin;
+        double radius = cutter.PhysicalRadiusAtDepth(Math.Max(-a.Z, -b.Z)) + margin;
         double left=Math.Min(a.X,b.X)-radius,bottom=Math.Min(a.Y,b.Y)-radius;
         double right=Math.Max(a.X,b.X)+radius,top=Math.Max(a.Y,b.Y)+radius;
-        if(!double.IsFinite(left+bottom+right+top))return false;
+        if(!double.IsFinite(left+bottom+right+top)){refusalDiagnostic?.Invoke("reason=nonfinite-envelope");return false;}
+        if(memoRefusals)
+        for(int i=0;i<refusalWitnessCount;i++)
+        {
+            var witness=refusalWitnesses[(nextRefusalWitness-1-i+refusalWitnesses.Length)%refusalWitnesses.Length];
+            if(witness.ClearedOnly!=clearedOnly || witness.X<left || witness.X>right || witness.Y<bottom || witness.Y>top)continue;
+            RefusalWitnessTrials++;
+            // An UPPER bound on actual prior removal at this fixed protected
+            // point, with outward depth padding. Test the current complete
+            // cutter and its original posting shell at that point. A collision
+            // can only refuse work under that unchanged required authority.
+            // No cached refusal or neighbouring lower bound grants authority.
+            if(VCarveCutterBoxIntersection.Intersects(a,b,cutter,witness.UpperDepth,
+                witness.X-margin,witness.Y-margin,witness.X+margin,witness.Y+margin))
+            {RefusalWitnessHits++;refusalDiagnostic?.Invoke($"reason=protected-witness x={witness.X:R} y={witness.Y:R} removalUpper={witness.UpperDepth:R} margin={margin:R}");return false;}
+        }
         double originalRadiusSquared=0;
-        bool stationary=a==b && VCarveCutterBoxIntersection.TryPointRadiusSquared(profile,-a.Z,out originalRadiusSquared);
+        bool stationary=a==b && VCarveCutterBoxIntersection.TryPointRadiusSquared(cutter,-a.Z,out originalRadiusSquared);
         Span<Cell> pending = stackalloc Cell[64]; int visited = 0;
         // Cover the entire original sweep box. One root at a time keeps the
         // bounded DFS stack independent of a routed chord's length. Grid
@@ -491,44 +626,67 @@ internal sealed class VCarveProjectedStock
                 token.ThrowIfCancellationRequested();
                 var cell = pending[--count];
                 Cells++;
-                if (++visited > 16384) { Refusals++; return false; }
+                if (++visited > 16384) { Refusals++; refusalDiagnostic?.Invoke($"reason=cell-budget visited={visited} stationary={stationary}");return false; }
                 if(cell.Left>right||cell.Right<left||cell.Bottom>top||cell.Top<bottom)continue;
                 // No stock query is needed where even the complete cutter below
                 // the original top cannot intersect this cell.
                 double distanceSquared=stationary?VCarveCutterBoxIntersection.PointBoxDistanceSquared(a,
                     cell.Left-margin,cell.Bottom-margin,cell.Right+margin,cell.Top+margin):0;
-                if(stationary?!(distanceSquared-originalRadiusSquared<-1e-12):!VCarveCutterBoxIntersection.Intersects(a,b,profile,0,
+                if(stationary?!(distanceSquared-originalRadiusSquared<-1e-12):!VCarveCutterBoxIntersection.Intersects(a,b,cutter,0,
                     cell.Left-margin,cell.Bottom-margin,cell.Right+margin,cell.Top+margin))
                 continue;
+                bool IntersectsAt(double depth)=>stationary
+                    &&VCarveCutterBoxIntersection.TryPointRadiusSquared(cutter,-a.Z-depth,out double squared)
+                    ?distanceSquared-squared<-1e-12
+                    :VCarveCutterBoxIntersection.Intersects(a,b,cutter,depth,
+                        cell.Left-margin,cell.Bottom-margin,cell.Right+margin,cell.Top+margin);
+                // A parent's disk contains every child box. Its physical stock
+                // lower bound, admitted wholly inside the Part, therefore also
+                // holds throughout each child. Test the COMPLETE current cutter
+                // against that inherited floor before rebuilding child facts.
+                // Target permission is never inherited or enlarged.
+                if(cell.FloorLower>0&&!IntersectsAt(cell.FloorLower))
+                {InheritedStockCellProofs++;continue;}
                 double x = (cell.Left + cell.Right) / 2, y = (cell.Bottom + cell.Top) / 2;
                 double halfX = (cell.Right - cell.Left) / 2, halfY = (cell.Top - cell.Bottom) / 2;
                 double coverRadius = Math.Sqrt(halfX * halfX + halfY * halfY);
                 ref var facts = ref GetCellFacts(cell,x,y);
-                double partDistance = facts.PartDistance;
-                double targetDistance = clearedOnly ? double.NegativeInfinity : facts.TargetDistance;
+                // Whole-parent disk containment also proves the same strict
+                // Part membership / target exclusion for each child disk.
+                // Keep exact region distances lazy; these two inherited facts
+                // cannot grant target permission or cross a Part boundary.
+                bool inheritedPart=(cell.GeometryFlags&1)!=0;
+                bool inheritedOutsideTarget=(cell.GeometryFlags&2)!=0;
+                if(!inheritedPart&&double.IsNaN(facts.PartDistance))facts.PartDistance=part.SignedDistanceUncached(new(x,y));
+                if(!clearedOnly&&!inheritedOutsideTarget&&double.IsNaN(facts.TargetDistance))facts.TargetDistance=target.SignedDistanceUncached(new(x,y));
+                if(inheritedPart)InheritedRegionDistanceQueriesAvoided++;
+                if(!clearedOnly&&inheritedOutsideTarget)InheritedRegionDistanceQueriesAvoided++;
+                double partDistance = inheritedPart?double.PositiveInfinity:facts.PartDistance;
+                double targetDistance = clearedOnly||inheritedOutsideTarget ? double.NegativeInfinity : facts.TargetDistance;
                 bool inPart = partDistance >= coverRadius + PreparedRegionDistance.Uncertainty;
                 if (inPart && !clearedOnly && targetDistance >= coverRadius + PreparedRegionDistance.Uncertainty)
                 continue;
-                bool IntersectsAt(double depth)=>stationary
-                    &&VCarveCutterBoxIntersection.TryPointRadiusSquared(profile,-a.Z-depth,out double squared)
-                    ?distanceSquared-squared<-1e-12
-                    :VCarveCutterBoxIntersection.Intersects(a,b,profile,depth,
-                        cell.Left-margin,cell.Bottom-margin,cell.Right+margin,cell.Top+margin);
                 if(inPart&&double.IsNaN(facts.Clearance)&&lastProfileWinner>=0)
                 {
                     if(double.IsNaN(facts.SeedClearance))
                     {
                         // A literal prior pose can already cover this ENTIRE
-                        // immutable stock disk. Re-evaluate its full profile;
+                        // immutable stock disk. Re-evaluate its full cutter;
                         // no neighbouring height or target permission transfers.
                         SeededCellTrials++;
                         facts.SeedClearance=Math.Max(0,ProfileDepth(columns[lastProfileWinner],x,y,coverRadius,true));
                     }
-                    if(facts.SeedClearance>0&&!IntersectsAt(facts.SeedClearance))
+                    if(facts.SeedClearance>0&&facts.SeedClearance!=cell.FloorLower&&!IntersectsAt(facts.SeedClearance))
                     {SeededCellProofs++;continue;}
                 }
-                double floor = inPart ? CellClearance(ref facts,x,y,coverRadius,point:false) : 0;
-                bool intersects=IntersectsAt(floor);
+                double floor = Math.Max(cell.FloorLower,inPart ? CellClearance(ref facts,x,y,coverRadius,point:false) : 0);
+                // The original-top test already proved intersection at zero;
+                // a positive inherited floor likewise passed its complete test
+                // above. Equal child clearance repeats that IDENTICAL pure
+                // cutter/box predicate, including the original posting shell.
+                bool knownIntersection=floor==cell.FloorLower;
+                if(knownIntersection)ReusedCellIntersectionPredicates++;
+                bool intersects=knownIntersection||IntersectsAt(floor);
                 if(!intersects)continue;
                 // A penetrating protected witness can refuse a nomination without
                 // subdividing the rest of an already invalid cutter footprint.
@@ -538,16 +696,39 @@ internal sealed class VCarveProjectedStock
                 {
                     double atPoint = partDistance >= PreparedRegionDistance.Uncertainty
                         ? CellClearance(ref facts,x,y,0,point:true) : 0;
-                    if (VCarveCutterBoxIntersection.Intersects(a, b, profile, atPoint,
+                    if (VCarveCutterBoxIntersection.Intersects(a, b, cutter, atPoint,
                         x-margin,y-margin,x+margin,y+margin))
+                    {
+                        if(memoRefusals && partDistance>=PreparedRegionDistance.Uncertainty
+                            && (clearedOnly||targetDistance < -PreparedRegionDistance.Uncertainty))
+                        {
+                            int previousWinner=lastProfileWinner;
+                            // innerReserve:false uses independent cutter extrema
+                            // from ABOVE, including variable-depth prior sweeps.
+                            double upper=ClearedDepth(x,y,0,innerReserve:false)+PreparedRegionDistance.Uncertainty;
+                            lastProfileWinner=previousWinner;
+                            if(VCarveCutterBoxIntersection.Intersects(a,b,cutter,upper,
+                                x-margin,y-margin,x+margin,y+margin))
+                            {
+                                refusalWitnesses[nextRefusalWitness]=new(x,y,upper,clearedOnly);
+                                nextRefusalWitness=(nextRefusalWitness+1)%refusalWitnesses.Length;
+                                refusalWitnessCount=Math.Min(refusalWitnessCount+1,refusalWitnesses.Length);
+                                RefusalWitnessPublications++;
+                            }
+                        }
+                        refusalDiagnostic?.Invoke($"reason=point-intersection x={x:R} y={y:R} removalLower={atPoint:R} cellLevel={cell.Level} margin={margin:R} stationary={stationary}");
                         return false;
+                    }
                 }
-                if(cell.Level>=14||Math.Max(halfX,halfY)<.0005){Refusals++;return false;}
+                if(cell.Level>=14||Math.Max(halfX,halfY)<.0005){Refusals++;refusalDiagnostic?.Invoke($"reason=unresolved-cell x={x:R} y={y:R} floor={floor:R} cellLevel={cell.Level} halfX={halfX:R} halfY={halfY:R} margin={margin:R} stationary={stationary}");return false;}
                 int level = cell.Level + 1;
-                pending[count++] = new(cell.Left, cell.Bottom, x, y, level);
-                pending[count++] = new(x, cell.Bottom, cell.Right, y, level);
-                pending[count++] = new(cell.Left, y, x, cell.Top, level);
-                pending[count++] = new(x, y, cell.Right, cell.Top, level);
+                double inheritedFloor=inheritCellClearance?floor:0;
+                int flags=inheritCellClearance&&inPart?1:0;
+                if(inheritCellClearance&&!clearedOnly&&targetDistance < -coverRadius-PreparedRegionDistance.Uncertainty)flags|=2;
+                pending[count++] = new(cell.Left, cell.Bottom, x, y, level,flags,inheritedFloor);
+                pending[count++] = new(x, cell.Bottom, cell.Right, y, level,flags,inheritedFloor);
+                pending[count++] = new(cell.Left, y, x, cell.Top, level,flags,inheritedFloor);
+                pending[count++] = new(x, y, cell.Right, cell.Top, level,flags,inheritedFloor);
             }
         }
         return true;
@@ -556,13 +737,21 @@ internal sealed class VCarveProjectedStock
 
     private ref CellFacts GetCellFacts(Cell cell,double x,double y)
     {
-        CellFacts Fresh()=>new(){PartDistance=part.SignedDistanceUncached(new(x,y)),TargetDistance=target.SignedDistanceUncached(new(x,y)),
+        CellFacts Fresh()=>new(){PartDistance=double.NaN,TargetDistance=double.NaN,
             Clearance=double.NaN,PointClearance=double.NaN,SeedClearance=double.NaN};
-        var key=(cell.Left,cell.Bottom,cell.Level);
+        double gridX=x*2048,gridY=y*2048;
+        if(gridX<int.MinValue||gridX>int.MaxValue||gridY<int.MinValue||gridY>int.MaxValue)
+        {
+            // Do not narrow or alias coordinates outside the packed domain.
+            // A fresh literal query retains the same proof without memoization.
+            CellGeometryCacheMisses++;
+            uncachedCellFacts=Fresh();return ref uncachedCellFacts;
+        }
+        var key=new CellKey(((ulong)(uint)(int)gridX<<32)|(uint)(int)gridY);
         ref var found=ref CollectionsMarshal.GetValueRefOrNullRef(stockCells,key);
         if(!Unsafe.IsNullRef(ref found)){CellGeometryCacheHits++;return ref found;}
         CellGeometryCacheMisses++;
-        if(stockCells.Count==StockCellCacheLimit)
+        if(stockCells.Count==stockCellCacheLimit)
         {stockCells.Remove(stockCellOrder.Dequeue());StockCellCacheEvictions++;}
         ref var added=ref CollectionsMarshal.GetValueRefOrAddDefault(stockCells,key,out _);
         // Both immutable regions belong to this operation. Store literal signed

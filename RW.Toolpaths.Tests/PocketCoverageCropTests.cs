@@ -7,6 +7,38 @@ namespace RW.Toolpaths.Tests;
 
 public sealed class PocketCoverageCropTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void IntegerRectCropPreservesTheJointSignedFillIncludingEnclosingHoles(bool mirror)
+    {
+        PointD[] Circle(double radius,int count)=>Enumerable.Range(0,count).Select(i=>
+            new PointD(radius*Math.Cos(2*Math.PI*i/count),radius*Math.Sin(2*Math.PI*i/count))).ToArray();
+        var hole=Circle(9,2048);Array.Reverse(hole);
+        IReadOnlyList<PointD>[] source=[Circle(20,1024),hole,Circle(2,512),Rect(-12,.5,12,1.5)];
+        if(mirror)source=source.Select(path=>(IReadOnlyList<PointD>)path.Select(p=>new PointD(-p.x,p.y)).ToArray()).ToArray();
+        foreach(var window in new[]{Rect(-3,-3,3,3),Rect(-11,-2,12,2),Rect(15,-6,22,9)})
+        {
+            var expected=PolygonOps.Intersect(source,[window]);
+            var actual=PolygonOps.ClipSignedToRect(source,Tick(window[0].x),Tick(window[0].y),
+                Tick(window[2].x),Tick(window[2].y),default);
+            var difference=Clipper.Xor(PathUtils.ToClipper(expected),PathUtils.ToClipper(actual),FillRule.NonZero);
+            Console.WriteLine($"[SignedRectCrop.Compare] mirror={mirror} window=({window[0].x},{window[0].y})..({window[2].x},{window[2].y}) "
+                +$"expectedCounts={string.Join(',',expected.Select(p=>p.Count))} actualCounts={string.Join(',',actual.Select(p=>p.Count))} "
+                +$"differencePaths={difference.Count} differenceAreaTicks={difference.Sum(p=>Math.Abs(Clipper.Area(p))):R} "
+                +$"differenceVertices={string.Join(';',difference.SelectMany(p=>p).Take(16).Select(p=>$"({p.X},{p.Y})"))}");
+            // Both backends retain the identical signed fill. At a rounded
+            // extremum Clipper can express a zero-area retrace differently;
+            // bound that boundary discrepancy to ONE native tick, inside the
+            // existing eighteen-tick crop reserve.
+            Assert.All(difference,path=>{
+                Assert.Equal(0,Clipper.Area(path));
+                Assert.True(path.Max(p=>p.X)-path.Min(p=>p.X)<=1
+                    ||path.Max(p=>p.Y)-path.Min(p=>p.Y)<=1);
+            });
+        }
+    }
+
     [Fact]
     public void ApprovedAirIsDepthScopedAndNeverFabricatesAnExecutedStrokeOrLaterSnapshot()
     {

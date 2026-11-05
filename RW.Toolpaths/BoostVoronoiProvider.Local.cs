@@ -41,7 +41,7 @@ public sealed partial class BoostVoronoiProvider
     /// Distance to one retained finite original segment bounds the nearest distance from above;
     /// a site's AABB distance bounds its influence from below. Equality always retains the site.</summary>
     internal static LocalDiagram? TryConstructLocalMedialAxis(LocalSiteSet source, RectD query,
-        double maximumChordError, double filteringAngle, CancellationToken token)
+        double maximumChordError, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
         if (source.Sites.Count < 3 || maximumChordError <= 0) return null;
@@ -120,7 +120,7 @@ public sealed partial class BoostVoronoiProvider
             var cellSites = cells.Select(cell => MakeCellSite(cell, sites)).ToArray();
             var points = vertices.Select(vertex => new MedialAxisEdgeClassifier.EdgePoint(vertex.X, vertex.Y)).ToArray();
             var output = new List<MedialSegment>();
-            int emitted = 0, skipped = 0;
+            int emitted = 0;
             // Stable ORIGINAL site owners order the local edges. A subset
             // diagram has different native indices; they are not advertised as
             // full-diagram command equivalence.
@@ -139,8 +139,6 @@ public sealed partial class BoostVoronoiProvider
                     e.PrevIndex, e.NextIndex, points[e.Vertex0Index], points[e.Vertex1Index],
                     cellSites[e.CellIndex], cellSites[e.TwinCellIndex])
                 { IsLinear = e.IsLinear != 0, IsCurved = e.IsCurved != 0 };
-                double? angle = TryGetCellsAngleForDebug(edge);
-                if (angle is { } value && value > filteringAngle) { skipped++; continue; }
                 if (!BoundedLocalMedialEmitter.TryEmit(edge, influenceWindow, maximumChordError, reserve, output, token))
                 {
                     Console.WriteLine($"[Offset.Terminal.LocalSites] result=fallback reason=unresolved-finite-curve edge={i}");
@@ -153,7 +151,7 @@ public sealed partial class BoostVoronoiProvider
                 + $"segments={output.Count} upper={upper:R} reserve={reserve:R} chordError={maximumChordError:R} "
                 + "conditioning=complete-original-source originalOwners=True fakeBridges=0 fullWinding=caller-authority");
             return new(output, retained.Select(site => site.Ordinal).ToArray(), source.Sites.Count,
-                upper, reserve, emitted, skipped);
+                upper, reserve, emitted, 0);
         }
         finally { BoostVoronoiInterop.bv_destroy(handle); }
 

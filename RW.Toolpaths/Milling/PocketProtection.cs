@@ -100,7 +100,7 @@ internal static class PocketProtection
                 + $"safetyReserve={safetyReserve:R} positiveLeaveCredit={positiveLeaveCredit:R} "
                 + $"negativeLeaveCancellation={negativeLeaveCancellation:R} reserveReference={reserveReference} "
                 + $"requiredGuard={guard:R} appliedOffset={applied:R} maskArc={quantum:R} maskSimplification=0 "
-                + "guardFidelity=original-first-command laterArcWallCredit=0 rawAuthority=complete-signed-domain-and-boundary-capsules");
+                + $"guardFidelity=original-first-command laterArcWallCredit=0 rawAuthority=complete-signed-domain-and-boundary-capsules");
             if (complete)
                 return new ProtectionDomain(PathUtils.FromClipper(expanded), guard, applied, actualArc,
                     quantum, proofChords, attempt + 1);
@@ -242,10 +242,10 @@ internal static class PocketProtection
                 + $"materializeMs={Milliseconds(prepared?.ComponentMaterializeTicks ?? 0):F3} "
                 + $"mappingMs={Milliseconds(mappingTicks):F3} elapsedMs={Milliseconds(Stopwatch.GetTimestamp() - started):F3} "
                 + $"allocatedBytes={GC.GetAllocatedBytesForCurrentThread() - allocated} "
-                + "selection=complete-signed-contour-bounds guardTicks=1 inputOwnership=immutable-copy "
-                + "subjectOrder=canonical-original clipOrder=original componentOrder=literal-polytree "
-                + "timingNesting=bounds-and-inputBuild-within-enginePrepare densePolicy=full-original-clips "
-                + "failurePolicy=throw-discard-partial");
+                + $"selection=complete-signed-contour-bounds guardTicks=1 inputOwnership=immutable-copy "
+                + $"subjectOrder=canonical-original clipOrder=original componentOrder=literal-polytree "
+                + $"timingNesting=bounds-and-inputBuild-within-enginePrepare densePolicy=full-original-clips "
+                + $"failurePolicy=throw-discard-partial");
         }
     }
 

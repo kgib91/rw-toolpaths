@@ -47,7 +47,7 @@ public static partial class MedialAxisGeometry
             Console.WriteLine($"[MedialAxisGeometry.FillFidelity] requestedArc={requested.ArcTolerance:R} "
                 + $"requestedSimplify={requested.SimplifyTolerance:R} arc={accurate.ArcTolerance:R} "
                 + $"simplify={accurate.SimplifyTolerance:R} firstArc={first.ArcTolerance:R} "
-                + "firstSourceCoverage=original scope=all-levels");
+                + $"firstSourceCoverage=original scope=all-levels");
         }
         // A finite authored band is safe to certify in the same collector: its
         // candidate distance is capped before testing for a vanished child.
@@ -141,11 +141,11 @@ public static partial class MedialAxisGeometry
                             + $"candidateMs={gate.CandidateMilliseconds:F3} sourceProofMs={gate.SourceCertificateMilliseconds:F3} "
                             + $"hullComplementMs={gate.HullComplementMilliseconds:F3} physicalMs={gate.PhysicalMilliseconds:F3} acceptedSweepMs={gate.AcceptedSweepMilliseconds:F3} "
                             + $"gapMs={gate.GapMilliseconds:F3} totalMs={gate.TotalMilliseconds:F3} "
-                            + "sourceAuthority=complete-original-signed-finite-sites cutCredit=accepted-emitted-only fallback=full-original");
+                            + $"sourceAuthority=complete-original-signed-finite-sites cutCredit=accepted-emitted-only fallback=full-original");
                         if (covered) continue;
                     }
                     else Console.WriteLine($"[Offset.Terminal.ExactFirstGate] region={regionIndex} "
-                        + "certified=False reason=full-original-already-materialized");
+                        + $"certified=False reason=full-original-already-materialized");
                 }
                 // A line-valued first front has no filled polygon to give to the
                 // collector. Retain that exact tangent locus, including a stem

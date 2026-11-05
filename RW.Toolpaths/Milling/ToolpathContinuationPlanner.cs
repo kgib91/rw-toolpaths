@@ -14,6 +14,7 @@ internal sealed class ToolpathContinuationPlanner
         internal Node(Point3D point) { Point = point; }
         internal readonly Point3D Point;
         internal readonly List<int> Neighbours = new();
+        internal bool Indexed;
     }
     private readonly List<Node> nodes = new();
     private readonly Dictionary<Point3D, int> ordinals = new();
@@ -21,15 +22,16 @@ internal sealed class ToolpathContinuationPlanner
     private readonly Dictionary<(long X, long Y), List<int>> grid = new();
     private readonly HashSet<(long X, long Y, long Z)> portalVoxels = new();
     private readonly HashSet<(int,int)> clearedEdges=new();
-    private readonly Dictionary<(double,double,double,double),List<(Point3D A,Point3D B)>> executedProjections=new();
     private readonly double neighbourhood;
     private readonly CancellationToken token;
     private readonly Action<string>? diagnostic;
     private readonly string owner;
-    private const int MaximumNodes = 2_000_000, MaximumSearch = 100_000;
-    private const long MaximumTotalSearch = 20_000_000;
+    private const int MaximumNodes = 2_000_000, MaximumSearch = 4_096;
+    private const long MaximumTotalSearch = 2_000_000;
     private long direct, retraces, entries, examined, recordRefusals, boundedSearches, visibilityTests, priorAirEdges;
     private readonly Dictionary<string, long> reasons = new();
+    private long shortVisibilityProofs, shortVisibilityAccepted, indexedPortals;
+    private readonly List<(double Distance, string Reason, Point3D From, Point3D Target)> longReentries = new();
     internal string LastFailure {get;private set;}="no-certified-route";
 
     internal ToolpathContinuationPlanner(string owner, double neighbourhood,
@@ -45,6 +47,8 @@ internal sealed class ToolpathContinuationPlanner
     internal bool Record(TaggedToolpath path, Func<Point3D, Point3D, bool>? allowRetrace = null)
     {
         bool anchored=true;
+        Point3D? previousRecorded = null;
+        portalVoxels.Clear();
         var spans=path.Spans.Count>0 ? path.Spans : new[] {new ToolpathSpan(0,path.Points.Count-1,ToolpathSpanKind.Cut)};
         foreach (var span in spans)
         {
@@ -59,45 +63,28 @@ internal sealed class ToolpathContinuationPlanner
                 if(partial)anchored=false;
                 else if(!yOnly || span.Kind==ToolpathSpanKind.TabLift)anchored=true;
                 if (!valid || span.Kind is not (ToolpathSpanKind.Cut or ToolpathSpanKind.Ramp or ToolpathSpanKind.Link or ToolpathSpanKind.ClearedTravel)
-                    || !Finite(a) || !Finite(b) || allowRetrace is not null && !allowRetrace(a, b)) continue;
+                    || !Finite(a) || !Finite(b) || allowRetrace is not null && !allowRetrace(a, b))
+                { portalVoxels.Clear(); previousRecorded = null; continue; }
+                if (previousRecorded != a) portalVoxels.Clear();
                 int first = NodeAt(a), last = NodeAt(b);
+                previousRecorded = b;
                 if (first < 0 || last < 0 || first == last) continue;
                 // Repeated entry laps can contain the same physical chord many times.
                 if (!nodes[first].Neighbours.Contains(last)) nodes[first].Neighbours.Add(last);
                 if (!nodes[last].Neighbours.Contains(first)) nodes[last].Neighbours.Add(first);
-                AddProjection(a,b);AddProjection(b,a);
                 if(span.Kind==ToolpathSpanKind.ClearedTravel)clearedEdges.Add((Math.Min(first,last),Math.Max(first,last)));
             }
         }
         return anchored;
     }
 
-    // A geometry adapter may deepen an already executed complete XY chord by
-    // one physical step. Both endpoints must be dominated by ONE earlier chord
-    // in native and posted space; independent endpoint minima are not evidence.
-    internal bool HasStepdownPrecursor(Point3D a,Point3D b,double step,
+    // A longer transition can follow a literal executed chord while moving one
+    // radial step sideways. The entire projected span must stay on that chord.
+    internal bool HasLateralPrecursor(Point3D a,Point3D b,double radialStep,double axialStep,double grade,
         Func<Point3D,Point3D> command)
     {
-        if(!executedProjections.TryGetValue((a.X,a.Y,b.X,b.Y),out var prior))return false;
-        var ca=command(a);var cb=command(b);
-        foreach(var edge in prior)
-        {
-            var pa=command(edge.A);var pb=command(edge.B);
-            if(a.Z>=edge.A.Z-step && b.Z>=edge.B.Z-step
-                && ca.X==pa.X && ca.Y==pa.Y && cb.X==pb.X && cb.Y==pb.Y
-                && ca.Z>=pa.Z-step-1e-10 && cb.Z>=pb.Z-step-1e-10)return true;
-        }
-        return false;
-    }
-
-    private void AddProjection(Point3D a,Point3D b)
-    {
-        var key=(a.X,a.Y,b.X,b.Y);
-        if(!executedProjections.TryGetValue(key,out var prior))executedProjections[key]=prior=new();
-        if(prior.Any(p=>p.A.Z<=a.Z && p.B.Z<=b.Z))return;
-        prior.RemoveAll(p=>a.Z<=p.A.Z && b.Z<=p.B.Z);
-        // Bounded retention can discard authority, never manufacture it.
-        if(prior.Count<16)prior.Add((a,b));
+        return ordinals.TryGetValue(a,out int node)&&nodes[node].Neighbours.Take(64).Any(next=>
+            ToolpathEngagementLimits.Allows(a,b,radialStep,axialStep,grade,command,nodes[next].Point));
     }
 
     internal void RecordProvedAir(Point3D a, Point3D b, Func<Point3D,Point3D,bool> wholeVolumeProof,
@@ -128,7 +115,7 @@ internal sealed class ToolpathContinuationPlanner
         Func<Point3D, Point3D, bool> allowsNewChord,
         Func<Point3D,Point3D,bool>? positiveTravelClearance = null,double clearedTravelCostRatio=1,
         IReadOnlyList<double>? targetCosts=null,IReadOnlyList<Point3D>? preferredEntryPortals=null,
-        double maximumCost=double.PositiveInfinity)
+        double maximumCost=double.PositiveInfinity, ToolpathMotionCost? motionCost=null)
     {
         token.ThrowIfCancellationRequested();
         LastFailure="no-certified-route";
@@ -146,7 +133,7 @@ internal sealed class ToolpathContinuationPlanner
                 var candidate=Finish(new[] {from,targets[i]},i,"certified-direct");
                 double cost=Cost(from,targets[i])+TargetCost(i);
                 if(cost>maximumCost)continue;
-                if(ratio==1 || Fast(from,targets[i])){direct++;return candidate;}
+                // All legal entry poses compete with their complete retained entry cost.
                 if(cost<directCost){directCost=cost;directFallback=candidate;}
             }
         }
@@ -167,7 +154,7 @@ internal sealed class ToolpathContinuationPlanner
             for (long y = cell.Y - 1; y <= cell.Y + 1; y++)
             {
                 if (!grid.TryGetValue((x, y), out var list)) continue;
-                foreach (int node in list)
+                foreach (int node in list.TakeLast(256))
                 {
                     double distance = Distance(nodes[node].Point, point);
                     if (distance <= neighbourhood) nearby.Add((node, distance));
@@ -215,10 +202,10 @@ internal sealed class ToolpathContinuationPlanner
                 for (long y=cell.Y-1;y<=cell.Y+1;y++)
                 {
                     if (!grid.TryGetValue((x,y),out var list)) continue;
-                    foreach (int next in list)
+                    foreach (int next in list.TakeLast(256))
                     {
                         double length = Distance(nodes[node].Point,nodes[next].Point);
-                        if (length < .25 || length > neighbourhood || nodes[node].Neighbours.Contains(next)) continue;
+                        if (length <= 0 || length > neighbourhood || nodes[node].Neighbours.Contains(next)) continue;
                         double value=cost+length*ratio;
                         if (costs.TryGetValue(next,out double old) && old<=value) continue;
                         proposals.Add((next,length+Heuristic(next)));
@@ -231,6 +218,11 @@ internal sealed class ToolpathContinuationPlanner
                     {
                         visibilityTests++;
                         allowed=allowsNewChord(nodes[node].Point,nodes[proposal.Node].Point);
+                        if (Distance(nodes[node].Point,nodes[proposal.Node].Point) < .25)
+                        {
+                            shortVisibilityProofs++;
+                            if (allowed) shortVisibilityAccepted++;
+                        }
                         visibility[key]=allowed;
                     }
                     if (allowed) Relax(proposal.Node);
@@ -276,7 +268,8 @@ internal sealed class ToolpathContinuationPlanner
             travelProofs[(a,b)]=value;travelProofs[(b,a)]=value;
             return value;
         }
-        double Cost(Point3D a,Point3D b)=>Distance(a,b)*(ratio<1 && Fast(a,b) ? ratio : 1);
+        double Cost(Point3D a,Point3D b)=>motionCost?.ChordSeconds(a,b,Fast(a,b))
+            ?? Distance(a,b)*(ratio<1 && Fast(a,b) ? ratio : 1);
         Connection? Fallback(){if(directFallback is not null)direct++;return directFallback;}
 
         void AddGoal(int node, int target, double extra)
@@ -286,23 +279,38 @@ internal sealed class ToolpathContinuationPlanner
                 goals[node] = (target, total);
         }
         double TargetCost(int target)=>targetCosts is null ? 0 : targetCosts[target];
-        double Heuristic(int node) => targets.Select((p,i)=>ratio*Distance(nodes[node].Point,p)+TargetCost(i)).Min();
+        double Heuristic(int node) => targets.Select((p,i)=>(motionCost?.MinimumSecondsPerMm ?? ratio)*Distance(nodes[node].Point,p)+TargetCost(i)).Min();
     }
 
     internal void Reentry(string reason, Point3D? from, Point3D target)
     {
         entries++; reasons[reason] = reasons.GetValueOrDefault(reason) + 1;
+        if (from is { } exit && Distance(exit, target) > 25)
+        {
+            longReentries.Add((Distance(exit, target), reason, exit, target));
+            longReentries.Sort((a,b) => b.Distance.CompareTo(a.Distance));
+            if (longReentries.Count > 8) longReentries.RemoveAt(8);
+        }
         if (entries <= 8)
             diagnostic?.Invoke($"stage=continuation event=reentry owner={owner} reason={reason} "
                 + $"from={from} target={target} physicalNecessityProved=False");
     }
 
-    internal void Report() => diagnostic?.Invoke($"stage=continuation event=complete owner={owner} "
+    internal void Report()
+    {
+        int rank = 0;
+        foreach (var witness in longReentries)
+            diagnostic?.Invoke($"stage=continuation event=long-reentry owner={owner} rank={++rank} "
+                + $"distance={witness.Distance:R} reason={witness.Reason} from={witness.From} target={witness.Target} "
+                + "witnessLimit=8 minimumDistanceMm=25 physicalNecessityProved=False");
+        diagnostic?.Invoke($"stage=continuation event=complete owner={owner} "
         + $"direct={direct} retraces={retraces} entries={entries} nodes={nodes.Count} "
         + $"searchNodes={examined} searchBudgetRefusals={boundedSearches} recordBudgetRefusals={recordRefusals} "
         + $"visibilityProofs={visibilityTests} priorProvedAirEdges={priorAirEdges} "
+        + $"shortVisibilityProofs={shortVisibilityProofs} shortVisibilityAccepted={shortVisibilityAccepted} shortVisibilityThresholdMm=0.25 indexedPortals={indexedPortals} portalSampling=per-continuous-executed-trace "
         + $"reasons={string.Join(',', reasons.OrderBy(p => p.Key).Select(p => p.Key + ':' + p.Value))} "
         + "policy=direct-then-executed-retrace-then-reasoned-entry futureStockCredit=False nativeXYZIdentity=True");
+    }
 
     /// <summary>Common final routing for generators that already nominate entries.
     /// Only a proved redundant Ramp prefix may be removed; every Cut/Tab survives.
@@ -312,11 +320,15 @@ internal sealed class ToolpathContinuationPlanner
         Func<TaggedToolpath, Point3D, Point3D, bool>? allowsNewChord = null,
         bool removeSubsumedEntries = false, Action<string>? diagnostic = null,
         Action<TaggedToolpath>? recordExecuted = null,
-        Func<Point3D, Point3D, bool>? validateConnection = null)
+        Func<Point3D, Point3D, bool>? validateConnection = null,
+        MillingMotionSettings? motion=null,double surface=0)
     {
         diagnostic ??= Console.WriteLine;
+        source=ToolpathSourceTraversal.EnteredDetours(source,token,diagnostic,validateConnection,motion,surface);
         var planner = new ToolpathContinuationPlanner(owner, neighbourhood, token, diagnostic);
         var result = new List<TaggedToolpath>(source.Count);
+        var motionCost=motion is null?null:new ToolpathMotionCost(motion,surface);
+        int costRefusals=0;double savedSeconds=0;
         Point3D? previous = null; int? previousRegion = null; bool previousAnchored=true;
         foreach (var original in source)
         {
@@ -329,8 +341,12 @@ internal sealed class ToolpathContinuationPlanner
                 int cut = removeSubsumedEntries ? SubsumedEntryEnd(path) : 0;
                 if (cut > 0) targets.Add(path.Points[cut]);
                 targets.Add(path.Points[0]);
+                var costs=motionCost is null?null:targets.Select((_,i)=>motionCost.VisitSeconds(
+                    i==0&&cut>0?Prepend(path,new[]{path.Points[cut]},cut):path)).ToArray();
                 var connection = planner.Connect(from, targets,
-                    (a, b) => allowsNewChord?.Invoke(path, a, b) == true);
+                    (a, b) => allowsNewChord?.Invoke(path, a, b) == true,
+                    targetCosts:costs,maximumCost:motionCost?.CompleteVisitSeconds(from,path)??double.PositiveInfinity,
+                    motionCost:motionCost);
                 bool rejectedConnection = false;
                 if (connection is not null && validateConnection is not null)
                 for (int i=1;i<connection.Points.Count;i++)
@@ -341,7 +357,16 @@ internal sealed class ToolpathContinuationPlanner
                     connection=null; rejectedConnection=true; break;
                 }
                 if (connection is not null)
-                    path = Prepend(path, connection.Points, connection.Target == 0 && cut > 0 ? cut : 0);
+                {
+                    var candidate=Prepend(path, connection.Points, connection.Target == 0 && cut > 0 ? cut : 0);
+                    if(ToolpathMotionCost.PreferContinuation(motionCost,from,path,candidate,out double before,out double after))
+                    {path=candidate;if(motionCost is not null)savedSeconds+=before-after;}
+                    else
+                    {
+                        if(++costRefusals<=8)diagnostic($"[Toolpath.EntryCost] owner={owner} decision=reenter continuationSec={after:R} entrySec={before:R} completeRetainedTrace=True");
+                        planner.Reentry("slower-than-complete-entry",from,path.Points[0]);
+                    }
+                }
                 else planner.Reentry(rejectedConnection ? "connection-guard-refused" : planner.LastFailure, from, path.Points[0]);
             }
             else if (previous is null || previous != path.Points[0])
@@ -350,6 +375,7 @@ internal sealed class ToolpathContinuationPlanner
             previous = path.Points[^1]; previousRegion = path.RegionIndex;
         }
         planner.Report();
+        diagnostic($"[Toolpath.EntryCost] owner={owner} event=complete machineContext={motionCost is not null} costRefusals={costRefusals} selectedSavingSec={savedSeconds:R} completeBridgeEntryAndCut=True policyOwner=RW.Toolpaths");
         return result;
     }
 
@@ -357,7 +383,7 @@ internal sealed class ToolpathContinuationPlanner
         int sourceStart = 0,IReadOnlyList<bool>? clearedTravel = null)
     {
         if (connection.Count == 0 || connection[^1] != path.Points[sourceStart])
-            throw new InvalidOperationException("A certified continuation must meet its exact native source endpoint.");
+            throw new InvalidOperationException($"A certified continuation must meet its exact native source endpoint: count={connection.Count} end={connection.LastOrDefault()} source={path.Points[sourceStart]}.");
         var points = connection.Take(connection.Count - 1).Concat(path.Points.Skip(sourceStart)).ToArray();
         int offset = connection.Count - 1;
         var spans = new List<ToolpathSpan>();
@@ -381,7 +407,8 @@ internal sealed class ToolpathContinuationPlanner
         }
         return new(points, spans, path.RegionIndex, path.Category, path.DepthPassIndex,
             path.VisitIdentity, path.DetectCurves) {ContinuationComponentIndex=path.ContinuationComponentIndex,
-                ContinuationPlan=path.ContinuationPlan,ContinuationSourceOrdinal=path.ContinuationSourceOrdinal};
+                ContinuationPlan=path.ContinuationPlan,ContinuationSourceOrdinal=path.ContinuationSourceOrdinal,
+                ConcentricSource=path.ConcentricSource};
     }
 
     private static int SubsumedEntryEnd(TaggedToolpath path)
@@ -417,22 +444,30 @@ internal sealed class ToolpathContinuationPlanner
 
     private int NodeAt(Point3D point)
     {
-        if (ordinals.TryGetValue(point, out int node)) return node;
+        if (ordinals.TryGetValue(point, out int node)) { Nominate(node); return node; }
         if (nodes.Count >= MaximumNodes) { recordRefusals++; return -1; }
         node = nodes.Count; nodes.Add(new(point)); ordinals.Add(point, node);
         var key = (point.X, point.Y);
         if (!columns.TryGetValue(key, out var list)) columns[key] = list = new();
         list.Add(node);
-        // Portal sampling bounds nomination cost only; the exact execution graph
-        // still retains every recorded endpoint and chord as the authority.
+        Nominate(node);
+        return node;
+    }
+
+    private void Nominate(int node)
+    {
+        var point = nodes[node].Point;
+        // A voxel can contain disconnected executed traces. Sample once per
+        // continuous recorded trace, retaining exact XYZ nodes and cutter proof.
+        // Reusing a voxel never supplies connectivity or cleared-stock credit.
         var voxel=((long)Math.Floor(point.X/.5),(long)Math.Floor(point.Y/.5),(long)Math.Floor(point.Z/.5));
-        if (portalVoxels.Add(voxel))
+        if (portalVoxels.Add(voxel) && !nodes[node].Indexed)
         {
             var cell = Cell(point);
-            if (!grid.TryGetValue(cell, out list)) grid[cell] = list = new();
+            if (!grid.TryGetValue(cell, out var list)) grid[cell] = list = new();
             list.Add(node);
+            nodes[node].Indexed = true; indexedPortals++;
         }
-        return node;
     }
     private (long X, long Y) Cell(Point3D p) => ((long)Math.Floor(p.X / neighbourhood), (long)Math.Floor(p.Y / neighbourhood));
     private static bool Finite(Point3D p) => double.IsFinite(p.X) && double.IsFinite(p.Y) && double.IsFinite(p.Z)

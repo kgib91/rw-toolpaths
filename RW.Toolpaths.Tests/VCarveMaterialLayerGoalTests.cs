@@ -56,8 +56,8 @@ public sealed class VCarveMaterialLayerGoalTests
         Assert.Equal(0,translated[0].Points[0].Z);Assert.Equal(-.001,unsafePhysical[0].Points[0].Z);
         IReadOnlyList<IReadOnlyList<PointD>> artwork=new[]{(IReadOnlyList<PointD>)new List<PointD>{new(-1,-1),new(1,-1),new(1,1),new(-1,1)}};
         Type wall=typeof(VCarveSmoothing).GetNestedType("CommandClearance",BindingFlags.NonPublic)!;
-        var ctor=wall.GetConstructor(BindingFlags.NonPublic|BindingFlags.Instance,null,new[]{typeof(IReadOnlyList<IReadOnlyList<PointD>>),typeof(VCarveCutterProfile),typeof(double),typeof(CancellationToken),typeof(Action<string>),typeof(IReadOnlyList<IReadOnlyList<PointD>>),typeof(long),typeof(bool),typeof(int)},null)!;
-        object owner=ctor.Invoke(new object?[]{artwork,profile,0d,CancellationToken.None,null,artwork,1_000_000L,true,65536});
+        var ctor=wall.GetConstructor(BindingFlags.NonPublic|BindingFlags.Instance,null,new[]{typeof(IReadOnlyList<IReadOnlyList<PointD>>),typeof(VCarveCutterProfile),typeof(double),typeof(CancellationToken),typeof(Action<string>),typeof(IReadOnlyList<IReadOnlyList<PointD>>),typeof(long),typeof(bool),typeof(int),wall,typeof(VCarveMaterialSurface)},null)!;
+        object owner=ctor.Invoke(new object?[]{artwork,profile,0d,CancellationToken.None,null,artwork,1_000_000L,true,65536,null,null});
         var proof=(Func<Point3D,Point3D,bool>)wall.GetMethod("IsLegalCommandedChord",BindingFlags.NonPublic|BindingFlags.Instance)!
             .CreateDelegate(typeof(Func<Point3D,Point3D,bool>),owner);
         Assert.False(proof(unsafePhysical[0].Points[0],unsafePhysical[0].Points[1]));

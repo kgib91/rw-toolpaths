@@ -20,6 +20,7 @@ internal static class PocketContinuationRouter
         PocketOptions options, double radius, CancellationToken token, bool useIndexedCoverage = true,
         ToolGeometry? tool = null)
     {
+        source=ToolpathSourceTraversal.EnteredDetours(source,token,Console.WriteLine,motion:options.Motion,surface:depth.SurfaceZ);
         long routeStarted = Stopwatch.GetTimestamp();
         long allocationStarted = GC.GetAllocatedBytesForCurrentThread();
         useIndexedCoverage &= Environment.GetEnvironmentVariable("RW_TOOLPATHS_ROUTING_REFERENCE") != "1";
@@ -32,11 +33,14 @@ internal static class PocketContinuationRouter
         var coverageDiagnostics = new CoverageDiagnostics();
         var followingCache = useIndexedCoverage ? new FollowingSweepCache() : null;
         var output = new List<TaggedToolpath>();
+        var motionCost=options.Motion is null?null:new ToolpathMotionCost(options.Motion,depth.SurfaceZ);
+        int costRefusals=0;double selectedSaving=0;
         var spatial = options.LinkClearance ?? LinkClearance.Unrestricted;
         int lifts = 0, plunges = 0, linear = 0, helicals = 0, rebased = 0, candidates = 0;
         int nextVisit = source.Where(path => path.VisitIdentity.HasValue)
             .Select(path => path.VisitIdentity!.Value).DefaultIfEmpty(-1).Max() + 1;
         int checkedLinks = 0;
+        int boundaryConnections = 0, boundaryRefusals = 0;
         double capturedProofPrepareMilliseconds = 0, routeRepairMilliseconds = 0, executedRecordMilliseconds = 0;
         double MeasuredClearanceMilliseconds() => stock.FloorProjectionMilliseconds + stock.FloorSweepMilliseconds
             + stock.FloorUnionMilliseconds + coverageDiagnostics.ExclusiveMilliseconds
@@ -49,10 +53,70 @@ internal static class PocketContinuationRouter
             postedStepdown?.Record(stroke);
             executedRecordMilliseconds += Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         }
+        TaggedToolpath ConnectBoundary(TaggedToolpath original)
+        {
+            if (!flatCylinder || output.Count == 0 || original.Points.Count < 2) return original;
+            var previous = output[^1];
+            var from = previous.Points[^1];
+            if (from == original.Points[0] || previous.RegionIndex != original.RegionIndex
+                || previous.DepthPassIndex != original.DepthPassIndex) return original;
+            int firstCutIndex = -1;
+            for (int i = 0; i < original.Spans.Count; i++)
+                if (original.Spans[i].Kind == ToolpathSpanKind.Cut && original.Spans[i].MoveCount > 0)
+                { firstCutIndex = i; break; }
+            if (firstCutIndex < 0) return original;
+            var cut = original.Spans[firstCutIndex];
+            double floor = original.Points[cut.StartIndex].Z;
+            if (from.Z != floor || floor >= depth.SurfaceZ
+                || original.Points.Skip(cut.StartIndex).Take(cut.PointCount).Any(p => p.Z != floor)) return original;
+            // Only a leading independent descent may be removed. A resumed
+            // carrier keeps all of its existing Cut/Link spans and direction.
+            bool entryOnly = firstCutIndex > 0 && original.Spans[0].StartIndex == 0
+                && original.Spans[firstCutIndex - 1].EndIndex == cut.StartIndex
+                && original.Spans.Take(firstCutIndex).Select((s, i) => s.Kind == ToolpathSpanKind.Ramp
+                    && (i == 0 || original.Spans[i - 1].EndIndex == s.StartIndex)).All(valid => valid);
+            var tail = entryOnly ? Slice(original, cut.StartIndex, original.Points.Count - 1) : original;
+            if (DistanceSquared(from, tail.Points[0]) > 64 * radius * radius) return original;
+            var following = BelowFloor(original.Points.Skip(cut.StartIndex).Take(cut.PointCount).ToList(), floor);
+            var proof = new TemporalClearance(spatial, stock, floor, following, radius, token,
+                coverageDiagnostics, useIndexedCoverage, followingCache, validateIndexedCoverage, limitCropWork,
+                postedStepdown?.Capture());
+            TaggedToolpath candidate;
+            if (proof.IsTravelSafe(from, tail.Points[0], radius))
+            {
+                var points = tail.Points.ToList(); var spans = tail.Spans.ToList();
+                PrependLink(from, points, spans);
+                candidate = Copy(tail, points, spans);
+            }
+            else if (tail.Spans[0].Kind != ToolpathSpanKind.Cut
+                || tail.Points[tail.Spans[0].StartIndex] != tail.Points[tail.Spans[0].EndIndex]
+                || !TryRebase(tail, from, proof, radius, token, out candidate, out _, options.PreserveCommandVertices))
+            {
+                candidates += proof.Queries;
+                if (++boundaryRefusals <= 8) Console.WriteLine($"[PocketContinuation.Boundary] decision=keep-entry reason=no-proved-local-connection "
+                    + $"region={original.RegionIndex} pass={original.DepthPassIndex} from=({from.X:R},{from.Y:R},{from.Z:R}) "
+                    + $"target=({tail.Points[0].X:R},{tail.Points[0].Y:R},{tail.Points[0].Z:R}) queries={proof.Queries} futureScope=first-cut");
+                return original;
+            }
+            candidates += proof.Queries;
+            if (!ToolpathMotionCost.PreferContinuation(motionCost, from, original, candidate, out double before, out double after))
+            {
+                if (++boundaryRefusals <= 8) Console.WriteLine($"[PocketContinuation.Boundary] decision=keep-entry reason=complete-entry-cost "
+                    + $"entrySec={before:R} continuationSec={after:R} region={original.RegionIndex} pass={original.DepthPassIndex}");
+                return original;
+            }
+            if (motionCost is not null) selectedSaving += before - after;
+            boundaryConnections++;
+            if (boundaryConnections <= 8) Console.WriteLine($"[PocketContinuation.Boundary] decision=continue region={original.RegionIndex} "
+                + $"pass={original.DepthPassIndex} removedIndependentRamp={entryOnly} "
+                + $"from=({from.X:R},{from.Y:R},{from.Z:R}) target=({candidate.Points[1].X:R},{candidate.Points[1].Y:R},{candidate.Points[1].Z:R}) "
+                + $"entrySec={before:R} continuationSec={after:R} futureScope=first-cut sourceCutDirectionRetained=True");
+            return candidate;
+        }
         foreach (var original in source)
         {
             token.ThrowIfCancellationRequested();
-            var path = original;
+            var path = ConnectBoundary(original);
             int repairs = 0;
             bool finished = false;
             while (!finished)
@@ -99,7 +163,40 @@ internal static class PocketContinuationRouter
                     }
                     checkedLinks++;
                     candidates += proof.Queries;
-                    if (safe)
+                    Point3D from = path.Points[span.StartIndex];
+                    var tail = cutIndex < 0 ? default : Slice(path, path.Spans[cutIndex].StartIndex, path.Points.Count - 1);
+                    TaggedToolpath? independentEntry=null;RampStrategy independentStrategy=RampStrategy.Auto;
+                    TaggedToolpath IndependentEntry()
+                    {
+                        if(independentEntry is {} ready)return ready;
+                        double entryTop=path.DepthPassIndex is {} entryPass?depth.PassTopZ(entryPass):depth.SurfaceZ;
+                        independentEntry=options.PreserveCommandVertices
+                            ? AddEntryAtCommandVertices(tail,entryTop,options.Ramp,nextVisit,token,out independentStrategy)
+                            : AddEntry(tail,entryTop,options.Ramp,nextVisit,token,out independentStrategy);
+                        return independentEntry.Value;
+                    }
+                    bool Prefer(TaggedToolpath candidate)
+                    {
+                        if(motionCost is null)return true;
+                        TaggedToolpath independent;
+                        try{independent=IndependentEntry();}
+                        catch(InvalidOperationException error)
+                        {
+                            Console.WriteLine($"[Toolpath.EntryCost] owner=pocket alternative=unavailable reason={error.Message} provedContinuationRetained=True");
+                            return true;
+                        }
+                        bool accepted=ToolpathMotionCost.PreferContinuation(motionCost,from,independent,candidate,out double before,out double after);
+                        if(accepted)selectedSaving+=before-after;
+                        else if(++costRefusals<=8)Console.WriteLine($"[Toolpath.EntryCost] owner=pocket decision=reenter continuationSec={after:R} entrySec={before:R} "
+                            + $"spatiallyProved={safe} region={path.RegionIndex} pass={path.DepthPassIndex} span={spanIndex} "
+                            + $"from=({from.X:R},{from.Y:R},{from.Z:R}) target=({tail.Points[0].X:R},{tail.Points[0].Y:R},{tail.Points[0].Z:R}) "
+                            + $"completeRetainedTrace=True policyOwner=RW.Toolpaths");
+                        return accepted;
+                    }
+                    // A proved chord can still be an expensive feed through air.
+                    // Price the existing link plus its complete retained tail against
+                    // the same independent entry used by repaired continuations.
+                    if (safe && (cutIndex < 0 || Prefer(Slice(path, span.StartIndex, path.Points.Count - 1))))
                     {
                         RecordExecuted(path, span);
                         spanIndex = linkRunEnd;
@@ -111,7 +208,6 @@ internal static class PocketContinuationRouter
                         throw new InvalidOperationException("Ordered pocket continuation repair did not make progress.");
                     var prefix = Slice(path, 0, span.StartIndex);
                     if (prefix.Spans.Any(part => part.MoveCount > 0)) output.Add(prefix);
-                    Point3D from = path.Points[span.StartIndex];
                     if (cutIndex < 0)
                     {
                         lifts++;
@@ -123,9 +219,8 @@ internal static class PocketContinuationRouter
                             - (MeasuredClearanceMilliseconds() - priorRepairClearance));
                         break;
                     }
-                    var tail = Slice(path, path.Spans[cutIndex].StartIndex, path.Points.Count - 1);
                     if (TryRebase(tail, from, proof, radius, token, out var continued, out int tested,
-                            options.PreserveCommandVertices))
+                            options.PreserveCommandVertices) && Prefer(continued))
                     {
                         candidates += tested;
                         rebased++;
@@ -136,7 +231,7 @@ internal static class PocketContinuationRouter
                     }
                     else if (TryNativeRetrace(tail, from, proof, stock, radius, token,
                                  out continued, out int nativeQueries, out double retraceLength,
-                                 options.PreserveCommandVertices))
+                                 options.PreserveCommandVertices) && Prefer(continued))
                     {
                         candidates += tested + nativeQueries;
                         rebased++;
@@ -151,10 +246,8 @@ internal static class PocketContinuationRouter
                     {
                         candidates += tested + nativeQueries;
                         double top = path.DepthPassIndex is { } pass ? depth.PassTopZ(pass) : depth.SurfaceZ;
-                        RampStrategy strategy;
-                        path = options.PreserveCommandVertices
-                            ? AddEntryAtCommandVertices(tail, top, options.Ramp, nextVisit++, token, out strategy)
-                            : AddEntry(tail, top, options.Ramp, nextVisit++, token, out strategy);
+                        path=IndependentEntry();nextVisit++;
+                        RampStrategy strategy=independentStrategy;
                         lifts++;
                         switch (strategy)
                         {
@@ -175,12 +268,14 @@ internal static class PocketContinuationRouter
             }
             if (path.Spans.Any(span => span.MoveCount > 0)) output.Add(path);
         }
+        Console.WriteLine($"[Toolpath.EntryCost] owner=pocket event=complete machineContext={motionCost is not null} costRefusals={costRefusals} selectedSavingSec={selectedSaving:R} completeBridgeEntryAndCut=True policyOwner=RW.Toolpaths");
         Console.WriteLine($"[PocketContinuation.Temporal] event=complete inputPaths={source.Count} paths={output.Count} "
+            + $"boundaryConnections={boundaryConnections} boundaryRefusals={boundaryRefusals} "
             + $"checkedLinks={checkedLinks} rebased={rebased} lifts={lifts} candidates={candidates} "
             + $"recordedStrokes={stock.RecordedStrokes} floors={stock.FloorCount} floorQueries={stock.FloorQueries} "
             + $"replayedStrokes={stock.ReplayedStrokes} deferredFloorStrokes={stock.DeferredFloorStrokes} "
             + $"floorUnionBatches={stock.FloorUnionBatches} "
-            + $"floorUnionCalls={stock.FloorUnionCalls} preparedBatches={stock.PreparedBatches} "
+            + $"floorUnionCalls={stock.FloorUnionCalls} floorUnionRetainedVertices={stock.FloorUnionRetainedVertices} floorUnionSubmittedVertices={stock.FloorUnionSubmittedVertices} preparedBatches={stock.PreparedBatches} "
             + $"floorProjectionCacheHits={stock.FloorProjectionCacheHits} floorProjectionCacheMisses={stock.FloorProjectionCacheMisses} "
             + $"nativeChordIndexEnabled={stock.NativeChordIndexEnabled} nativeChordQueries={stock.NativeChordQueries} "
             + $"nativeChordCachedScanQueries={stock.NativeChordCachedScanQueries} nativeChordIndexedQueries={stock.NativeChordIndexedQueries} nativeChordIndexDeferredQueries={stock.NativeChordIndexDeferredQueries} "
@@ -267,12 +362,22 @@ internal static class PocketContinuationRouter
     {
         radius = 0;
         if (tool is null) return false;
-        if (tool.VCarveProfile is { } profile)
+        if (tool.VCarveProfile is { } profile && profile.MaximumDepth < stockDepth) return false;
+        IReadOnlyList<CarvingCutterSection>? sections = tool.PhysicalProfile is { } cutter
+            ? cutter.Sections.ToArray() : tool.VCarveProfile?.Sections;
+        if (sections is not null)
         {
-            double physical = profile.Sections[0].BottomRadius;
-            if (profile.RoundedTip || profile.MaximumDepth < stockDepth || physical <= 0
-                || !profile.Sections.All(section => section.Kind == CarvingCutterSectionKind.Linear
-                    && section.BottomRadius == physical && section.TopRadius == physical)) return false;
+            double physical = sections[0].BottomRadius, height = 0;
+            if (physical <= 0 || (float)tool.Radius != (float)physical
+                || tool.PhysicalProfile is not null && tool.Radius != physical) return false;
+            foreach (var section in sections)
+            {
+                if (height > stockDepth) break;
+                if (section.Kind != CarvingCutterSectionKind.Linear
+                    || section.BottomRadius != physical || section.TopRadius != physical) return false;
+                height += section.Height;
+            }
+            if (height < stockDepth) return false;
             radius = physical;
             return true;
         }
@@ -888,6 +993,7 @@ internal static class PocketContinuationRouter
     {
         internal sealed class Floor
         {
+            internal readonly HashSet<(double, double, double, double)> SweptChords = new();
             internal List<List<PointD>> Swept = new();
             internal List<IReadOnlyList<PointD>> Pending = new();
             internal int ConsumedStrokes;
@@ -905,6 +1011,7 @@ internal static class PocketContinuationRouter
         private readonly double _radius;
         private readonly CancellationToken _token;
         private readonly bool _useNativeChordIndex;
+        private readonly bool _selectiveFloorUnions;
         private readonly CoverageBatch? _knownEmpty;
         private readonly double _knownEmptyFloor;
         private readonly List<IReadOnlyList<Point3D>> _strokes = new();
@@ -937,8 +1044,11 @@ internal static class PocketContinuationRouter
         internal bool NativeChordIndexEnabled => _useNativeChordIndex;
         internal long DeferredFloorStrokes => _floors.Values.Sum(floor => (long)_strokes.Count - floor.ConsumedStrokes);
         internal ClearedStock(double radius, CancellationToken token, bool useNativeChordIndex = true,
-            IReadOnlyList<IReadOnlyList<PointD>>? knownEmpty=null,double knownEmptyFloor=double.PositiveInfinity)
+            IReadOnlyList<IReadOnlyList<PointD>>? knownEmpty=null,double knownEmptyFloor=double.PositiveInfinity,
+            bool deduplicateProjectedSweeps = true,bool selectiveFloorUnions=true)
         {
+            _deduplicateProjectedSweeps = deduplicateProjectedSweeps;
+            _selectiveFloorUnions=selectiveFloorUnions;
             _radius = radius; _token = token;
             _knownEmptyFloor=knownEmptyFloor;
             if(knownEmpty is {Count:>0}) _knownEmpty=new CoverageBatch(knownEmpty.Select(p=>p.ToList()).ToList(),0);
@@ -950,8 +1060,87 @@ internal static class PocketContinuationRouter
             _token.ThrowIfCancellationRequested();
             _strokes.Add(stroke);
         }
+
+        private const int MaximumProjectedSweepChords = 1_048_576;
+        private readonly bool _deduplicateProjectedSweeps;
+        private long _duplicateProjectedSweepChords, _newProjectedSweepChords;
+
+        private void AddNewSweeps(Floor floor, IReadOnlyList<IReadOnlyList<PointD>> paths)
+        {
+            if (!_deduplicateProjectedSweeps) { floor.Pending.AddRange(paths); return; }
+            foreach (var path in paths)
+            {
+                if (path.Count < 2) continue;
+                var run = new List<PointD>();
+                void Flush()
+                {
+                    if (run.Count == 0) return;
+                    if (run.Count > 1) floor.Pending.Add(run);
+                    run = new();
+                }
+                for (int i = 1; i < path.Count; i++)
+                {
+                    _token.ThrowIfCancellationRequested();
+                    var a = path[i - 1]; var b = path[i];
+                    var first = a; var second = b;
+                    if (first.x > second.x || first.x == second.x && first.y > second.y)
+                        (first, second) = (second, first);
+                    var key = (first.x, first.y, second.x, second.y);
+                    bool finite = double.IsFinite(first.x) && double.IsFinite(first.y)
+                        && double.IsFinite(second.x) && double.IsFinite(second.y);
+                    if (finite && floor.SweptChords.Contains(key))
+                    {
+                        _duplicateProjectedSweepChords++;
+                        Flush();
+                        continue;
+                    }
+                    if (finite && floor.SweptChords.Count < MaximumProjectedSweepChords) floor.SweptChords.Add(key);
+                    _newProjectedSweepChords++;
+                    if (run.Count == 0) run.Add(a);
+                    run.Add(b);
+                }
+                Flush();
+            }
+        }
         internal IReadOnlyList<List<PointD>> AtFloor(double z)
             => PrepareAtFloor(z).Materialize();
+
+        internal long FloorUnionRetainedVertices,FloorUnionSubmittedVertices;
+        private List<List<PointD>> UnionAddedSweeps(IReadOnlyList<List<PointD>> previous,IReadOnlyList<List<PointD>> added)
+        {
+            // Previous is this floor's canonical signed union. A new sweep
+            // cannot alter a contour whose box is disjoint from ALL additions.
+            // Selecting intersecting contour boxes includes every enclosing
+            // ancestor, so omitted holes/islands can be restored literally.
+            // Keep the original left-to-right batch hierarchy and captured
+            // prefixes; only omit unaffected operands within one union call.
+            if(!_selectiveFloorUnions||previous.Count<16||added.Count==0)
+                return PolygonOps.Union(previous.Concat(added));
+            double left=double.PositiveInfinity,bottom=left,right=double.NegativeInfinity,top=right;
+            foreach(var path in added)foreach(var point in path)
+            {
+                if(!double.IsFinite(point.x)||!double.IsFinite(point.y))return PolygonOps.Union(previous.Concat(added));
+                left=Math.Min(left,point.x);bottom=Math.Min(bottom,point.y);right=Math.Max(right,point.x);top=Math.Max(top,point.y);
+            }
+            if(!double.IsFinite(left+bottom+right+top))return PolygonOps.Union(previous.Concat(added));
+            double guard=8/PathUtils.Scale;
+            left-=guard;bottom-=guard;right+=guard;top+=guard;
+            var active=new List<IReadOnlyList<PointD>>();var retained=new List<List<PointD>>();
+            foreach(var path in previous)
+            {
+                _token.ThrowIfCancellationRequested();
+                double x0=double.PositiveInfinity,y0=x0,x1=double.NegativeInfinity,y1=x1;
+                foreach(var point in path)
+                {x0=Math.Min(x0,point.x);y0=Math.Min(y0,point.y);x1=Math.Max(x1,point.x);y1=Math.Max(y1,point.y);}
+                if(!double.IsFinite(x0+y0+x1+y1))return PolygonOps.Union(previous.Concat(added));
+                if(x1<left||x0>right||y1<bottom||y0>top)
+                {retained.Add(path.ToList());FloorUnionRetainedVertices+=path.Count;}
+                else {active.Add(path);FloorUnionSubmittedVertices+=path.Count;}
+            }
+            active.AddRange(added);
+            var merged=PolygonOps.Union(active);merged.AddRange(retained);
+            return PolygonOps.NormalizeOrder(merged);
+        }
 
         // Preparing the executed prefix constructs each new physical sweep once.
         // The original insertion-ordered global unions remain lazy diagnostics /
@@ -975,13 +1164,18 @@ internal static class PocketContinuationRouter
             while (floor.ConsumedStrokes < _strokes.Count)
             {
                 _token.ThrowIfCancellationRequested();
-                floor.Pending.AddRange(_useNativeChordIndex
+                AddNewSweeps(floor, _useNativeChordIndex
                     ? Projected(floor, floor.ConsumedStrokes, z, nativeQuery: false)
                     : BelowFloor(_strokes[floor.ConsumedStrokes], z));
                 floor.ConsumedStrokes++;
                 ReplayedStrokes++;
             }
             FloorProjectionMilliseconds += Stopwatch.GetElapsedTime(projectionStarted).TotalMilliseconds;
+            if (FloorQueries <= 3 || FloorQueries % 128 == 0)
+                Console.WriteLine($"[PocketContinuation.StockReplay] floor={z:R} prefixStrokes={floor.ConsumedStrokes} "
+                    +$"uniqueProjectedChords={_newProjectedSweepChords} duplicateProjectedChords={_duplicateProjectedSweepChords} "
+                    +$"floorMemoEntries={floor.SweptChords.Count} floorMemoLimit={MaximumProjectedSweepChords} "
+                    +$"identity=exact-native-XY-at-this-floor cutterRadiusUnchanged=True nativeStrokeHistoryRetained=True futureStrokesUncredited=True");
             if (floor.Pending.Count > 0)
             {
                 long sweepStarted = Stopwatch.GetTimestamp();
@@ -1025,7 +1219,7 @@ internal static class PocketContinuationRouter
                     for (int i = _startingMaterialized; i < PrefixBatches; i++)
                     {
                         _owner._token.ThrowIfCancellationRequested();
-                        snapshot = PolygonOps.Union(snapshot.Concat(_floor.Batches[i].Paths));
+                        snapshot = _owner.UnionAddedSweeps(snapshot,_floor.Batches[i].Paths);
                         _owner.FloorUnionCalls++;
                     }
                     _owner.FloorUnionMilliseconds += Stopwatch.GetElapsedTime(started).TotalMilliseconds;
@@ -1035,7 +1229,7 @@ internal static class PocketContinuationRouter
                 {
                     _owner._token.ThrowIfCancellationRequested();
                     var added = _floor.Batches[_floor.MaterializedBatches++];
-                    _floor.Swept = PolygonOps.Union(_floor.Swept.Concat(added.Paths));
+                    _floor.Swept = _owner.UnionAddedSweeps(_floor.Swept,added.Paths);
                     _owner.FloorUnionCalls++;
                 }
                 _owner.FloorUnionMilliseconds += Stopwatch.GetElapsedTime(started).TotalMilliseconds;
@@ -1709,6 +1903,7 @@ internal static class PocketContinuationRouter
         private readonly bool _limitCropWork;
         private readonly bool _useCoverageTiles;
         private readonly bool _useLocalTileCache;
+        private readonly bool _referenceDilation;
         private sealed record LocalTile(CoverageBounds Bounds,PolygonOps.BoundarySegmentIndex Index,
             IReadOnlyList<List<PointD>> Source,long EstimatedBytes);
         private readonly List<LocalTile> _localTiles=new(8);
@@ -1733,7 +1928,7 @@ internal static class PocketContinuationRouter
             CoverageDiagnostics? diagnostics = null, bool useIndexedCoverage = true,
             FollowingSweepCache? followingCache = null, bool validateIndexedCoverage = false,
             bool limitCropWork = true, PocketPostedStepdownStock.Proof? priorStepdown = null,
-            bool useCoverageTiles = true,bool useLocalTileCache=true)
+            bool useCoverageTiles = true,bool useLocalTileCache=true,bool referenceDilation=false)
         {
             _spatial = spatial;
             _token = token;
@@ -1744,6 +1939,7 @@ internal static class PocketContinuationRouter
             _useCoverageTiles = useCoverageTiles
                 && Environment.GetEnvironmentVariable("RW_TOOLPATHS_CROP_TILE_REFERENCE") != "1";
             _useLocalTileCache=useLocalTileCache;
+            _referenceDilation=referenceDilation;
             _priorStepdown = priorStepdown;
             _floorZ = floor;
             _floor = stock.PrepareAtFloor(floor);
@@ -1966,24 +2162,19 @@ internal static class PocketContinuationRouter
                 return false;
             }
             long cropStarted = Stopwatch.GetTimestamp();
-            // Intersect the complete signed filled domain as one group. The
-            // ring-oriented ClipToRect API intentionally clips each contour
-            // independently, which would turn a negative hole into an outer.
-            IReadOnlyList<PointD>[] rectangle = new IReadOnlyList<PointD>[] { new PointD[]
-            {
-                new(minX / PathUtils.Scale, minY / PathUtils.Scale),
-                new(maxX / PathUtils.Scale, minY / PathUtils.Scale),
-                new(maxX / PathUtils.Scale, maxY / PathUtils.Scale),
-                new(minX / PathUtils.Scale, maxY / PathUtils.Scale),
-            } };
-            var cropped = PolygonOps.Intersect(selected, rectangle);
+            // Retain directed winding through the native integer rectangle
+            // clip, then union the signed outputs as one fill. ClipToRect's
+            // independently filled polygon API is not suitable for holes.
+            var cropped = PolygonOps.ClipSignedToRect(selected,(long)minX,(long)minY,(long)maxX,(long)maxY,_token);
             double cropMilliseconds = Stopwatch.GetElapsedTime(cropStarted).TotalMilliseconds;
             _diagnostics.CropMilliseconds += cropMilliseconds;
             _diagnostics.LocalInputVertices += cropped.Sum(path => (long)path.Count);
             _token.ThrowIfCancellationRequested();
             long bufferStarted = Stopwatch.GetTimestamp();
-            var certified = PolygonOps.Union(PolygonOps.Buffer(cropped,
-                ConstructionError - CropOffsetReserve, ArcTolerance / 4));
+            // Buffer publishes a canonical signed fill. Its offsetter/large
+            // stroke builder already completed the original cleanup union.
+            var certified = PolygonOps.Buffer(cropped,
+                ConstructionError - CropOffsetReserve, ArcTolerance / 4);
             double bufferMilliseconds = Stopwatch.GetElapsedTime(bufferStarted).TotalMilliseconds;
             _diagnostics.LocalBufferMilliseconds += bufferMilliseconds;
             _diagnostics.LocalOutputVertices += certified.Sum(path => (long)path.Count);
@@ -2100,7 +2291,9 @@ internal static class PocketContinuationRouter
             }
             else allowed = CapturedAllowed();
             long bufferStarted = Stopwatch.GetTimestamp();
-            var certified = PolygonOps.Union(PolygonOps.Buffer(allowed, ConstructionError, ArcTolerance / 4));
+            var certified = validation || _referenceDilation
+                ? PolygonOps.Union(PolygonOps.BufferWithBoundaryCapsules(allowed, ConstructionError, ArcTolerance / 4))
+                : PolygonOps.Buffer(allowed, ConstructionError, ArcTolerance / 4);
             double bufferMilliseconds = Stopwatch.GetElapsedTime(bufferStarted).TotalMilliseconds;
             long indexStarted = Stopwatch.GetTimestamp();
             var index = new PolygonOps.BoundarySegmentIndex(PathUtils.ToClipper(certified));
@@ -2127,7 +2320,7 @@ internal static class PocketContinuationRouter
             Console.WriteLine($"[PocketContinuation.Coverage] event=local-proof-mismatch floor={_floorZ:R} "
                 + $"prefixBatches={_floor.PrefixBatches} radius={radius:R} "
                 + $"from=({from.X:R},{from.Y:R},{from.Z:R}) to=({to.X:R},{to.Y:R},{to.Z:R}) "
-                + "reference=original-whole-domain action=refuse-generation");
+                + $"reference=original-whole-domain action=refuse-generation");
             throw new InvalidOperationException("An indexed pocket continuation did not satisfy its original whole-domain proof.");
         }
 

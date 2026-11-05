@@ -1,4 +1,4 @@
-﻿using Clipper2Lib;
+using Clipper2Lib;
 using RW.Toolpaths;
 
 namespace RW.Toolpaths.Tests;
@@ -34,7 +34,7 @@ public class MedialAxisCallContractTests
         Assert.True(provider.WasCalled, "Expected provider to be invoked.");
 
         Assert.Equal(tolerance, provider.LastTolerance, 12);
-        Assert.Equal(3.0 * Math.PI / 4.0, provider.LastFilteringAngle, 12);
+        Assert.Equal(Math.PI, provider.LastFilteringAngle, 12);
         Assert.True(provider.LastUseBigIntegers);
 
         // JS g_/y_ behavior: maxRadius = tan(radianTipAngle / 2) * depthPerPass,

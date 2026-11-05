@@ -35,6 +35,7 @@ internal static partial class VCarveCoverageCertificate
         internal bool UsePreparedSphereDiscPruning { get; init; }
         internal bool UseCachedTreeBounds { get; init; }
         internal bool UseGpuDiscWitnesses { get; init; }
+        internal VCarveGenerationPolicy? GenerationPolicy { get; init; }
         internal bool UseGpuTriangleDomain { get; init; }
         internal bool UseGpuBoundaryNominations { get; init; }
         internal bool UseDelaunayTriangleDomain { get; init; } = true;
@@ -286,14 +287,14 @@ internal static partial class VCarveCoverageCertificate
             {
                 gpuAttempted = true;
                 gpuAvailable = mandatoryDiscs!.TryCreateGpuContext(profile, cancellationToken, diagnostic,
-                    out gpuContext, out gpuReason);
+                    out gpuContext, out gpuReason, limits.GenerationPolicy);
                 if (gpuAvailable) gpuReason = "ready";
                 diagnostic?.Invoke($"stage=smooth-physical-certificate event=gpu-selection available={gpuAvailable} " +
                     $"reason={gpuReason} mandatoryIntervals={mandatoryIntervals} batchSize={limits.GpuBatchSize}");
                 if (gpuAvailable && optionalDiscs is not null)
                 {
                     bool optionalAvailable = optionalDiscs.TryCreateGpuContext(profile, cancellationToken, diagnostic,
-                        out optionalGpuContext, out string optionalReason);
+                        out optionalGpuContext, out string optionalReason, limits.GenerationPolicy);
                     diagnostic?.Invoke($"stage=smooth-physical-certificate event=gpu-optional-selection available={optionalAvailable} " +
                         $"reason={optionalReason} optionalIntervals={optionalIntervals} preference=mandatory-first");
                 }
@@ -874,7 +875,8 @@ internal static partial class VCarveCoverageCertificate
         internal Tree(Segment[] segments, Budget work) { _segments = segments; _work = work; Build(0, segments.Length); }
 
         internal bool TryCreateGpuContext(VCarveCutterProfile profile, CancellationToken cancellationToken,
-            Action<string>? diagnostic, out VCarveGpuDiscWitnessContext? context, out string reason)
+            Action<string>? diagnostic, out VCarveGpuDiscWitnessContext? context, out string reason,
+            VCarveGenerationPolicy? policy = null)
         {
             var segments = new GpuDiscSegment[_segments.Length];
             for (int i = 0; i < segments.Length; i++)
@@ -892,7 +894,7 @@ internal static partial class VCarveCoverageCertificate
                     n.MaximumRadius, n.First, n.Count, n.Left, n.Right);
             }
             return VCarveGpuDiscWitnessContext.TryCreate(segments, nodes, profile, cancellationToken,
-                diagnostic, out context, out reason);
+                diagnostic, out context, out reason, policy);
         }
 
         internal bool TryValidateGpuNomination(PointD q, double desired, GpuDiscNomination nomination,

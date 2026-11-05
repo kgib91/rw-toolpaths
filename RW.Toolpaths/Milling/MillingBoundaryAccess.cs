@@ -59,11 +59,13 @@ public sealed record MillingBoundaryAccess(
         internal IReadOnlyList<MillingRegion> PocketRegions(double radius, double allowance, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
+            long guideStarted = Stopwatch.GetTimestamp();
             // Internal approved clearance can support a cutter contacting the target from
             // either side. At the platform edge, compensate a radius-wide apron so the
             // outermost centreline stays on the platform, while the cutter can overhang.
             double expansion = 2 * radius + Math.Max(0, allowance);
-            var guide = PolygonOps.Offset(Target, expansion, .0001, 0);
+            var guide = PolygonOps.Offset(Target, expansion, .0001, 0, pruneCollapsedHoles: true);
+            double expansionMilliseconds = Stopwatch.GetElapsedTime(guideStarted).TotalMilliseconds;
             var platform = PolygonOps.Offset(new[] { PartBoundary }, radius + allowance - .001, .0001, 0);
             guide = PolygonOps.Intersect(guide,platform);
             var local = PolygonOps.Intersect(guide, Fill(GetRegions(token)));
@@ -73,7 +75,8 @@ public sealed record MillingBoundaryAccess(
             Console.WriteLine($"[Milling.OutsideEdges.PocketGuide] operation={_context} targetContours={Target.Count} "
                 + $"physicalAccessRegions={Regions.Count} guideRegions={result.Length} expansion={expansion:R} "
                 + $"platformCentreOverrun=0 cutterOverhang={radius:R} guideArea={Math.Abs(local.Sum(r=>Clipper.Area(new PathD(r)))):R} "
-                + "source=original-cutting-target remoteClearanceShapesFronts=False physicalWallsUnchanged=True");
+                + $"expansionMs={expansionMilliseconds:F1} totalMs={Stopwatch.GetElapsedTime(guideStarted).TotalMilliseconds:F1} "
+                + $"source=original-cutting-target remoteClearanceShapesFronts=False physicalWallsUnchanged=True");
             return result;
         }
 
@@ -95,9 +98,13 @@ public sealed record MillingBoundaryAccess(
             double allowance, CancellationToken token)
         {
             long started=Stopwatch.GetTimestamp();
+            // Ordinary pockets use a conservative engaged disk for wall checks.
+            // This bound is never used as evidence of already-cleared stock.
+            double envelopeDepth=PocketContinuationRouter.RequiredPostedCylinderHeight(depth);
+            double envelopeRadius=tool.PhysicalProfile?.MaxRadiusBelow(envelopeDepth) ?? tool.Radius;
             var profile=tool.VCarveProfile ?? (tool.ConeLength is > 0 ? VCarvePhysicalSweep.ProfileFor(tool,depth.Depth)
                 : new VCarveCutterProfile(new[]{new CarvingCutterSection(CarvingCutterSectionKind.Linear,
-                    tool.Radius,tool.Radius,depth.Depth)},depth.Depth));
+                    envelopeRadius,envelopeRadius,envelopeDepth)},envelopeDepth));
             VCarveSmoothing.CommandClearance? guard=null;
             bool cylinder=profile.Sections.All(section=>section.Kind==CarvingCutterSectionKind.Linear
                 &&section.BottomRadius==profile.TipRadius&&section.TopRadius==profile.TipRadius)
@@ -141,7 +148,7 @@ public sealed record MillingBoundaryAccess(
                 {
                     Console.Error.WriteLine($"[Milling.OutsideEdges.Verify] operation={_context} result=failed fingerprint={Signature} "
                         + $"category={path.Category} pass={path.DepthPassIndex} from={a} to={b} allowance={allowance:R} "
-                        + "coordinateSpace=float-world-F3 partialOutput=False");
+                        + $"coordinateSpace=float-world-F3 partialOutput=False");
                     throw new InvalidOperationException("Outside-edge cutter sweep intersects protected material: "+a+" -> "+b);
                 }
                 chords++;
@@ -149,7 +156,7 @@ public sealed record MillingBoundaryAccess(
             Console.WriteLine($"[Milling.OutsideEdges.Verify] operation={_context} result=passed fingerprint={Signature} chords={chords} "
                 + $"elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} rectangularPart={_rectangularPart.HasValue} "
                 + $"strictCylinderProofs={cylinderProofs} fallbackChords={chords-cylinderProofs} fallbackPreparationMs={fallbackPreparationMs:F1} "
-                + "coordinateSpace=float-world-F3 fullPhysicalProfile=True platformCentreOverrun=0");
+                + $"coordinateSpace=float-world-F3 fullPhysicalProfile=True platformCentreOverrun=0");
         }
 
         internal bool CentreChord(Point3D a,Point3D b)
@@ -247,7 +254,7 @@ public sealed record MillingBoundaryAccess(
                 var prepared=new CommandDomain(boundary,regions);Volatile.Write(ref _commandDomain,prepared);
                 Console.WriteLine($"[Milling.OutsideEdges.CommandDomain] operation={_context} regions={regions.Length} "
                     +$"points={boundary.Sum(r=>(long)r.Count)} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
-                    +"construction=unchanged-reserved-physical-domain publication=complete consumer=cutting-regions");
+                    +$"construction=unchanged-reserved-physical-domain publication=complete consumer=cutting-regions");
                 return prepared;
             }
         }
@@ -273,7 +280,7 @@ public sealed record MillingBoundaryAccess(
                 Volatile.Write(ref _openEdges,prepared);
                 Console.WriteLine($"[Milling.OutsideEdges.OpenBand] operation={_context} interfaces={open.Count} "
                     +$"contours={boundary.Count} points={boundary.Sum(r=>(long)r.Count)} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
-                    +"source=original-interface-recipe publication=complete consumer=open-edge-cuts implicitClosingChords=False");
+                    +$"source=original-interface-recipe publication=complete consumer=open-edge-cuts implicitClosingChords=False");
                 return prepared;
             }
         }
@@ -328,7 +335,7 @@ public sealed record MillingBoundaryAccess(
                 var edges=retained.SelectMany(path=>Enumerable.Range(1,path.Count-1).Select(i=>(path[i-1],path[i]))).ToArray();
                 Console.WriteLine($"[Milling.OutsideEdges.RampWalls] operation={_context} mode=protected-wall-band "
                     +$"edges={edges.Length} radius={wallRadius:R} outerReserve={bandReserve:R} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
-                    +"windowInteriorProved=True protectedAnchorsConservative=True");
+                    +$"windowInteriorProved=True protectedAnchorsConservative=True");
                 return edges;
             }
             // Keep original finite wall segments. Only portions strictly inside
@@ -360,7 +367,7 @@ public sealed record MillingBoundaryAccess(
                 out var conditioned,out _))source=conditioned!;
             Console.WriteLine($"[Milling.OutsideEdges.Nomination] operation={_context} event=source "
                 +$"literalPoints={literalSourcePoints} candidatePoints={source.Sum(p=>(long)p.Count)} "
-                +"conditioner=existing-raw-front originalTargetAndPhysicalWallsUnchanged=True physicalProofRequired=True");
+                +$"conditioner=existing-raw-front originalTargetAndPhysicalWallsUnchanged=True physicalProofRequired=True");
             for(int pass=0;pass<depth.PassCount;pass++)
             {
                 double penetration=depth.SurfaceZ-depth.PassBottomZ(pass);
@@ -443,27 +450,6 @@ public sealed record MillingBoundaryAccess(
             return result;
         }
 
-        /// <summary>Omit only rest-contour portions whose largest physical
-        /// footprint cannot contact demand. This is not a floor or stock proof.</summary>
-        internal IEnumerable<VCarveRampRestNominator.RestContour> RestrictRestContour(
-            IReadOnlyList<PointD> ring, bool closed, double maximumPhysicalRadius, CancellationToken token)
-        {
-            if (ring.Count < 2) yield break;
-            var points = ring.Select(p => new Point3D(p.x,p.y,0)).ToList();
-            if (closed && points[0] != points[^1]) points.Add(points[0]);
-            var source = new TaggedToolpath(points,Array.Empty<ToolpathSpan>(),0,"rest-demand",null,detectCurves:false);
-            // Covers source integer conversion and all subsequent float/F3 XY
-            // movement. The full-profile maximum bounds every fitted depth.
-            double radius = maximumPhysicalRadius + .002 + 2 / PathUtils.Scale;
-            foreach (var fragment in Trim(new[] { source },_ => radius,token,restrictCentres:false))
-            {
-                bool loop = closed && fragment.Points[0] == fragment.Points[^1];
-                var xy = (loop ? fragment.Points.Take(fragment.Points.Count-1) : fragment.Points)
-                    .Select(p => new PointD(p.X,p.Y)).ToArray();
-                yield return new(xy,loop);
-            }
-        }
-
         /// <summary>Trim proposals in XYZ while retaining their directed heights and span kinds.
         /// The indexed filled-contact query includes holes and intervening protected gaps.</summary>
         internal List<TaggedToolpath> Trim(IEnumerable<TaggedToolpath> paths, Func<double,double> radiusAtDepth,
@@ -483,7 +469,8 @@ public sealed record MillingBoundaryAccess(
                     if (points.Count > 1)
                     {
                         output.Add(new(points.ToArray(),spans.ToArray(),path.RegionIndex,
-                            path.Category,path.DepthPassIndex,path.VisitIdentity,detectCurves:false));
+                            path.Category,path.DepthPassIndex,path.VisitIdentity,detectCurves:false)
+                            {ConcentricSource=path.ConcentricSource});
                         if(interpolated){insertedFragments++;interpolatedFragments?.Add(output.Count-1);}
                     }
                     points.Clear(); spans.Clear();
@@ -533,7 +520,7 @@ public sealed record MillingBoundaryAccess(
             }
             if(retainContactingChords)Console.WriteLine($"[Milling.OutsideEdges.PostedSourceTrim] operation={_context} "
                 +$"wholeContactChords={wholeContactChords} unchangedChords={unchangedChords} interpolatedFragments={insertedFragments} "
-                +"demandUnchanged=True sourceChordGeometryRetained=True platformCentreClip=True newVerticesRequireFreshProtection=True");
+                +$"demandUnchanged=True sourceChordGeometryRetained=True platformCentreClip=True newVerticesRequireFreshProtection=True");
             return output;
         }
         private static Point64 Native(Point3D p)=>new((long)Math.Round(p.X*PathUtils.Scale),(long)Math.Round(p.Y*PathUtils.Scale));

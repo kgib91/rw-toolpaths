@@ -20,7 +20,7 @@ public static class SurfaceToolpathSimplifier
             var compact=Simplify(path,tolerance,token);after+=compact.Points.Count;afterSpans+=compact.Spans.Count;result.Add(compact);
         }
         diagnostic?.Invoke($"stage=surface-simplification event=complete phase={stage} paths={paths.Count} sourcePoints={before} retainedPoints={after} sourceSpans={beforeSpans} retainedSpans={afterSpans} "
-            +$"chordBoundMm={tolerance:R} surfaceBudgetMm={MachiningAccuracy.SurfaceDeviation:R} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
+            +$"chordBoundMm={tolerance:R} approximationOwner=caller elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
             +"finite3DCapsules=True endpointsAndMotionKindBoundaries=True adjacentCutSpanSubdivisionRequired=False originalPathEqualityRequired=False downstreamPhysicalProtectionRequired=True");
         return result;
     }
@@ -98,10 +98,10 @@ public static class SurfaceToolpathSimplifier
             path.DepthPassIndex,path.VisitIdentity,detectCurves:false)
             {ContinuationComponentIndex=path.ContinuationComponentIndex,ContinuationPlan=path.ContinuationPlan,
                 ContinuationSourceOrdinal=path.ContinuationSourceOrdinal,ContinuationCircuit=path.ContinuationCircuit,
-                ContinuationCircuitDefinition=path.ContinuationCircuitDefinition};
+                ContinuationCircuitDefinition=path.ContinuationCircuitDefinition,ConcentricSource=path.ConcentricSource};
     }
 
-    internal static double DistanceSquared(Point3D p,Point3D a,Point3D b)
+    public static double DistanceSquared(Point3D p,Point3D a,Point3D b)
     {
         double x=b.X-a.X,y=b.Y-a.Y,z=b.Z-a.Z,length=x*x+y*y+z*z;
         double t=length>0?Math.Clamp(((p.X-a.X)*x+(p.Y-a.Y)*y+(p.Z-a.Z)*z)/length,0,1):0;

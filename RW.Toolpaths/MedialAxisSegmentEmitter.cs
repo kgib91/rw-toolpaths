@@ -23,7 +23,8 @@ internal static class MedialAxisSegmentEmitter
         double tolerance = 0.1,
         ParabolaDiscretizationMethod method = ParabolaDiscretizationMethod.Error2D,
         double maxRadius = -1,
-        bool rejectIncompleteDiscretization = false)
+        bool rejectIncompleteDiscretization = false,
+        bool samplePointPointRadius = false)
     {
         var samples = new List<SamplePoint>
         {
@@ -65,9 +66,10 @@ internal static class MedialAxisSegmentEmitter
         {
             var pointSite = edge.Cell.Point!;
 
-            // Point-point Voronoi edges are linear. Keep endpoint-only emission
-            // and assign radius at sampled points; recursive subdivision here
-            // can fail to converge on long spans and truncate valid connectors.
+            // The nominal construction samples radius change on a linear XY
+            // bisector. Certified source callers keep their separate contract.
+            if (samplePointPointRadius && maxRadius > 0)
+                DiscretizePointPoint(pointSite, maxRadius, samples);
 
             for (int i = 0; i < samples.Count; i++)
             {
@@ -112,6 +114,33 @@ internal static class MedialAxisSegmentEmitter
         }
 
         return true;
+    }
+
+    private static void DiscretizePointPoint(MedialAxisEdgeClassifier.EdgePoint site,
+        double maximumRadiusChange, List<SamplePoint> samples)
+    {
+        var end = samples[^1]; samples.RemoveAt(samples.Count - 1);
+        var pending = new Stack<SamplePoint>(); pending.Push(end);
+        var current = samples[0]; int visits = 0;
+        while (pending.TryPeek(out var target))
+        {
+            if (++visits > MaxSubdivisionIterations)
+                throw new InvalidOperationException("Nominal point-pair radius subdivision exceeded its budget; incomplete geometry is not accepted.");
+            var middle = new SamplePoint((current.X + target.X) / 2, (current.Y + target.Y) / 2);
+            double radius = DistanceToPoint(site, current);
+            if (Math.Abs(radius - DistanceToPoint(site, target)) <= maximumRadiusChange
+                && Math.Abs(radius - DistanceToPoint(site, middle)) <= maximumRadiusChange)
+            { pending.Pop(); samples.Add(target); current = target; }
+            else
+            {
+                if (middle == current || middle == target)
+                    throw new InvalidOperationException("Nominal point-pair radius subdivision cannot progress.");
+                pending.Push(middle);
+            }
+        }
+        // Keep the baseline source representation. Later directed-command
+        // compaction owns redundant coordinate removal, independently of the graph.
+        samples.Add(end);
     }
 
     private static void DiscretizeError2D(
@@ -383,62 +412,6 @@ internal static class MedialAxisSegmentEmitter
         samples[^1] = end;
     }
 
-    private static void DiscretizePointPoint(
-        MedialAxisEdgeClassifier.EdgePoint point,
-        double tolerance,
-        List<SamplePoint> samples)
-    {
-        static double Distance(double x0, double y0, double x1, double y1)
-        {
-            double dx = x0 - x1;
-            double dy = y0 - y1;
-            return Math.Sqrt(dx * dx + dy * dy);
-        }
-
-        var end = samples[^1];
-        samples.RemoveAt(samples.Count - 1);
-        var queue = new List<SamplePoint> { end };
-        double lastX = samples[0].X;
-        double lastY = samples[0].Y;
-
-        int iterations = 0;
-        while (queue.Count > 0)
-        {
-            if (++iterations > MaxSubdivisionIterations)
-            {
-                Console.Error.WriteLine("[medial-axis] DiscretizePointPoint iteration limit reached; truncating edge discretization.");
-                break;
-            }
-
-            var target = queue[0];
-            double midX = (lastX + target.X) / 2;
-            double midY = (lastY + target.Y) / 2;
-            if (Math.Abs(midX - lastX) < 1e-12 && Math.Abs(midY - lastY) < 1e-12)
-            {
-                queue.RemoveAt(0);
-                continue;
-            }
-
-            double startDistance = Distance(lastX, lastY, point.X, point.Y);
-            double midDistance = Distance(midX, midY, point.X, point.Y);
-            double endDistance = Distance(target.X, target.Y, point.X, point.Y);
-
-            if (Math.Abs(startDistance - endDistance) <= tolerance && Math.Abs(startDistance - midDistance) <= tolerance)
-            {
-                queue.RemoveAt(0);
-                samples.Add(new SamplePoint(target.X, target.Y));
-                lastX = target.X;
-                lastY = target.Y;
-            }
-            else
-            {
-                queue.Insert(0, new SamplePoint(midX, midY));
-            }
-        }
-
-        samples.Add(end);
-    }
-
     private static double ParabolaY(double x, double pointProjection, double pointDistance) =>
         ((x - pointProjection) * (x - pointProjection) + pointDistance * pointDistance) / (pointDistance + pointDistance);
 
@@ -479,4 +452,3 @@ internal static class MedialAxisSegmentEmitter
 
     private static double Hypot(double x, double y) => Math.Sqrt(x * x + y * y);
 }
-

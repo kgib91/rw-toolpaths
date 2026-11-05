@@ -152,7 +152,7 @@ public sealed class VCarveGpuFrontIntegrationTests
         Assert.Equal(oldTargets[0], capture.FixedTargets[0]); Assert.NotEmpty(certificates);
         Assert.All(certificates, item => Assert.Equal(capture.FixedTargets[0], TargetBits(item.Target)));
         Assert.Contains(capture.Logs, line => line.Contains("stage=box-correction-neighborhood event=selection enabled=True")
-            && line.Contains("selectionCapturedAtApply=True") && line.Contains("physicalCredit=0"));
+            && line.Contains("selectionFrozenForApply=True") && line.Contains("physicalCredit=0"));
         Assert.Contains(capture.Logs, line => line.Contains("boxCompletionRequired=True"));
         Assert.Contains(capture.Logs, line => line.Contains("stage=smooth-physical-certificate") && line.Contains("certified=True"));
         VerifyOriginalPhysicalGuards(fixture, actual);
@@ -208,7 +208,7 @@ public sealed class VCarveGpuFrontIntegrationTests
         EqualGeometryBits(baseline, actual);
         Assert.Single(capture.Cores); Assert.False(capture.Cores[0].UseGpuFronts);
         Assert.Single(oldTargets); Assert.Single(capture.FixedTargets); Assert.Equal(oldTargets[0], capture.FixedTargets[0]);
-        Assert.Contains(capture.Logs, message => message.Contains("taperedLowerSweeps=True") && message.Contains("selectionCapturedAtApply=True"));
+        Assert.Contains(capture.Logs, message => message.Contains("taperedLowerSweeps=True") && message.Contains("selectionFrozenForApply=True"));
         VerifyOriginalPhysicalGuards(fixture, actual);
         _output.WriteLine($"taperedRequested=True realProfileQuotaRefused=True literalGeometryBits=True fixedTargetBits=True capturedPolicySurvivesEnvironmentMutation=True fullFloorWallGradeGuards=True paths={actual.Count}");
     }
@@ -271,7 +271,7 @@ public sealed class VCarveGpuFrontIntegrationTests
         Assert.Single(capture.Cores); Assert.Single(oldTargets); Assert.Single(capture.FixedTargets);
         Assert.Equal(oldTargets[0], capture.FixedTargets[0]);
         Assert.Contains(capture.Logs, line => line.Contains("lowerSweepBudget=True lowerSweepTolerance=0.004")
-            && line.Contains("selectionCapturedAtApply=True"));
+            && line.Contains("selectionFrozenForApply=True"));
         VerifyOriginalPhysicalGuards(fixture, actual);
     }
 
@@ -583,6 +583,37 @@ public sealed class VCarveGpuFrontIntegrationTests
         }
     }
 
+    [Fact]
+    public void CapturedNominationPolicySurvivesOriginalRetryAndEnvironmentMutation()
+    {
+        // Full interior work reaches correction/recovery. The default bounded
+        // no-fill fixture completes before those stages and cannot test a retry.
+        var fixture = Ramp();
+        fixture = fixture with { Options = fixture.Options with { IncludeInteriorFill = true } };
+        var baseline = Run(fixture, false, null, null, contourSeeds: true);
+        var capture = new Capture();
+        var control = Control(capture, forceInconclusive: true) with {
+            CoreEntered = input => {
+                capture.Cores.Add(input);
+                Environment.SetEnvironmentVariable("RW_TOOLPATHS_VCARVE_GPU_FRONTS", "0");
+                Environment.SetEnvironmentVariable("RW_TOOLPATHS_VCARVE_CONTOUR_SEEDS", "0");
+            }
+        };
+        var actual = Run(fixture, true, control, capture.Logs.Add, contourSeeds: true);
+        Assert.Equal(new[] { true, false }, capture.Cores.Select(core => core.UseGpuFronts));
+        var complete = Assert.Single(capture.Completions);
+        Assert.False(complete.Certificate.Certified);
+        var policy = Assert.IsType<VCarveGenerationPolicy>(complete.Authority.Limits.GenerationPolicy);
+        Assert.True(policy.GpuFronts);
+        Assert.True(policy.ContourSeeds);
+        Assert.True(complete.Authority.Limits.UseContourBoxSeeds);
+        Assert.Single(capture.Logs.Where(message => message.Contains("event=completion-fallback")));
+        EqualGeometryBits(baseline, actual);
+        Assert.Equal(1, capture.Factories);
+        Assert.Equal(1, capture.Lifetime.Disposals);
+        _output.WriteLine("capturedPolicySurvivesOriginalRetry=True environmentMutationIgnored=True originalGeometryBitsPreserved=True");
+    }
+
     private List<TaggedToolpath> Run(Fixture fixture, bool gpu,
         VCarveSmoothing.GpuFrontIntegrationControl? control, Action<string>? diagnostic, CancellationToken token = default,
         bool floorAware = false, bool contourSeeds = false, bool tapered = false, bool lowerSweepBudget = false, bool boxNeighborhoods = false)
@@ -591,8 +622,7 @@ public sealed class VCarveGpuFrontIntegrationTests
             "RW_TOOLPATHS_VCARVE_GPU_TRIANGLES", "RW_TOOLPATHS_VCARVE_GPU_BOUNDARY",
             "RW_TOOLPATHS_VCARVE_GPU_FP32", "RW_TOOLPATHS_VCARVE_GPU_BOUNDARY_FP32",
             "RW_TOOLPATHS_VCARVE_FLOOR_AWARE_RAMPS", "RW_TOOLPATHS_VCARVE_CONTOUR_SEEDS",
-            "RW_TOOLPATHS_VCARVE_GPU_FRONT_NEAREST_ROWS", "RW_TOOLPATHS_VCARVE_GPU_PARTIAL_FRONTS",
-            "RW_TOOLPATHS_VCARVE_GPU_PARTIAL_FRONT_REDUCTION", "RW_TOOLPATHS_GPU_GOLDEN_REFERENCE",
+            "RW_TOOLPATHS_GPU_GOLDEN_REFERENCE",
             "RW_TOOLPATHS_VCARVE_TAPERED_SWEEPS", "RW_TOOLPATHS_VCARVE_LOWER_SWEEP_BUDGET",
             "RW_TOOLPATHS_VCARVE_ACTUAL_F3_COMPACTION", "RW_TOOLPATHS_VCARVE_BOX_NEIGHBORHOODS" };
         var previousEnvironment = isolatedFlags.ToDictionary(flag => flag, Environment.GetEnvironmentVariable);

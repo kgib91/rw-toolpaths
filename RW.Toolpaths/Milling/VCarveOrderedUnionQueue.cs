@@ -21,7 +21,7 @@ internal sealed class VCarveOrderedUnionQueue : IDisposable
         internal static Slot Completed(Paths64 paths) => new() { Result = paths };
     }
 
-    private readonly BlockingCollection<Slot> _queue = new(4);
+    private readonly BlockingCollection<Slot> _queue;
     private readonly SemaphoreSlim _permits;
     private readonly ManualResetEventSlim _empty = new(true);
     private readonly Task[] _workers;
@@ -47,7 +47,7 @@ internal sealed class VCarveOrderedUnionQueue : IDisposable
     internal VCarveOrderedUnionQueue(CancellationToken token, int workers,
         Func<Paths64, Paths64>? union = null, long maximumBytes = MaximumRetainedInputBytes, int maximumPathsPerLeaf=32)
     {
-        if (workers < 1 || workers > Math.Min(4, GeometryParallelism.WorkerLimit))
+        if (workers < 1 || workers > GeometryParallelism.WorkerLimit)
             throw new ArgumentOutOfRangeException(nameof(workers));
         if (maximumBytes < 1 || maximumBytes > MaximumRetainedInputBytes)
             throw new ArgumentOutOfRangeException(nameof(maximumBytes));
@@ -56,6 +56,7 @@ internal sealed class VCarveOrderedUnionQueue : IDisposable
         _maximumPathsPerLeaf=maximumPathsPerLeaf;
         _token = token; _maximumBytes = maximumBytes;
         _union = union ?? (paths => Clipper.Union(paths, FillRule.NonZero));
+        _queue = new(workers);
         _permits = new SemaphoreSlim(workers, workers);
         _workers = new Task[workers];
         int created = 0;
@@ -122,8 +123,8 @@ internal sealed class VCarveOrderedUnionQueue : IDisposable
         }
     }
 
-    // ConstantRun's literal ClipperOffset consumes the same four-worker owner.
-    // The producer acquires a permit so it cannot overlap four active unions.
+    // ConstantRun's literal ClipperOffset consumes the same worker owner.
+    // The producer acquires a permit within that shared budget.
     internal IDisposable EnterProducerGeometry()
     {
         CheckActive(); WaitPermit();
@@ -232,6 +233,6 @@ internal sealed class VCarveOrderedUnionQueue : IDisposable
             $"peakInFlight={PeakInFlight} peakInputBytes={PeakRetainedInputBytes} maximumInputBytes={_maximumBytes} maximumPathsPerLeaf={_maximumPathsPerLeaf} " +
             $"computeMs={ComputeMilliseconds:F3} waitMs={WaitMilliseconds:F3} complete={_complete} " +
             $"failure={Volatile.Read(ref _failure)?.SourceException.GetType().Name ?? "none"} " +
-            "computeScope=sum-worker-inclusive outputPublication=after-join-and-token-check");
+            $"computeScope=sum-worker-inclusive outputPublication=after-join-and-token-check");
     }
 }

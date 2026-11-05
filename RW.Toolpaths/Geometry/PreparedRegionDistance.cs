@@ -14,6 +14,7 @@ public sealed class PreparedRegionDistance
     private readonly Dictionary<(long X,long Y), double> _queries = new();
     private readonly Queue<(long X,long Y)> _queryOrder = new();
     private readonly object _queryLock = new();
+    private readonly bool _threadConfined;
     private long _cachedQueryHits, _boundaryQueries, _cachedQueryEvictions;
     public long CachedQueryHits => Interlocked.Read(ref _cachedQueryHits);
     public long BoundaryQueries => Interlocked.Read(ref _boundaryQueries);
@@ -33,6 +34,16 @@ public sealed class PreparedRegionDistance
                 &&ring.Select(p=>(p.X,p.Y)).Distinct().Count()==4)
                 _rectangle=(left,bottom,right,top);
         }
+    }
+
+    // Only immutable geometry is shared. A bounded geometry worker owns this
+    // wrapper and its query memo exclusively, avoiding a common cache lock in
+    // millions of independent layer/stock queries.
+    internal PreparedRegionDistance CreateQueryWorker() => new(this);
+    private PreparedRegionDistance(PreparedRegionDistance source)
+    {
+        _boundary = source._boundary; _rectangle = source._rectangle;
+        _threadConfined = true;
     }
 
     /// <summary>Literal closest boundary site for a separate physical proof or
@@ -56,6 +67,13 @@ public sealed class PreparedRegionDistance
             (long)Math.Round(point.y * PathUtils.Scale));
         var key=(quantized.X,quantized.Y);
         if (_boundary.SegmentCount == 0) return double.NegativeInfinity;
+        if (_threadConfined)
+        {
+            if (_queries.TryGetValue(key, out double cached)) { _cachedQueryHits++; return cached; }
+            double distance = ComputeDistance(quantized);
+            RememberQuery(key, distance);
+            return distance;
+        }
         // The distance and sign depend only on this exact stored query coordinate.
         // Adaptive stock patches and repeated ramp laps revisit these coordinates.
         lock (_queryLock)
@@ -71,15 +89,20 @@ public sealed class PreparedRegionDistance
         {
             // An independent reader may have completed the same immutable query.
             if (_queries.ContainsKey(key)) return result;
-            if (_queries.Count >= MaximumCachedQueries)
-            {
-                _queries.Remove(_queryOrder.Dequeue());
-                Interlocked.Increment(ref _cachedQueryEvictions);
-            }
-            _queries.Add(key, result);
-            _queryOrder.Enqueue(key);
+            RememberQuery(key, result);
         }
         return result;
+    }
+
+    private void RememberQuery((long X,long Y) key, double result)
+    {
+        if (_queries.Count >= MaximumCachedQueries)
+        {
+            _queries.Remove(_queryOrder.Dequeue());
+            if (_threadConfined) _cachedQueryEvictions++;
+            else Interlocked.Increment(ref _cachedQueryEvictions);
+        }
+        _queries.Add(key, result); _queryOrder.Enqueue(key);
     }
 
     /// <summary>The same literal distance without a second cache. Callers such
@@ -94,7 +117,7 @@ public sealed class PreparedRegionDistance
 
     private double ComputeDistance(Point64 point)
     {
-        Interlocked.Increment(ref _boundaryQueries);
+        if (_threadConfined) _boundaryQueries++; else Interlocked.Increment(ref _boundaryQueries);
         if(_rectangle is { } box)
         {
             double x=point.X,y=point.Y;

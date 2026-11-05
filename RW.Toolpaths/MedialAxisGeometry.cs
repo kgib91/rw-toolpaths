@@ -23,7 +23,7 @@ public static partial class MedialAxisGeometry
         IMedialAxisProvider provider,
         double tolerance,
         double maxRadius,
-        double filteringAngle = 3 * Math.PI / 4,
+        double filteringAngle = Math.PI,
         CancellationToken cancellationToken = default,
         Action<string>? diagnostic = null,
         Action<double, string, bool>? progress = null,

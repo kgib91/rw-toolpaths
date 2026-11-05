@@ -5,6 +5,41 @@ namespace RW.Toolpaths.Tests;
 public sealed class CutterSweepStockTests
 {
     [Fact]
+    public void IncrementalExecutedRunsMatchColdWholeBodyProofWithoutRepeatedPrefixRebuilds()
+    {
+        var incremental=new CutterSweepStock(Profile,p=>p,0,default,mergeIncrementally:true);
+        var committed=new List<(Point3D A,Point3D B)>();
+        const int batches=256,chordsPerBatch=32;
+        for(int batch=0;batch<batches;batch++)
+        {
+            double y=batch*20;
+            Assert.False(incremental.ContainsTravel(new(0,y,-1),new(1,y,-1),.1));
+            for(int i=0;i<chordsPerBatch;i++)
+            {
+                var a=new Point3D(i,y,-4);var b=new Point3D(i+1,y,-4);
+                incremental.RecordExecuted(a,b);committed.Add((a,b));
+            }
+            incremental.Seal();
+            if((batch+1)%32!=0)continue;
+            var cold=new CutterSweepStock(Profile,p=>p,0,default);
+            foreach(var c in committed)cold.RecordExecuted(c.A,c.B);cold.Seal();
+            foreach(int lane in new[]{0,batch/2,batch})
+            foreach(double z in new[]{-1d,-4.01})
+            {
+                var a=new Point3D(4,lane*20,z);var b=new Point3D(8,lane*20,z);
+                Assert.Equal(cold.ContainsTravel(a,b,.1),incremental.ContainsTravel(a,b,.1));
+                Assert.Equal(cold.Contains(a,b,0),incremental.Contains(a,b,0));
+            }
+            Assert.False(incremental.ContainsTravel(new(4,y+10,-1),new(8,y+10,-1),.1));
+        }
+        Assert.True(incremental.ContainsTravel(new(4,0,-1),new(8,0,-1),.1));
+        Assert.Equal(batches*chordsPerBatch,incremental.Chords);
+        Assert.True(incremental.ReindexedChords<incremental.Chords*(1+Math.Log2(batches)));
+        Assert.InRange(incremental.MaximumBlocks,1,1+(int)Math.Log2(batches));
+        Console.WriteLine($"[Stock.PrefixRuns.Test] committed={incremental.Chords} reindexed={incremental.ReindexedChords} maximumBlocks={incremental.MaximumBlocks} coldProofsMatch=True futureLanesRefused=True");
+    }
+
+    [Fact]
     public void MedianIndexesMatchTheOriginalSortedStockAcrossCommittedAdditions()
     {
         var indexed=new CutterSweepStock(Profile,p=>p,0,default);

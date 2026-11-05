@@ -13,6 +13,11 @@ public static class ScanlinePocketToolpaths
         if (!double.IsFinite(options.StockToLeave))
             throw new ArgumentOutOfRangeException(nameof(options), "Pocket edge offset must be finite.");
         if (regions.Count == 0 || tool.Radius <= 0 || depth.Depth <= 0) return ToolpathPlan.Empty;
+        // Raster endpoints and the closing perimeter share the physical inset.
+        // Coarse display tolerances can chord through a protected island corner.
+        options = options with { Tolerances = options.Tolerances with {
+            ArcTolerance = Math.Min(options.Tolerances.ArcTolerance, MachiningAccuracy.ArtworkChord),
+            SimplifyTolerance = Math.Min(options.Tolerances.SimplifyTolerance, MachiningAccuracy.ArtworkChord) } };
         var access = options.BoundaryAccess?.Resolve(regions,tool,depth,options.SmoothRoughing,
             options.SmoothRampAngleDegrees,options.StockToLeave,cancellationToken);
         if(access!=null)
@@ -27,7 +32,8 @@ public static class ScanlinePocketToolpaths
         if (!double.IsFinite(pitch) || pitch <= 0) throw new ArgumentException("Scanline stepover must be positive.");
         Console.WriteLine($"[PocketToolpaths.EdgeOffset] mode=scanline toolRadius={tool.Radius:R} "
             + $"edgeOffset={options.StockToLeave:R} firstInset={tool.Radius + options.StockToLeave:R} "
-            + $"stepOver={pitch:R} regions={regions.Count}");
+            + $"stepOver={pitch:R} regions={regions.Count} arcTolerance={options.Tolerances.ArcTolerance:R} "
+            + $"simplifyTolerance={options.Tolerances.SimplifyTolerance:R}");
         double angle = angleDegrees * Math.PI / 180, cos = Math.Cos(angle), sin = Math.Sin(angle);
         PointD Rotate(PointD p) => new(p.x * cos + p.y * sin, -p.x * sin + p.y * cos);
         PointD World(PointD p) => new(p.x * cos - p.y * sin, p.x * sin + p.y * cos);
@@ -39,7 +45,7 @@ public static class ScanlinePocketToolpaths
         var boundary = access != null && !options.IndependentRasterEntries
             ? PocketToolpaths.Generate(regions,tool,depth,options with { BoundaryAccess=null,MaxRings=1,
                 InsideOut=false,SpiralChaining=false },cancellationToken)
-            : ProfileToolpaths.Generate(regions, tool, depth, new ProfileOptions {
+            : ProfileToolpaths.Generate(regions, tool, depth, new ProfileOptions { Motion=options.Motion,
             Side = ProfileSide.Inside, StockToLeave = options.StockToLeave, Ramp = options.Ramp,
             Tolerances = options.Tolerances, ClipBoundary = options.ClipBoundary,
             CalculateSweptArea = options.CalculateSweptArea }, cancellationToken);
@@ -90,12 +96,17 @@ public static class ScanlinePocketToolpaths
             }
             if (options.CalculateSweptArea)
                 planarRuns.AddRange(runs.Select(run => new List<PointD> { run.A, run.B }));
+            int firstRaster = paths.Count;
+            var rowBlocks = runs.Select(_ => new List<TaggedToolpath>()).ToArray();
             for (int pass = 0; pass < depth.PassCount; pass++)
             {
-            IEnumerable<(PointD A,PointD B)> passRuns=options.IndependentRasterEntries&&(pass&1)!=0
-                ? runs.AsEnumerable().Reverse().Select(r=>(A:r.B,B:r.A)):runs;
-            foreach (var run in passRuns)
+            bool reverse = options.IndependentRasterEntries && (pass & 1) != 0;
+            IEnumerable<int> passRows = reverse ? Enumerable.Range(0, runs.Count).Reverse()
+                : Enumerable.Range(0, runs.Count);
+            foreach (int row in passRows)
             {
+                var run = runs[row];
+                if (reverse) run = (run.B, run.A);
                 cancellationToken.ThrowIfCancellationRequested();
                 // Local open entries recut their ramped prefix and exit at the far endpoint.
                 RampedPath ramp;
@@ -108,16 +119,28 @@ public static class ScanlinePocketToolpaths
                 else
                     ramp=RampPlanner.PlanPathEntry(new Point3D[]{new(run.A.x,run.A.y,depth.PassBottomZ(pass)),
                         new(run.B.x,run.B.y,depth.PassBottomZ(pass))},depth.PassTopZ(pass),options.Ramp,cancellationToken);
-                paths.Add(new TaggedToolpath(ramp.Points, ramp.Spans, regionIndex, PocketToolpaths.Category,
-                    pass, paths.Count, detectCurves: false));
+                var path = new TaggedToolpath(ramp.Points, ramp.Spans, regionIndex, PocketToolpaths.Category,
+                    pass, paths.Count, detectCurves: false);
+                paths.Add(path);
+                rowBlocks[row].Add(path);
             }
+            }
+            if (options.IndependentRasterEntries && depth.PassCount > 1 && runs.Count > 1)
+            {
+                var carrier = boundary.Toolpaths.LastOrDefault(p => p.RegionIndex == regionIndex && p.Points.Count > 0);
+                var seed = carrier.Points is { Count: > 0 } ? carrier.Points[^1] : rowBlocks[0][0].Points[0];
+                var ordered = OrderRowBlocks(paths.Skip(firstRaster).ToArray(), rowBlocks, seed, depth.SurfaceZ,
+                    regionIndex, cancellationToken);
+                paths.RemoveRange(firstRaster, paths.Count - firstRaster);
+                paths.AddRange(ordered);
             }
         }
         Console.WriteLine($"[Pocket.Scanline] regions={regions.Count} rows={rows} passes={depth.PassCount} paths={paths.Count} pitch={pitch:R} angle={angleDegrees:R}");
         // Finish one source component before the next. The boundary carrier
         // supplies the same executed retrace network used by offset pocketing.
         paths = paths.Select((path,index) => (path,index)).OrderBy(p => p.path.RegionIndex)
-            .ThenBy(p => p.index < boundaryVisits ? 0 : 1).ThenBy(p => p.path.DepthPassIndex ?? 0)
+            .ThenBy(p => p.index < boundaryVisits ? 0 : 1)
+            .ThenBy(p => p.index < boundaryVisits || !options.IndependentRasterEntries ? p.path.DepthPassIndex ?? 0 : 0)
             .Select(p => p.path).ToList();
         if(access!=null) paths=access.Trim(paths,_=>tool.Radius,cancellationToken,surface:depth.SurfaceZ);
         double verifiedAllowance=options.StockToLeave;
@@ -131,9 +154,8 @@ public static class ScanlinePocketToolpaths
                 message=>Console.WriteLine($"[Pocket.Scanline] {message}"),"raster-final-cutter-trajectory");
             verifiedAllowance=Math.Max(0,options.StockToLeave-.006);
             Console.WriteLine($"[Pocket.Scanline.Allowance] authored={options.StockToLeave:R} minimumVerified={verifiedAllowance:R} "
-                +"maximumTrajectoryChangeMm=0.004 originalPhysicalWallsAndRampExclusionRequired=True finishingTargetChanged=False");
+                +$"maximumTrajectoryChangeMm=0.004 originalPhysicalWallsAndRampExclusionRequired=True finishingTargetChanged=False");
         }
-        if(!options.IndependentRasterEntries)
         {
         var sourceClearance = new PocketToolpaths.FillSourceClearance(regions,
             Math.Max(0,tool.Radius+options.StockToLeave), options.LinkClearance, options.ClipBoundary);
@@ -141,12 +163,12 @@ public static class ScanlinePocketToolpaths
             options.KnownEmptyBoundary,options.KnownEmptyFloor);
         paths = ToolpathContinuationPlanner.Reconnect(paths,"scanline-pocket",2*tool.Radius,
             cancellationToken,continuation.AllowsNewChord,removeSubsumedEntries:continuation.Supported,
-            recordExecuted:continuation.Record);
+            recordExecuted:continuation.Record,motion:options.Motion,surface:depth.SurfaceZ);
+        continuation.Report();
         sourceClearance.Report();
         }
-        else Console.WriteLine($"[Pocket.Scanline.LocalEntries] paths={paths.Count} rows={rows} "
-            +"wholeCutterAndAccessVerificationRequired=True safeRetractsBetweenVisits=True rowExit=far-end "
-            +"executedStockNetworkReconstruction=False previousLayerCredit=none newInterVisitCutLinks=0");
+        Console.WriteLine($"[Pocket.Scanline.LocalEntries] paths={paths.Count} rows={rows} "
+            +$"commonSourceContinuation=True fullCutterProofRequired=True unknownRetainsEntry=True");
         access?.Verify(paths,tool,depth,verifiedAllowance,cancellationToken);
         PocketProtection.Verify(paths, tool.Radius, depth.SurfaceZ,
             options.ProtectedBoundary, cancellationToken);
@@ -156,6 +178,44 @@ public static class ScanlinePocketToolpaths
         Console.WriteLine($"[Pocket.Scanline.SweptArea] calculateSweptArea={options.CalculateSweptArea} polygons={swept.Count}");
         return new ToolpathPlan(paths, swept, new ToolpathDiagnostics {
             PathCount = paths.Count, DepthPassCount = depth.PassCount, IslandCount = regions.Count });
+    }
+
+    private static IReadOnlyList<TaggedToolpath> OrderRowBlocks(IReadOnlyList<TaggedToolpath> original,
+        IReadOnlyList<List<TaggedToolpath>> blocks, Point3D seed, double surface, int region, CancellationToken token)
+    {
+        // Complete a row's existing stepdowns as one block. The next reversed
+        // entry starts at the literal preceding exit; no connector or stock
+        // credit is invented. Keep the perimeter and every directed source chord.
+        var visits = blocks.Select(b => new TaggedToolpath(new[] { b[0].Points[0], b[^1].Points[^1] },
+            Array.Empty<ToolpathSpan>(), region, "row-block", null, detectCurves: false)).ToArray();
+        var order = ToolpathVisitOrder.Order(visits, Enumerable.Repeat(false, visits.Length).ToArray(), seed, token);
+        var candidate = order.SelectMany(i => blocks[i]).ToArray();
+        (int Count, double Planar, double Up, double Down) Cost(IReadOnlyList<TaggedToolpath> paths)
+        {
+            var from = seed; int count = 0; double planar = 0, up = 0, down = 0;
+            foreach (var path in paths)
+            {
+                token.ThrowIfCancellationRequested(); var to = path.Points[0];
+                if (from != to)
+                {
+                    count++; planar += Math.Sqrt(Math.Pow(to.X-from.X,2)+Math.Pow(to.Y-from.Y,2));
+                    up += Math.Max(0,surface-from.Z); down += Math.Max(0,surface-to.Z);
+                }
+                from = path.Points[^1];
+            }
+            return (count,planar,up,down);
+        }
+        var before = Cost(original); var after = Cost(candidate);
+        // Componentwise dominance holds for any positive approach/retract/feed
+        // rates and any nonnegative safe clearance, without guessing machine feeds.
+        bool accept = after.Count <= before.Count && after.Planar <= before.Planar + 1e-8
+            && after.Up <= before.Up + 1e-8 && after.Down <= before.Down + 1e-8;
+        Console.WriteLine($"[Pocket.Scanline.RowBlocks] region={region} blocks={blocks.Count} accepted={accept} "
+            + $"beforeTransfers={before.Count} candidateTransfers={after.Count} beforePlanarMm={before.Planar:R} candidatePlanarMm={after.Planar:R} "
+            + $"beforeRetractToSurfaceMm={before.Up:R} candidateRetractToSurfaceMm={after.Up:R} "
+            + $"beforeApproachFromSurfaceMm={before.Down:R} candidateApproachFromSurfaceMm={after.Down:R} "
+            + $"owner=shared-actual-exit-spatial-order completeRowStepdowns=True directedSourcesUnchanged=True newCutLinks=0 componentwiseTransitionCostRequired=True");
+        return accept ? candidate : original;
     }
 
     private static List<(PointD A,PointD B)> RouteLocalRows(List<(PointD A,PointD B)> source,
@@ -184,7 +244,7 @@ public static class ScanlinePocketToolpaths
         double before=Travel(source),after=Travel(ordered);bool accept=after<=before;
         Console.WriteLine($"[Pocket.Scanline.RowRouting] region={region} rows={source.Count} beforeTransferMm={before:R} "
             +$"afterTransferMm={(accept?after:before):R} accepted={accept} maximumQuadraticRows=2048 "
-            +"actualRowExit=far-end interLayerOrder=reverse priorOrFutureStockCredit=none safeRetracts=True");
+            +$"actualRowExit=far-end interLayerOrder=reverse priorOrFutureStockCredit=none safeRetracts=True");
         return accept?ordered:source;
     }
 }

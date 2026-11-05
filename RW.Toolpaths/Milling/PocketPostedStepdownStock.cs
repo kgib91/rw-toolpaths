@@ -196,8 +196,7 @@ internal sealed class PocketPostedStepdownStock
 
         static bool Continuous(Point3D a, Point3D b) => MathF.Abs((float)a.X - (float)b.X) <= 1e-4f
             && MathF.Abs((float)a.Y - (float)b.Y) <= 1e-4f && MathF.Abs((float)a.Z - (float)b.Z) <= 1e-4f;
-        static bool PlanarBridge(Point3D a, Point3D b) => MathF.Abs((float)a.X - (float)b.X) > 1e-4f
-            || MathF.Abs((float)a.Y - (float)b.Y) > 1e-4f;
+        static bool PlanarBridge(Point3D a, Point3D b) => MillingTransitionPlanner.RequiresPlanarTraverse(a,b);
     }
 
     internal Proof Capture() => new(this, _recorded);

@@ -43,13 +43,71 @@ internal static class ToolpathContinuationComponents
     internal static List<TaggedToolpath> Assign(IReadOnlyList<TaggedToolpath> source,
         Func<Point3D,Point3D> firstLayer, Func<Point3D,Point3D,bool> allows,
         double distance,CancellationToken token,Action<string>? log=null,Point3D? start=null,
-        Func<Point3D,Point3D,bool>? candidateFilter=null,bool closeOpenStrokes=false)
+        Func<Point3D,Point3D,bool>? candidateFilter=null,bool closeOpenStrokes=false,
+        bool literalPortalsOnly=false,IReadOnlyList<Edge>? nominatedPortals=null)
     {
         var parent=Enumerable.Range(0,source.Count).ToArray();
         var grid=new Dictionary<(long,long),List<Portal>>();
         var edges=new List<Edge>();
-        int proofs=0,joins=0,cyclePortals=0; bool bounded=false;
-        for(int owner=0;owner<source.Count;owner++)
+        int proofs=0,joins=0,cyclePortals=0,nominatedAccepted=0,nominatedRefused=0,nominatedDuplicates=0; bool bounded=false;
+        if(nominatedPortals is {Count:>0})
+        {
+            // Preserve source-owned inserted portals across coarse candidate
+            // sampling. Ownership and the original physical/grade proof remain
+            // required; a nominated edge is never executed-stock authority.
+            var vertices=new Dictionary<int,HashSet<Point3D>>();
+            var seenEdges=new HashSet<(Portal,Portal)>();
+            bool Owns(Portal p)
+            {
+                if(p.Owner<0||p.Owner>=source.Count)return false;
+                if(!vertices.TryGetValue(p.Owner,out var points))
+                    vertices[p.Owner]=points=source[p.Owner].Points.Select(firstLayer).ToHashSet();
+                return points.Contains(p.Point);
+            }
+            foreach(var edge in nominatedPortals.Distinct())
+            {
+                token.ThrowIfCancellationRequested();var a=edge.A;var b=edge.B;
+                if(!seenEdges.Add((a,b))){nominatedDuplicates++;continue;}seenEdges.Add((b,a));
+                if(a.Owner==b.Owner||!Owns(a)||!Owns(b)
+                    ||source[a.Owner].RegionIndex!=source[b.Owner].RegionIndex
+                    ||ToolpathContinuationPlanner.Distance(a.Point,b.Point)>distance
+                    ||candidateFilter is not null&&!candidateFilter(a.Point,b.Point))
+                {nominatedRefused++;continue;}
+                if(++proofs>50_000){bounded=true;break;}
+                if(a.Point!=b.Point&&!allows(a.Point,b.Point)){nominatedRefused++;continue;}
+                edges.Add(edge);nominatedAccepted++;
+                int first=Find(a.Owner),second=Find(b.Owner);
+                if(first!=second){parent[second]=first;joins++;}else cyclePortals++;
+            }
+        }
+        if(literalPortalsOnly)
+        {
+            // Known source junctions are topology, not proximity nominations.
+            // Retain every shared literal vertex, including a second portal
+            // between already-connected owners. A connectivity forest alone
+            // loses that second portal and can force a whole branch replay.
+            var vertices=new Dictionary<(int Region,Point3D Point),Portal>();long visited=0;
+            for(int owner=0;owner<source.Count&&!bounded;owner++)
+            {
+                var ownSeen=new HashSet<Point3D>();
+                foreach(var original in source[owner].Points)
+                {
+                    if((++visited&1023)==0)token.ThrowIfCancellationRequested();
+                    if(visited>2_000_000||edges.Count>=2_000_000){bounded=true;break;}
+                    var point=firstLayer(original);if(!ownSeen.Add(point))continue;
+                    var portal=new Portal(owner,point);
+                    var key=(source[owner].RegionIndex,point);
+                    if(!vertices.TryGetValue(key,out var previous)){vertices.Add(key,portal);continue;}
+                    edges.Add(new(previous,portal));
+                    int a=Find(previous.Owner),b=Find(owner);
+                    if(a!=b){parent[b]=a;joins++;}else cyclePortals++;
+                }
+                token.ThrowIfCancellationRequested();
+            }
+        }
+        if(!literalPortalsOnly)
+        {
+        for(int owner=0;owner<source.Count&&!bounded;owner++)
         {
             token.ThrowIfCancellationRequested();
             var portals=new List<Point3D>();
@@ -69,8 +127,9 @@ internal static class ToolpathContinuationComponents
                 for(long y=cell.Item2-1;y<=cell.Item2+1;y++)
                 {
                     if(!grid.TryGetValue((x,y),out var found))continue;
-                    foreach(var previous in found)
+                    foreach(var previous in found.TakeLast(256))
                     {
+                        if(source[previous.Owner].RegionIndex!=source[owner].RegionIndex)continue;
                         int root=Find(previous.Owner);
                         if(root==Find(owner))continue;
                         double length=ToolpathContinuationPlanner.Distance(previous.Point,point);
@@ -143,6 +202,7 @@ internal static class ToolpathContinuationComponents
                 }
             }
         }
+        }
         var ids=new Dictionary<int,int>();
         var plan=new Plan(edges,source,token);
         var result=new List<TaggedToolpath>(source.Count);
@@ -163,7 +223,8 @@ internal static class ToolpathContinuationComponents
         for(int i=0;i<result.Count;i++)result[i]=result[i] with{ContinuationComponentIndex=ranks[result[i].ContinuationComponentIndex!.Value]};
         log?.Invoke($"stage=continuation-components event=complete sourceVisits={source.Count} components={ids.Count} "
             +$"certifiedJoins={joins} cyclePortals={cyclePortals} chordProofs={proofs} budgetReached={bounded} "
-            +"sourceVerticesOnly=True futureStockCredit=False order=component-before-depth unknownSeparate=True");
+            +$"nominatedPortals={nominatedPortals?.Count??0} nominatedAccepted={nominatedAccepted} nominatedRefused={nominatedRefused} nominatedDuplicates={nominatedDuplicates} "
+            +$"literalPortalsOnly={literalPortalsOnly} sourceVerticesOnly=True futureStockCredit=False order=component-before-depth unknownSeparate=True");
         return result;
         int Find(int index){while(parent[index]!=index){parent[index]=parent[parent[index]];index=parent[index];}return index;}
         (long,long) Cell(Point3D p)=>((long)Math.Floor(p.X/distance),(long)Math.Floor(p.Y/distance));

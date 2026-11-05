@@ -101,6 +101,19 @@ public sealed class RampedPath
 /// </summary>
 public static class RampPlanner
 {
+    // Consume the configured descent on the XY connector; PlanPathEntry then
+    // completes any remaining drop along the next source without a plunge.
+    internal static Point3D PlanTransitionEntry(Point3D from, Point3D target, RampSettings settings)
+    {
+        double dx=target.X-from.X,dy=target.Y-from.Y;
+        double distance=Math.Sqrt(dx*dx+dy*dy),requestedDrop=from.Z-target.Z;
+        double drop=settings.Strategy==RampStrategy.Plunge || settings.AngleRadians<=0
+            || distance<=1e-9 || requestedDrop<=1e-9 ? 0
+            : Math.Min(requestedDrop,distance*Math.Tan(settings.AngleRadians));
+        double entryZ=Math.Max(target.Z,from.Z-drop);
+        return entryZ<=target.Z+1e-9 ? target : target with{Z=entryZ};
+    }
+
     /// <summary>
     /// Enters an existing cutting polyline from above without descending faster than
     /// the configured ramp angle or below any original cutting chord. The ramp lands
@@ -132,7 +145,8 @@ public static class RampPlanner
         CancellationToken cancellationToken,
         Action<string>? diagnostic,
         bool landAtSourceVertex,
-        bool preserveClosedExit)
+        bool preserveClosedExit,
+        bool preserveOpenExit = true)
     {
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(settings);
@@ -159,7 +173,7 @@ public static class RampPlanner
             if ((i & 1023) == 0) cancellationToken.ThrowIfCancellationRequested();
             length += PlanarDistance(path[i - 1], path[i]);
             if (path[i - 1] != path[i]) distinctSourceEdges++;
-            if (closed && !partialAxisFallback)
+            if (!partialAxisFallback)
                 partialAxisFallback = RequiresLegacyClosedTail(path[i - 1], path[i]);
         }
         if (length <= 1e-9)
@@ -200,7 +214,7 @@ public static class RampPlanner
                     : gapStart <= 1e-9 ? 0 : Math.Clamp(gapStart / (gapStart - gapEnd), 0, 1);
                 Point3D contact = landAtSourceVertex ? to : new Point3D(from.X + (to.X - from.X) * t,
                     from.Y + (to.Y - from.Y) * t, from.Z + (to.Z - from.Z) * t);
-                if (closed && !partialAxisFallback)
+                if (!partialAxisFallback)
                     partialAxisFallback = RequiresLegacyClosedTail(points[^1], contact);
                 points.Add(contact);
                 travelled += distance * t;
@@ -211,7 +225,7 @@ public static class RampPlanner
             if (distance > 1e-12)
             {
                 var rampPoint = new Point3D(to.X, to.Y, nextZ);
-                if (closed && !partialAxisFallback)
+                if (!partialAxisFallback)
                     partialAxisFallback = RequiresLegacyClosedTail(points[^1], rampPoint);
                 points.Add(rampPoint);
             }
@@ -272,12 +286,21 @@ public static class RampPlanner
         }
         else
         {
-            // An open path has no permissible closing chord. Return along its
-            // exact prefix before recutting the complete original directed trace.
+            // Return beneath the entry ramp. If contact reached the far end,
+            // that return completes the whole source; no forward replay is needed.
             for (int i = contactSegment; i >= 0; i--)
                 AppendDistinct(points, path[i]);
-            foreach (Point3D point in path)
-                AppendDistinct(points, point);
+            // A branch may revisit its terminal XYZ before its terminal ordinal.
+            // Contact there has not covered the intervening excursion. Only an
+            // actual end-of-source contact permits omitting the forward replay.
+            if(preserveOpenExit||partialAxisFallback||fromIndex!=path.Count-1||points[cutStart]!=path[^1])
+                foreach (Point3D point in path) AppendDistinct(points, point);
+            else
+            {
+                redundantPointsRemoved=distinctSourceEdges;
+                redundantCutTravelRemoved=Enumerable.Range(1,path.Count-1)
+                    .Sum(i=>ToolpathContinuationPlanner.Distance(path[i-1],path[i]));
+            }
         }
         var spans = new List<ToolpathSpan>
         {
@@ -292,7 +315,7 @@ public static class RampPlanner
             $"cutCycleClosed={closed && points[cutStart] == points[^1]} cutMoves={points.Count - cutStart - 1} " +
             $"redundantCutTravelRemoved={redundantCutTravelRemoved:R} " +
             $"finalExit=({points[^1].X:R},{points[^1].Y:R},{points[^1].Z:R}) " +
-            $"localTargetContact=True sourceVertexContact={landAtSourceVertex} originalCutTracePreserved=True");
+            $"localTargetContact=True contactSourceIndex={fromIndex} sourceVertexContact={landAtSourceVertex} originalCutTracePreserved=True");
         return new RampedPath(points, spans,
             closed && traversals > 0 ? RampStrategy.Helical : RampStrategy.Linear,
             closed ? traversals : 0, redundantPointsRemoved, redundantCutTravelRemoved, partialAxisFallback);

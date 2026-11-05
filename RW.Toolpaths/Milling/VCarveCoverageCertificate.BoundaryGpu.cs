@@ -11,7 +11,8 @@ internal static partial class VCarveCoverageCertificate
         // order. The provider independently validates the entire BVH snapshot.
         // Integer queries and device distances only choose a candidate edge.
         internal bool TryCreateBoundaryGpu(Action<string>? diagnostic,
-            out VCarveGpuDiscWitnessContext.BoundarySampleContext? context, out string reason)
+            out VCarveGpuDiscWitnessContext.BoundarySampleContext? context, out string reason,
+            VCarveGenerationPolicy? policy = null)
         {
             context = null;
             reason = "boundary-grid-domain";
@@ -37,6 +38,7 @@ internal static partial class VCarveCoverageCertificate
                     leaf ? n.First : 0, leaf ? n.Count : 0, n.Left, n.Right);
             }
             return VCarveGpuDiscWitnessContext.BoundarySampleContext.TryCreate(segments, nodes,
+                GpuBoundaryWorkLimits.Default, (policy ?? VCarveGenerationPolicy.Capture()).GpuBoundaryFp32,
                 _work.Cancellation, diagnostic, out context, out reason);
 
             static bool Exact(double coordinate, out long integer)

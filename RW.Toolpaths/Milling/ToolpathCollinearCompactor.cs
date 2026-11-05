@@ -78,7 +78,7 @@ internal static class ToolpathCollinearCompactor
         return new TaggedToolpath(points, spans, path.RegionIndex, path.Category,
             path.DepthPassIndex, path.VisitIdentity, detectCurves: false)
             {ContinuationComponentIndex=path.ContinuationComponentIndex,ContinuationPlan=path.ContinuationPlan,
-                ContinuationSourceOrdinal=path.ContinuationSourceOrdinal};
+                ContinuationSourceOrdinal=path.ContinuationSourceOrdinal,ConcentricSource=path.ConcentricSource};
     }
 
     private static bool NativeBetween(Point3D a, Point3D b, Point3D c)

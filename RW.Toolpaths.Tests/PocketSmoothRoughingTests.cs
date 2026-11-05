@@ -98,8 +98,14 @@ public sealed class PocketSmoothRoughingTests
         var plan = VCarveToolpaths.Generate(regions, tool, depth, options, BoostVoronoiProvider.CreateDefault());
         Assert.NotEmpty(plan.Toolpaths);
         Assert.Contains(plan.Toolpaths, path => path.Category == "clearing" && path.DepthPassIndex == 0);
-        Assert.All(plan.Toolpaths.Where(path => path.Category == "clearing" && path.DepthPassIndex == 0)
-            .SelectMany(path => path.Points), point => Assert.True(-point.Z <= stepdown + .0005));
+        var firstLayerCuts=plan.Toolpaths.Where(path => path.Category == "clearing" && path.DepthPassIndex == 0)
+            .SelectMany(path => path.Spans.Where(s=>s.Kind is ToolpathSpanKind.Cut or ToolpathSpanKind.Ramp)
+                .SelectMany(s=>path.Points.Skip(s.StartIndex).Take(s.PointCount))).ToArray();
+        Assert.NotEmpty(firstLayerCuts);
+        // Proved links/retraces may visit deeper stock already cut by an
+        // earlier completed ring; fresh first-layer cutting retains its cap.
+        Assert.All(firstLayerCuts,
+            point => Assert.True(-point.Z <= stepdown + .0005,$"Fresh first-layer cut exceeds {stepdown:R}: {point}"));
         Assert.Equal(2, depth.StartDepth);
         Assert.Equal(2, depth.SkipDepthPasses);
         Assert.False(options.IncludeInteriorFill);

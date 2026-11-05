@@ -4,8 +4,24 @@ using RW.Toolpaths.Geometry;
 namespace RW.Toolpaths.Milling;
 
 /// <summary>Orders independent visits without changing their cutting chords or depth schedule.</summary>
-internal static class VCarvePathRouter
+internal static partial class VCarvePathRouter
 {
+    // Read-only per-execution capture of the actual protected routing request.
+    // Diagnostic observers may retain it for bounded, fixed-source comparisons;
+    // no caller-supplied route or clearance result enters production generation.
+    internal sealed record Request(IReadOnlyList<TaggedToolpath> Paths,
+        IReadOnlyList<IReadOnlyList<PointD>> Boundary, ToolGeometry Tool, DepthSchedule Depth,
+        VCarveOptions Options, double EdgeFillWidth, Point3D? Start,
+        Func<Point3D, Point3D, bool>? CutGuard, Func<Point3D, double>? EntryHeight);
+    internal static readonly AsyncLocal<Action<Request>?> Observer = new();
+    // Controlled same-source routing comparisons in friend diagnostics/tests.
+    // This can select the legacy heuristic; it grants no geometry/stock proof.
+    internal static readonly AsyncLocal<bool?> ConnectionOptimizationOverride = new();
+    internal static readonly AsyncLocal<bool?> CutRetraceOptimizationOverride = new();
+    internal static readonly AsyncLocal<bool?> AirRampFeedOptimizationOverride = new();
+    // Opt-in ordering of complete nonconcentric clearing sources. Ring jobs
+    // retain their constructor order; typed fixed-seam tours retain legacy.
+    internal static readonly AsyncLocal<bool?> SpatialIndependentSourcesOverride = new();
     private const double LinkBoundaryTolerance = .001;
     internal static List<TaggedToolpath> OrderRegions(List<TaggedToolpath> paths,CancellationToken token,Action<string>? log)
     {
@@ -21,9 +37,17 @@ internal static class VCarvePathRouter
             Array.Empty<ToolpathSpan>(),0,"region-transfer",null,detectCurves:false)).ToArray();
         var order=ToolpathVisitOrder.Order(visits,Enumerable.Repeat(false,visits.Length).ToArray(),null,token);
         double before=TransferDistance(visits,null),after=TransferDistance(order.Select(i=>visits[i]),null);
-        bool accepted=after<before-1e-6;
+        int unanchoredFastEntries=0;
+        for(int i=1;i<order.Length;i++){
+            var block=blocks[order[i]];
+            if(!block.Any(p=>p.Spans.Any(s=>s.Kind==ToolpathSpanKind.ClearedTravel)))continue;
+            var from=blocks[order[i-1]][^1].Points[^1];var to=block[0].Points[0];
+            if(!MillingTransitionPlanner.RequiresPlanarTraverse(from,to)
+                &&((float)from.X!=(float)to.X||(float)from.Y!=(float)to.Y))unanchoredFastEntries++;
+        }
+        bool accepted=after<before-1e-6&&unanchoredFastEntries==0;
         log?.Invoke($"stage=region-travel blocks={blocks.Count} beforeTransfer={before:R} afterTransfer={(accepted?after:before):R} "
-            +$"accepted={accepted} completeRegionBlocks=True literalCutRampAndReturnTracesPreserved=True");
+            +$"accepted={accepted} unanchoredFastEntries={unanchoredFastEntries} completeRegionBlocks=True literalCutRampAndReturnTracesPreserved=True");
         if(!accepted)return paths;
         return order.SelectMany(i=>blocks[i]).Select((p,i)=>p with{VisitIdentity=i}).ToList();
     }
@@ -40,45 +64,68 @@ internal static class VCarvePathRouter
         Func<Point3D, Point3D, bool>? continuationCutGuard = null,
         Func<Point3D, double>? materialEntryHeight = null)
     {
-        if(options.SmoothVCarving && continuationCutGuard is not null && paths.Count>0
-            && paths.All(p=>p.ContinuationCircuitDefinition is not null))
+        if (Observer.Value is { } observer)
+            observer(new(paths, boundary, tool, depth, options, localEdgeFillWidth, start,
+                continuationCutGuard, materialEntryHeight));
+        if(options.SmoothVCarving&&continuationCutGuard is not null&&paths.Any(p=>p.ConcentricSource is not null)
+            &&paths.All(p=>p.RegionIndex==paths[0].RegionIndex))
         {
-            var profile=VCarvePhysicalSweep.ProfileFor(tool,depth.Depth);
-            double step=depth.DepthPerPass>0 ? depth.DepthPerPass : depth.Depth;
-            // A small positive engagement preserves actual cutter-accessible
-            // topology. This is a transit construction scale, not a visual
-            // omission tolerance or a relaxation of the authored stepdown.
-            double transit=Math.Min(step,VCarveCommandRounding.CommandIncrement);
-            bool Allows(Point3D a,Point3D b)=>continuationCutGuard(a with{Z=a.Z-depth.SurfaceZ},b with{Z=b.Z-depth.SurfaceZ});
-            var ramp=options.Ramp with{Strategy=RampStrategy.Linear,
-                AngleRadians=Math.Min(options.Ramp.AngleRadians>0 ? options.Ramp.AngleRadians : double.PositiveInfinity,
-                    options.SmoothRampAngleDegrees*Math.PI/180)};
-            Point3D Command(Point3D p)=>new(VCarveCommandRounding.Round((float)p.X),VCarveCommandRounding.Round((float)p.Y),
-                VCarveCommandRounding.Round((float)p.Z-(float)depth.SurfaceZ));
-            var completedStock=new CompletedCircuitStock(paths,profile,Command,cancellationToken);
-            bool ClearedCarrier(int owner,Point3D a,Point3D b)=>options.CompactCollinearCommands
-                && completedStock.ContainsRaisedChord(owner,a,b,.1);
-            var executed=ToolpathCircuitExecutor.Execute(paths,transit,Math.Max(.1,2*options.StepOver*profile.ClearingDiameter),
-                depth,ramp,VCarveToolpaths.FreshStockLayers(paths,depth,cancellationToken,depth.SurfaceZ),Allows,cancellationToken,diagnostic,
-                Math.Tan(options.SmoothRampAngleDegrees*Math.PI/180),ClearedCarrier,start);
-            diagnostic?.Invoke($"stage=completed-circuit-stock event=complete queries={completedStock.Queries} accepted={completedStock.Accepted} "
-                +$"indexedCircuits={completedStock.IndexedCircuits} positiveClearanceMm=0.1 fullInscribedCylinder=True lazySourceChordIndex=True");
-            return executed;
+            var previousSweep=VCarveRingOrder.SpatialSweepOverride.Value;
+            var previousMixed=VCarveRingRouter.SpatialMixedSourcesOverride.Value;
+            var previousIndependent=SpatialIndependentSourcesOverride.Value;
+            var automatic=previousSweep is null?AutomaticSpatialSweep(paths,depth,options,cancellationToken):null;
+            try{
+                if(automatic is not null){
+                    VCarveRingOrder.SpatialSweepOverride.Value=automatic;
+                    VCarveRingRouter.SpatialMixedSourcesOverride.Value=previousMixed??true;
+                    SpatialIndependentSourcesOverride.Value=previousIndependent??true;
+                    diagnostic?.Invoke($"stage=spatial-routing-policy event=selected owner=automatic-large-single-pass-region axis={automatic.Axis} windowMm={automatic.WindowMm:R} "
+                        +"scope=complete-source-region sourceSplitting=False configuredDepthDirectionUnchanged=True geometricOrTravelAuthority=False");
+                }
+                return VCarveRingRouter.Route(paths,tool,depth,options,start,continuationCutGuard,materialEntryHeight,
+                    cancellationToken,diagnostic,(other,cursor)=>RouteCore(other,boundary,tool,depth,options,
+                        localEdgeFillWidth,cursor,cancellationToken,diagnostic,continuationCutGuard,materialEntryHeight));
+            }finally{
+                VCarveRingOrder.SpatialSweepOverride.Value=previousSweep;
+                VCarveRingRouter.SpatialMixedSourcesOverride.Value=previousMixed;
+                SpatialIndependentSourcesOverride.Value=previousIndependent;
+            }
         }
-        if (options.SmoothVCarving && paths.Count > 0 && paths.All(p => p.ContinuationCircuit))
-            return RouteCircuits(paths, depth, options, cancellationToken, diagnostic);
+        return RouteCore(paths,boundary,tool,depth,options,localEdgeFillWidth,start,cancellationToken,diagnostic,
+            continuationCutGuard,materialEntryHeight);
+    }
+    private static List<TaggedToolpath> RouteCore(IReadOnlyList<TaggedToolpath> paths,
+        IReadOnlyList<IReadOnlyList<PointD>> boundary,ToolGeometry tool,DepthSchedule depth,VCarveOptions options,
+        double localEdgeFillWidth,Point3D? start,CancellationToken cancellationToken,Action<string>? diagnostic,
+        Func<Point3D,Point3D,bool>? continuationCutGuard,Func<Point3D,double>? materialEntryHeight)
+    {
+        bool branchFinishing=!options.SmoothVCarving&&!options.DetectCurves&&options.Motion is not null
+            &&continuationCutGuard is not null&&materialEntryHeight is not null
+            &&depth.StartDepth>=depth.Depth&&depth.Depth>0;
+        if(branchFinishing)paths=paths.Select((p,i)=>p with{ContinuationSourceOrdinal=i}).ToArray();
         var result = new List<TaggedToolpath>(paths.Count);
+        var motionCost=options.Motion is null?null:new ToolpathMotionCost(options.Motion,depth.SurfaceZ);
+        int entryCostRefusals=0;double entryCostSaving=0;
         PolygonOps.BoundarySegmentIndex? sourceBoundary = null;
-        // Source seams define the legacy order, orientation, and entry decisions.
-        // A shortened closed tail changes only the physical exit used by emission.
+        // Ordinary routing retains its legacy seam cursor. Smooth routing uses
+        // the literal completed exit for following entries and connections.
         Point3D? routingPrevious = start;
         Point3D? actualPrevious = start;
-        var continuation = options.SmoothVCarving && (continuationCutGuard is not null || options.RoughingRestChords.Count>0)
-            ? new VCarveContinuationAdapter(tool, depth, options, continuationCutGuard, cancellationToken, diagnostic,paths) : null;
+        VCarveContinuationAdapter? continuation=null;
         for (int first = 0; first < paths.Count;)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var representative = paths[first];
+            if(options.SmoothVCarving && continuationCutGuard is not null && (first==0
+                || paths[first-1].RegionIndex!=representative.RegionIndex
+                || paths[first-1].ContinuationComponentIndex!=representative.ContinuationComponentIndex))
+            {
+                continuation?.Report();
+                var family=paths.Skip(first).TakeWhile(p=>p.RegionIndex==representative.RegionIndex
+                    &&p.ContinuationComponentIndex==representative.ContinuationComponentIndex).ToArray();
+                continuation=new(tool,depth,options,continuationCutGuard,cancellationToken,diagnostic,family);
+                if(result.Count>0)continuation.Record(result[^1]);
+            }
             int end = first + 1;
             while (end < paths.Count && paths[end].RegionIndex == representative.RegionIndex
                 && paths[end].Category == representative.Category
@@ -86,28 +133,36 @@ internal static class VCarvePathRouter
                 && paths[end].DepthPassIndex == representative.DepthPassIndex)
                 end++;
             var group = paths.Skip(first).Take(end - first).ToArray();
+            bool fixedTypedCircuit=group.Any(path=>(path.ContinuationCircuitDefinition is not null||path.ContinuationCircuit)
+                &&!CanChangeStart(path));
+            bool independentClearingOrder=SpatialIndependentSourcesOverride.Value==true&&options.SmoothVCarving
+                &&representative.Category=="clearing"&&group.All(path=>path.ConcentricSource is null)&&!fixedTypedCircuit;
             bool[] movable = group.Select(path => CanChangeStart(path)
-                || continuation is not null && path.Points.Count >= 2 && Closed(path)
+                || options.SmoothVCarving && path.Points.Count >= 2 && Closed(path)
                     && path.Spans.All(span => span.Kind == ToolpathSpanKind.Cut)).ToArray();
             var samples = group.Select((path, index) => RoutingSamples(path, movable[index])).ToArray();
-            var incoming=continuation is not null ? actualPrevious : routingPrevious;
+            var incoming=options.SmoothVCarving ? actualPrevious : routingPrevious;
             // Large stroke sets use the spatial directed candidate below; an
             // all-pairs tour plus repeated local search is unnecessary there.
-            int[] order = group.Length <= 128 ? TravelOptimizer.Order(samples,
+            bool keepOffsetOrder = options.SmoothVCarving && representative.Category == "clearing"&&!independentClearingOrder;
+            int[] order = !keepOffsetOrder && group.Length <= 128 ? TravelOptimizer.Order(samples,
                 incoming is { } p ? new PointD(p.X, p.Y) : null,
                 label: $"vcarve-paths region={representative.RegionIndex} category={representative.Category} depth={representative.DepthPassIndex}",
                 cancellationToken: cancellationToken) : Enumerable.Range(0,group.Length).ToArray();
             var routed = Orient(group, movable, order, incoming, cancellationToken);
             double before = TransferDistance(group, incoming);
             double after = TransferDistance(routed, incoming);
-            var directed = Orient(group, movable, ToolpathVisitOrder.Order(group,movable,incoming,cancellationToken),
-                incoming,cancellationToken);
-            double directedDistance=TransferDistance(directed,incoming);
-            if(directedDistance<after){routed=directed;after=directedDistance;}
+            if (!keepOffsetOrder)
+            {
+                var directed = Orient(group, movable, ToolpathVisitOrder.Order(group,movable,incoming,cancellationToken),
+                    incoming,cancellationToken);
+                double directedDistance=TransferDistance(directed,incoming);
+                if(directedDistance<after){routed=directed;after=directedDistance;}
+            }
             // Closest-approach TSP is an approximation for open paths with fixed exits.
             // Keep the original order if its realized travel is better, while still
             // considering safe seam changes in that order.
-            if (after > before + 1e-6)
+            if (!keepOffsetOrder && after > before + 1e-6)
             {
                 routed = Orient(group, movable, Enumerable.Range(0, group.Length), incoming, cancellationToken);
                 after = TransferDistance(routed, incoming);
@@ -151,8 +206,9 @@ internal static class VCarvePathRouter
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var path = routed[visit];
-                bool linkedAtDepth = (continuation is not null ? actualPrevious : routingPrevious) == path.Points[0];
-                ToolpathContinuationPlanner.Connection? continued = null;
+                var independentSource=path;
+                bool linkedAtDepth = (options.SmoothVCarving?actualPrevious:routingPrevious) == path.Points[0];
+                ToolpathContinuationPlanner.Connection? continued=null;
                 if (!linkedAtDepth && actualPrevious == path.Points[0])
                     physicalCoincidenceWithoutLegacyContinuation++;
                 if (priorInGroup is { } prior && pitch > 0)
@@ -193,21 +249,50 @@ internal static class VCarvePathRouter
                 }
                 if ((options.SmoothVCarving || depth.StartDepth > 0 || depth.SkipDepthPasses > 0) && !linkedAtDepth)
                 {
-                    if (continuation is not null && actualPrevious is { } previousExit)
-                        continued = continuation.Connect(previousExit, ref path);
-                    if (continuation is not null && continued is null)
-                        continuation.Reentry(actualPrevious, path.Points[0]);
+                    RampedPath? baselineEntry=null;TaggedToolpath? independentEntry=null;
+                    if(continuation is not null && motionCost is not null)
+                    {
+                        double baselineZ=materialEntryHeight is null ? depth.SurfaceZ : Math.Max(path.Points[0].Z,materialEntryHeight(path.Points[0]));
+                        try
+                        {
+                            baselineEntry=RampPlanner.PlanPathEntry(path.Points,baselineZ,
+                                options.Ramp with{AngleRadians=Math.Min(options.Ramp.AngleRadians>0?options.Ramp.AngleRadians:double.PositiveInfinity,
+                                    options.SmoothRampAngleDegrees*Math.PI/180),Strategy=RampStrategy.Linear},cancellationToken,null,
+                                landAtSourceVertex:true,preserveClosedExit:false,preserveOpenExit:false);
+                            independentEntry=new TaggedToolpath(baselineEntry.Points,baselineEntry.Spans,path.RegionIndex,path.Category,
+                                path.DepthPassIndex,path.VisitIdentity,options.DetectCurves)
+                                {ContinuationComponentIndex=path.ContinuationComponentIndex,ContinuationPlan=path.ContinuationPlan,
+                                    ContinuationSourceOrdinal=path.ContinuationSourceOrdinal};
+                        }
+                        catch(InvalidOperationException error)
+                        {
+                            // An unavailable independent entry cannot disqualify
+                            // a separately proved continuation. If that also fails,
+                            // normal entry construction below retains its error.
+                            diagnostic?.Invoke($"stage=entry-cost alternative=unavailable reason={error.Message} provedContinuationStillRequired=True");
+                        }
+                    }
+                    if(continuation is not null && actualPrevious is { } from)
+                        continued=continuation.Connect(from,ref path,independentEntry);
+                    if(continuation is not null && continued is null)continuation.Reentry(actualPrevious,path.Points[0]);
                     // The cleared starting floor changes entry, not the physical
                     // stock/cutter geometry. Shallow detail above this floor must
                     // start at its own target height rather than plunge below it.
-                    // Smooth visits explicitly carry their complete descent from
-                    // the stock surface. This also keeps the downstream emitter's
-                    // vertical approach out of material, independently of the
-                    // authored starting-floor declaration or stock pruning.
-                    double entryZ = continued is not null ? continued.Points[^1].Z : options.SmoothVCarving ? depth.SurfaceZ
+                    // With prior-removal evidence, cutting entry uses certified local contact.
+                    // Otherwise original stock top remains the datum. Safe transfer/retract
+                    // clearance is owned independently by the downstream emitter.
+                    double entryZ = continued is not null?continued.Points[^1].Z:materialEntryHeight is not null ? Math.Max(path.Points[0].Z,materialEntryHeight(path.Points[0])) : options.SmoothVCarving ? depth.SurfaceZ
                         : Math.Max(depth.PassTopZ(0), path.Points[0].Z);
-                    if (materialEntryHeight is not null && continued is null)
-                        entryZ = Math.Max(entryZ, materialEntryHeight(path.Points[0]));
+                    if (materialEntryHeight is not null)
+                    {
+                        double required=materialEntryHeight(path.Points[0]);
+                        if(continued is not null&&required>entryZ)
+                        {
+                            diagnostic?.Invoke("stage=continuation event=reentry owner=vcarve reason=material-entry-height sourceEntryRetained=True");
+                            continued=null;path=independentSource;entryZ=Math.Max(path.Points[0].Z,required);
+                        }
+                        entryZ=Math.Max(entryZ,required);
+                    }
                     var entryRamp = options.SmoothVCarving
                         ? options.Ramp with
                         {
@@ -217,20 +302,19 @@ internal static class VCarvePathRouter
                             Strategy = RampStrategy.Linear,
                         }
                         : options.Ramp;
-                    bool reductionEnabled = options.CompactCollinearCommands && pitch <= 0;
+                    bool reductionEnabled = options.SmoothVCarving || options.CompactCollinearCommands && pitch <= 0;
                     bool closedSource = path.Points.Count > 1 && Closed(path);
-                    // A final group exit feeds the next group's order/orientation,
-                    // and the final region exit feeds VCarveToolpaths' next region.
-                    // Retain that seam rather than invent a new routing contract.
-                    bool groupBoundaryGuard = continuation is null && closedSource
+                    // Ordinary routing still has consumers of its original seam.
+                    // Smooth continuation and following groups use the actual exit.
+                    bool groupBoundaryGuard = !options.SmoothVCarving && closedSource
                         && (visit == routed.Count - 1 || visit == finalMultiPointVisit);
                     // The legacy continuation had no surface entry. Shortening
                     // its predecessor would add a different at-depth approach.
-                    bool continuationGuard = continuation is null && closedSource && visit + 1 < routed.Count
+                    bool continuationGuard = !options.SmoothVCarving && closedSource && visit + 1 < routed.Count
                         && path.Points[^1] == routed[visit + 1].Points[0];
                     if (reductionEnabled && groupBoundaryGuard) groupBoundaryExitGuards++;
                     if (reductionEnabled && continuationGuard) legacyContinuationExitGuards++;
-                    var entry = RampPlanner.PlanPathEntry(path.Points, entryZ,
+                    var entry = continued is null && baselineEntry is not null ? baselineEntry : RampPlanner.PlanPathEntry(path.Points, entryZ,
                         entryRamp, cancellationToken,
                         detail => diagnostic?.Invoke($"region={path.RegionIndex} category={path.Category} " +
                             $"depthPass={path.DepthPassIndex?.ToString() ?? "none"} startingDepth={depth.StartDepth:R} " +
@@ -238,13 +322,24 @@ internal static class VCarvePathRouter
                             $"skipDepthPasses={depth.SkipDepthPasses} smooth={options.SmoothVCarving} " +
                             $"maximumRampAngleDegrees={options.SmoothRampAngleDegrees:R} {detail}"),
                         landAtSourceVertex: options.SmoothVCarving || materialEntryHeight is not null,
-                        preserveClosedExit: !reductionEnabled || groupBoundaryGuard || continuationGuard);
+                        preserveClosedExit: !reductionEnabled || groupBoundaryGuard || continuationGuard,
+                        preserveOpenExit: !options.SmoothVCarving);
                     var entered = new TaggedToolpath(entry.Points, entry.Spans,
                         path.RegionIndex, path.Category, path.DepthPassIndex,
                         path.VisitIdentity, options.DetectCurves) {ContinuationComponentIndex=path.ContinuationComponentIndex,
                         ContinuationPlan=path.ContinuationPlan,ContinuationSourceOrdinal=path.ContinuationSourceOrdinal};
-                    result.Add(continued is null ? entered : ToolpathContinuationPlanner.Prepend(entered,
-                        continued.Points,clearedTravel:continued.ClearedTravel));
+                    var selected=continued is null?entered:ToolpathContinuationPlanner.Prepend(entered,continued.Points,
+                        clearedTravel:continued.ClearedTravel);
+                    if(continued is not null && independentEntry is {} baseline && actualPrevious is {} departure)
+                    {
+                        if(!ToolpathMotionCost.PreferContinuation(motionCost,departure,baseline,selected,out double beforeCost,out double afterCost))
+                        {
+                            if(++entryCostRefusals<=8)diagnostic?.Invoke($"stage=entry-cost decision=reenter continuationSec={afterCost:R} entrySec={beforeCost:R} completeRetainedTrace=True policyOwner=RW.Toolpaths");
+                            selected=baseline;entry=baselineEntry!;path=independentSource;
+                        }
+                        else entryCostSaving+=beforeCost-afterCost;
+                    }
+                    result.Add(selected);
                     redundantPointsRemoved += entry.RedundantPointsRemoved;
                     redundantCutTravelRemoved += entry.RedundantCutTravelRemoved;
                     if (entry.PartialAxisFallback) partialAxisFallbacks++;
@@ -269,10 +364,11 @@ internal static class VCarvePathRouter
             string routingExit = routingPrevious is { } routingPoint
                 ? $"({routingPoint.X:R},{routingPoint.Y:R},{routingPoint.Z:R})" : "none";
             diagnostic?.Invoke($"stage=path-routing region={representative.RegionIndex} " +
-                $"category={representative.Category} depthPass={representative.DepthPassIndex?.ToString() ?? "none"} " +
+                $"component={representative.ContinuationComponentIndex} category={representative.Category} depthPass={representative.DepthPassIndex?.ToString() ?? "none"} " +
                 $"paths={group.Length} beforeTransfer={before:R} afterTransfer={after - linkLength:R} " +
                 $"transferEstimate=source-visits actualTransfer={actualTransfer:R} " +
                 $"orderPolicy=actual-exit-spatial matrixAdmission={group.Length<=128} " +
+                $"independentClearingOrder={independentClearingOrder} fixedTypedCircuitOrderRetained={keepOffsetOrder&&fixedTypedCircuit} " +
                 $"links={links} linkLength={linkLength:R} rejectedLinks={rejected} " +
                 $"redundantPointsRemoved={redundantPointsRemoved} redundantCutTravelRemoved={redundantCutTravelRemoved:R} " +
                 $"entryExitChanges={entryExitChanges} partialAxisFallbacks={partialAxisFallbacks} finalExit={finalExit} " +
@@ -284,6 +380,7 @@ internal static class VCarvePathRouter
             first = end;
         }
         continuation?.Report();
+        diagnostic?.Invoke($"stage=entry-cost event=complete owner=vcarve machineContext={motionCost is not null} refused={entryCostRefusals} selectedSavingSec={entryCostSaving:R} completeBridgeEntryAndCut=True policyOwner=RW.Toolpaths");
         if (options.SmoothVCarving)
         {
             double permitted = Math.Tan(options.SmoothRampAngleDegrees * Math.PI / 180);
@@ -308,64 +405,16 @@ internal static class VCarvePathRouter
             }
             diagnostic?.Invoke($"stage=smooth-routing event=certified paths={result.Count} chords={chords} " +
                 $"maximumGrade={maximumGrade:R} requestedGrade={permitted:R} maximumExcess={maximumExcess:R} " +
-                "independentEntries=reasoned continuityPolicy=shared-executed-stock coordinateSpace=native");
+                "continuityPolicy=shared-executed-stock cuttingConnectors=runtime-certified coordinateSpace=native");
         }
-        return options.SmoothVCarving ? result : ToolpathContinuationPlanner.Reconnect(result,
+        if(options.SmoothVCarving)return result;
+        var independentVisits=ToolpathContinuationPlanner.Reconnect(result,
             "vcarve-legacy", Math.Max(.1, tool.Radius), cancellationToken, diagnostic: diagnostic,
-            validateConnection: materialEntryHeight is not null ? continuationCutGuard : null);
-    }
-
-    private static List<TaggedToolpath> RouteCircuits(IReadOnlyList<TaggedToolpath> paths,
-        DepthSchedule depth, VCarveOptions options, CancellationToken token, Action<string>? log)
-    {
-        var result = new List<TaggedToolpath>(paths.Count);
-        var ramp = options.Ramp with { Strategy = RampStrategy.Linear,
-            AngleRadians = Math.Min(options.Ramp.AngleRadians > 0 ? options.Ramp.AngleRadians : double.PositiveInfinity,
-                options.SmoothRampAngleDegrees * Math.PI / 180) };
-        int entries = 0, continuedLayers = 0, partialAxisTails = 0; long tailReturnPoints=0;
-        Point3D? previous = null; int? component = null;
-        foreach (var path in paths)
-        {
-            token.ThrowIfCancellationRequested();
-            bool continues = component == path.ContinuationComponentIndex && previous is { } p
-                && p.X == path.Points[0].X && p.Y == path.Points[0].Y;
-            double entryZ = continues ? previous!.Value.Z : depth.SurfaceZ;
-            var entry = RampPlanner.PlanPathEntry(path.Points, entryZ, ramp, token,
-                landAtSourceVertex: true, preserveClosedExit: false, diagnostic: null);
-            if(entry.PartialAxisFallback)partialAxisTails++;
-            // The required cycle ends at its ramp contact. Return over the
-            // already-cut short source prefix to the depth circuit's seam;
-            // appending another complete circuit is unnecessary.
-            if(entry.Points[^1]!=path.Points[0])
-            {
-                int contact=-1;
-                for(int i=0;i<path.Points.Count;i++)if(path.Points[i]==entry.Points[^1]){contact=i;break;}
-                if(contact<0)throw new InvalidOperationException("A circuit ramp did not land on a retained source vertex.");
-                int from=entry.Points.Count-1;
-                for(int i=contact-1;i>=0;i--){entry.Points.Add(path.Points[i]);tailReturnPoints++;}
-                entry.Spans.Add(new(from,entry.Points.Count-1,ToolpathSpanKind.Link));
-            }
-            var entered = new TaggedToolpath(entry.Points, entry.Spans, path.RegionIndex, path.Category,
-                path.DepthPassIndex, path.VisitIdentity, detectCurves: false)
-                { ContinuationCircuit = true, ContinuationComponentIndex = path.ContinuationComponentIndex };
-            if (continues && entered.Points[0] != previous)
-                throw new InvalidOperationException("A connected depth circuit lost its executed entry pose.");
-            double grade = Math.Tan(options.SmoothRampAngleDegrees * Math.PI / 180);
-            for (int i = 1; i < entered.Points.Count; i++)
-            {
-                if ((i & 1023) == 0) token.ThrowIfCancellationRequested();
-                var a = entered.Points[i - 1]; var b = entered.Points[i];
-                if (Math.Abs(b.Z - a.Z) > grade * Distance(a, b) + 1e-8)
-                    throw new InvalidOperationException("A constructed V-carve circuit exceeded the authored ramp grade.");
-            }
-            result.Add(entered); previous = entered.Points[^1]; component = path.ContinuationComponentIndex;
-            if (continues) continuedLayers++; else entries++;
-        }
-        log?.Invoke($"stage=construction-routing event=complete circuits={entries} surfaceEntries={entries} "
-            + $"continuousDepthPasses={continuedLayers} outputPaths={result.Count} "
-            + $"partialAxisTails={partialAxisTails} seamReturnPoints={tailReturnPoints} "
-            + "sameXYDepthPrecursor=True sourceChordsRetained=True emittedGraphSearch=False oneEntryPerCertifiedComponent=True");
-        return result;
+            validateConnection: materialEntryHeight is not null ? continuationCutGuard : null,
+            motion:options.Motion,surface:depth.SurfaceZ);
+        return branchFinishing?ToolpathSourceTraversal.FinishingBranches(paths,result,independentVisits,tool.Radius,
+            Math.Tan(options.Ramp.AngleRadians),continuationCutGuard!,materialEntryHeight!,options.Motion!,depth.SurfaceZ,
+            start,cancellationToken,diagnostic):independentVisits;
     }
 
     private static bool CanChangeStart(TaggedToolpath path)

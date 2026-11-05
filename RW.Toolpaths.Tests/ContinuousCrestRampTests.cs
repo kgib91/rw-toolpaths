@@ -139,17 +139,13 @@ public sealed class ContinuousCrestRampTests
             new(CarvingCutterSectionKind.Linear,nose,nose,10)],10.5);
         var field = new VCarveSmoothing.FloorField(VCarveRampSurface.Sources(boundary,
             Options with { SmoothRampAngleDegrees=degrees },default),profile,grade,depth);
-        var paths = new List<TaggedToolpath>();
-        VCarveRampRestNominator.NominateContours(boundary,Array.Empty<TaggedToolpath>(),profile,depth,
-            depth/grade+2*nose,(x,y)=>field.CappedDepth(depth,x,y),
-            (x,y)=>Math.Min(Math.Min(x,24-x),Math.Min(y,20-y)),p=>p,default,null,null,
-            proposed=>VCarveSmoothing.Constrain(proposed,field,grade,default,1_000_000),paths,grade,stepOver,
-            floorContact:field.NominateFloorContact,maximumFloorContactRadius:field.MaximumFloorContactRadius,
-            continuousCrestSurface:true);
+        var paths = VCarveSmoothing.Apply([],boundary,new ToolGeometry(nose) { VCarveProfile=profile },
+            new(depth,depth),Options with { SmoothRampAngleDegrees=degrees, IncludeInteriorFill=false,
+                EdgeFillWidth=profile.RampFillWidth(depth,degrees), StepOver=stepOver },default,null);
         Assert.NotEmpty(paths);
         double pitch=2*nose*stepOver;
         double authoredScallop=nose-Math.Sqrt(nose*nose-pitch*pitch/4);
-        double budget=authoredScallop+MachiningAccuracy.SurfaceDeviation;
+        double budget=authoredScallop+Options.PathToleranceMm;
         double tangent=nose*grade/Math.Sqrt(1+grade*grade);
         double support=nose*(Math.Sqrt(1+grade*grade)-1);
         double plateauCentre=(depth+support)/grade,blendStart=plateauCentre-tangent;
@@ -198,6 +194,6 @@ public sealed class ContinuousCrestRampTests
             Assert.True(removed<=expected+1e-8,$"Gouge at ({x:R},{y:R}): expected={expected:R} actual={removed:R}");
             Assert.True(remainingDistance<=budget,$"Ridge at ({x:R},{y:R}): expected={expected:R} actual={removed:R} spatialDistance={remainingDistance:R} budget={budget:R}");
         }
-        Console.WriteLine($"[Ramp.SweptBallAudit] angle={degrees:R} samples=1089 paths={paths.Count} maximumRemaining={worstRemaining:R} maximumGouge={worstGouge:R} authoredScallop={authoredScallop:R} spatialAccuracy={MachiningAccuracy.SurfaceDeviation:R} combinedBudget={budget:R} auditBandEnd={auditEnd:R}");
+        Console.WriteLine($"[Ramp.SweptBallAudit] angle={degrees:R} samples=1089 paths={paths.Count} maximumRemaining={worstRemaining:R} maximumGouge={worstGouge:R} authoredScallop={authoredScallop:R} spatialAccuracy={Options.PathToleranceMm:R} combinedBudget={budget:R} auditBandEnd={auditEnd:R}");
     }
 }

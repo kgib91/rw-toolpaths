@@ -41,7 +41,7 @@ internal static class ConservativeSurfaceMask
         Console.WriteLine($"[Pocket.SmoothRoughing.SurfaceMask] sourcePoints={before} proposedPoints={after} "
             +$"accepted={contains} originalProtectionFullyContained={contains} chordMm={chord:R} expansionMm={expansion:R} "
             +$"maximumAdditionalStockMm={2*chord+arc+12/PathUtils.Scale:R} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
-            +"authority=signed-original-filled-set-inclusion removedProtectedMaterial=0 fallback=original-mask");
+            +$"authority=signed-original-filled-set-inclusion removedProtectedMaterial=0 fallback=original-mask");
         return contains?expanded:original;
     }
 }

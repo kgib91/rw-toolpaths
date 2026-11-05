@@ -1,9 +1,9 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
-    <LangVersion>10</LangVersion>
+    <LangVersion>12.0</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>RW.Toolpaths</AssemblyName>
     <RootNamespace>RW.Toolpaths</RootNamespace>
@@ -16,6 +16,7 @@
   <ItemGroup>
     <!-- Pinned 1.4.0 source and identity; Shared uses this same project. -->
     <ProjectReference Include="..\vendor\Clipper2\Clipper2Lib.csproj" />
+    <ProjectReference Include="..\vendor\Clipper1\Clipper1.csproj" />
     <PackageReference Include="MIConvexHull" Version="1.1.19.1019" />
   </ItemGroup>
 
@@ -24,17 +25,24 @@
                       LogicalName="RW.Toolpaths.Milling.Acceleration.disc_witness.cu" />
   </ItemGroup>
 
-  <!-- Native Boost Voronoi library - copy whichever RID was built. -->
+  <!-- Bare-name P/Invoke resolves beside the managed assembly. Project content
+       under runtimes/ is not a NuGet runtime asset and adds no native deps entry. -->
   <ItemGroup>
+    <Content Include="runtimes\win-x64\native\clipper2medial.dll" Link="clipper2medial.dll" Condition="Exists('$(MSBuildThisFileDirectory)runtimes/win-x64/native/clipper2medial.dll')" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="runtimes\linux-x64\native\libclipper2medial.so" Link="libclipper2medial.so" Condition="Exists('$(MSBuildThisFileDirectory)runtimes/linux-x64/native/libclipper2medial.so')" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="runtimes\osx-x64\native\libclipper2medial.dylib" Link="libclipper2medial.dylib" Condition="Exists('$(MSBuildThisFileDirectory)runtimes/osx-x64/native/libclipper2medial.dylib')" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <Content Include="runtimes/win-x64/native/boostvoronoi.dll"
+             Link="boostvoronoi.dll" CopyToPublishDirectory="PreserveNewest"
              Condition="Exists('$(MSBuildThisFileDirectory)runtimes/win-x64/native/boostvoronoi.dll')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="runtimes/linux-x64/native/libboostvoronoi.so"
+             Link="libboostvoronoi.so" CopyToPublishDirectory="PreserveNewest"
              Condition="Exists('$(MSBuildThisFileDirectory)runtimes/linux-x64/native/libboostvoronoi.so')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="runtimes/osx-x64/native/libboostvoronoi.dylib"
+             Link="libboostvoronoi.dylib" CopyToPublishDirectory="PreserveNewest"
              Condition="Exists('$(MSBuildThisFileDirectory)runtimes/osx-x64/native/libboostvoronoi.dylib')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
@@ -78,5 +86,11 @@
           WorkingDirectory="$(_NativeDir)" />
   </Target>
 
-</Project>
 
+  <ItemGroup>
+    <!-- Opt-in namespace logging; handlers skip disabled diagnostic interpolation. -->
+    <Using Include="RW.Diagnostics.DiagnosticConsole" Alias="Console" />
+    <ProjectReference Include="../../rw-csg/RW.Diagnostics/RW.Diagnostics.csproj" />
+  </ItemGroup>
+
+</Project>

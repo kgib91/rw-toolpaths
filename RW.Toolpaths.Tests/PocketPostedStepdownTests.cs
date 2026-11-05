@@ -140,6 +140,30 @@ public sealed class PocketPostedStepdownTests
     }
 
     [Fact]
+    public void EngagedPocketWidthOnlyAuthorizesStockFromALiteralCylinder()
+    {
+        var sections = new CarvingCutterSection[] {
+            new(CarvingCutterSectionKind.Linear, .75, .75, 20),
+            new(CarvingCutterSectionKind.Linear, .793, 3, 10),
+            new(CarvingCutterSectionKind.Linear, 3, 3, 40) };
+        var tool = new ToolGeometry(.75) { PhysicalProfile = new(sections, 5) };
+        Assert.True(PocketContinuationRouter.TryFlatCylinderRadius(tool, 5.001, out double radius));
+        Assert.Equal(.75, radius);
+        Assert.False(PocketContinuationRouter.TryFlatCylinderRadius(tool with { Radius = 3 }, 5, out _));
+        Assert.False(PocketContinuationRouter.TryFlatCylinderRadius(tool, 20, out _));
+        var taper = new ToolGeometry(1) { PhysicalProfile = new([
+            new(CarvingCutterSectionKind.Linear, .5, 3, 10)], 2) };
+        Assert.False(PocketContinuationRouter.TryFlatCylinderRadius(taper, 2, out _));
+        var shortTool = tool with { PhysicalProfile = new([
+            new(CarvingCutterSectionKind.Linear, .75, .75, 2)], 2) };
+        Assert.False(PocketContinuationRouter.TryFlatCylinderRadius(shortTool, 5, out _));
+        var narrowShank = tool with { PhysicalProfile = new([
+            new(CarvingCutterSectionKind.Linear, .75, .75, 2),
+            new(CarvingCutterSectionKind.Linear, .3, .3, 10)], 5) };
+        Assert.False(PocketContinuationRouter.TryFlatCylinderRadius(narrowShank, 5, out _));
+    }
+
+    [Fact]
     public void PostedOriginalChordRetracesHaveZeroLateralStockCreditAcrossDepthsAndOldSnapshots()
     {
         var depth = new DepthSchedule(10.5, 3.5) { SurfaceZ = 12.7 };

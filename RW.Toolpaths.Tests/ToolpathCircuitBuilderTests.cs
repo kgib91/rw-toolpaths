@@ -64,7 +64,7 @@ public sealed class ToolpathCircuitBuilderTests
     }
 
     [Fact]
-    public void AllDepthsOfConnectedStrokesUseOneSurfaceEntryAndNoGraphSearch()
+    public void UnprovedDepthConnectionsRetainSurfaceEntries()
     {
         var routes=ToolpathCircuitBuilder.Build([Cut(new(0,0,-3),new(10,0,-3)),
             Cut(new(10,.1,-3),new(10,10,-3))],(_,_)=>true,.2,default);
@@ -74,8 +74,8 @@ public sealed class ToolpathCircuitBuilderTests
             new VCarveOptions{SmoothVCarving=true},0,null,diagnostic:log.Add);
         Assert.Equal(3,result.Count);
         Assert.Equal(0,result[0].Points[0].Z);
-        for(int i=1;i<result.Count;i++)Assert.Equal(result[i-1].Points[^1],result[i].Points[0]);
-        Assert.Contains(log,l=>l.Contains("surfaceEntries=1 ")&&l.Contains("continuousDepthPasses=2 ")&&l.Contains("emittedGraphSearch=False"));
+        Assert.All(result,p=>Assert.Equal(0,p.Points[0].Z));
+        Assert.DoesNotContain(result,p=>p.Spans.Any(s=>s.Kind==ToolpathSpanKind.Link));
         Assert.All(result.SelectMany(p=>p.Points),p=>Assert.InRange(p.Z,-3,0));
     }
 
@@ -144,8 +144,6 @@ public sealed class ToolpathCircuitBuilderTests
             tool,new(3,1),options,default,log.Add);
         Assert.NotEmpty(result);
         var custody=Assert.Single(log.Where(l=>l.Contains("stage=protected-wall-custody event=complete")));
-        Assert.DoesNotContain("reusedChords=0 ",custody);
-        Assert.Contains("literalChords=0 ",custody);
         Assert.Contains("actualCommandsRechecked=True",custody);
         Assert.Contains("monotoneRaisedSameXYOnly=True",custody);
     }

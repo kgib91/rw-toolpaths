@@ -18,6 +18,7 @@ public static partial class PolygonOps
 {
     private static long _integerUnionPrecisionFallbacks;
     private static readonly FilledFrontEvidenceCache.Cache<CenterlineBufferEvidence> CenterlineBufferCache = new(16L << 20, 64);
+    private static readonly FilledFrontEvidenceCache.Cache<CenterlineBufferEvidence> FilledDilationCache = new(128L << 20, 512);
 
     private sealed class CenterlineBufferEvidence
     {
@@ -138,6 +139,28 @@ public static partial class PolygonOps
         }
 
         internal int SegmentCount => _segments.Length;
+
+        // Bounded nomination only. Original ordinals survive spatial partitioning;
+        // callers still prove intersections against their original XYZ segments.
+        internal bool QueryBounds(long minX,long minY,long maxX,long maxY,List<int> matches,
+            int limit,CancellationToken token)
+        {
+            matches.Clear();int visited=0;bool complete=true;
+            Find(_root);return complete;
+            void Find(Node? node)
+            {
+                if(node is null||!complete||node.MaxX<minX||node.MinX>maxX||node.MaxY<minY||node.MinY>maxY)return;
+                if((++visited&255)==0)token.ThrowIfCancellationRequested();
+                if(node.Count==0){Find(node.First);Find(node.Second);return;}
+                for(int i=node.Start;i<node.Start+node.Count;i++)
+                {
+                    var s=_segments[i];
+                    if(s.MaxX<minX||s.MinX>maxX||s.MaxY<minY||s.MinY>maxY)continue;
+                    if(matches.Count>=limit){complete=false;return;}
+                    matches.Add(s.Ordinal);
+                }
+            }
+        }
         internal int PartitionCount => _partitionCount;
         internal int PartitionSortFallbacks => _partitionSortFallbacks;
         internal bool LegacyWitnessIndexBuilt => _legacyWitnessIndex?.IsValueCreated == true;
@@ -400,7 +423,7 @@ public static partial class PolygonOps
             if (_root.MaxX - _root.MinX < 2 * required || _root.MaxY - _root.MinY < 2 * required)
             {
                 Console.WriteLine($"[PolygonOps.OpeningFit] radius={radius / PathUtils.Scale:R} "
-                    + "fits=False reason=bounds probes=0");
+                    + $"fits=False reason=bounds probes=0");
                 return false;
             }
             var pending = new PriorityQueue<(long X0, long Y0, long X1, long Y1), double>();
@@ -913,7 +936,7 @@ public static partial class PolygonOps
                 if (fallback <= 4 || (fallback & (fallback - 1)) == 0)
                     Console.WriteLine($"[PolygonOps.IntegerUnionPrecision] fallback={fallback} "
                         + $"maximumExactDoubleInteger={maximumExactDoubleInteger} "
-                        + "legacyDoubleRoundTrip=True originalContourOrder=True");
+                        + $"legacyDoubleRoundTrip=True originalContourOrder=True");
                 return ToPaths64(NormalizeOrder(FromPaths64(output)));
             }
             if (smallest != 0)
@@ -1084,11 +1107,11 @@ public static partial class PolygonOps
                     Console.WriteLine($"[PolygonOps.OffsetConstruction] originalPoints={_geometry.PointCount} "
                         + $"constructionPoints={pointCount} tolerance={Tolerance:R} "
                         + $"inwardGuard={_guard:R} identicalFilledGeometry={_guard == 0} "
-                        + "originalSourceCapsuleProof=True zeroOffsetExact=True");
+                        + $"originalSourceCapsuleProof=True zeroOffsetExact=True");
                 Console.WriteLine($"[PolygonOps.OffsetConstructionLazy] event=prepared buildCount={BuildCount} "
                     + $"originalPoints={_geometry.PointCount} constructionPoints={pointCount} "
                     + $"tolerance={Tolerance:R} elapsedMs={PreparationMilliseconds:F2} "
-                    + "pathOrder=original rdpUnionXor=unchanged publication=complete-snapshot");
+                    + $"pathOrder=original rdpUnionXor=unchanged publication=complete-snapshot");
             }
         }
     }
@@ -1249,7 +1272,7 @@ public static partial class PolygonOps
                 Console.WriteLine($"[PolygonOps.OffsetConstructionLazy] event=skipped reason={reason} delta={delta:R} "
                     + $"sourcePoints={SourcePointCount} conditioningDeferred={conditioning} ordinaryOffsetterDeferred={ordinary} "
                     + $"conditioningSkips={ConstructionSkippedExecutions} ordinaryOffsetterSkips={OrdinaryOffsetterSkippedExecutions} "
-                    + "zeroFrontAndOriginalFeasibility=unchanged noConstructionOperandChanged=True");
+                    + $"zeroFrontAndOriginalFeasibility=unchanged noConstructionOperandChanged=True");
         }
 
         private ClipperOffset GetOrdinaryOffsetter(CancellationToken token)
@@ -1286,7 +1309,7 @@ public static partial class PolygonOps
                 .Any(path => Clipper.Area(path) != 0))
             {
                 Console.WriteLine($"[PolygonOps.AcceptedInsetSeed] accepted=False delta={delta:R} "
-                    + "reason=complete-original-filled-source-containment authority=unchanged-source-construction");
+                    + $"reason=complete-original-filled-source-containment authority=unchanged-source-construction");
                 return false;
             }
             int chords = 0;
@@ -1328,7 +1351,7 @@ public static partial class PolygonOps
             Console.WriteLine($"[PolygonOps.AcceptedInsetSeed] accepted={AcceptedInsetSeeded} delta={delta:R} "
                 + $"chords={chords} cachePoints={cachePoints} "
                 + $"twoOriginExperiment={_twoOriginExperiment} "
-                + "originalWalls=True constructionOnly=True futureShellProof=unchanged originalSourceModified=False");
+                + $"originalWalls=True constructionOnly=True futureShellProof=unchanged originalSourceModified=False");
             if (_twoOriginExperiment)
                 LogTwoOrigin("publish-shallow", delta, "shallow", cachePoints);
             return AcceptedInsetSeeded;
@@ -1389,8 +1412,8 @@ public static partial class PolygonOps
                 Console.WriteLine($"[PolygonOps.GuardedInsetExperiment] certified={directGuarded} "
                     + $"chords={chords} guardedPoints={guarded.Sum(path => path.Count)} "
                     + $"originalFirstClearance={required / PathUtils.Scale:R} "
-                    + "authority=complete-original-filled-domain-and-every-chord laterShellProof=unchanged "
-                    + "failure=established-intersected-cache commandedFirstFrontModified=False");
+                    + $"authority=complete-original-filled-domain-and-every-chord laterShellProof=unchanged "
+                    + $"failure=established-intersected-cache commandedFirstFrontModified=False");
             }
             var cache = directGuarded ? guarded : Clipper.Intersect(solution, guarded, FillRule.NonZero);
             token.ThrowIfCancellationRequested();
@@ -1408,7 +1431,7 @@ public static partial class PolygonOps
                 + $"shallowReuses={TwoOriginShallowReuseCount} deepReuses={TwoOriginDeepReuseCount} "
                 + $"mainOriginalSourceBuilds={DenseSourceConstructionCount} sharedOriginalPreparation=True "
                 + $"preparationMs={PreparationMilliseconds:F2} seedMs={AcceptedInsetSeedMilliseconds:F2} "
-                + "originalWalls=True shellProof=unchanged stockAuthority=False accumulatedApproximation=False");
+                + $"originalWalls=True shellProof=unchanged stockAuthority=False accumulatedApproximation=False");
 
         internal List<List<PointD>> ExecuteOriginalFirstAuthority(double delta,
             CancellationToken cancellationToken = default)
@@ -1452,8 +1475,8 @@ public static partial class PolygonOps
             Console.WriteLine($"[PolygonOps.OriginalFirstAuthority] inset={delta:R} "
                 + $"originalPoints={SourcePointCount} constructionPoints={_construction.PointCount} "
                 + $"nativeArcTolerance={_arcTolerance:R} commandedPoints={commanded.Sum(path => path.Count)} "
-                + "firstSourceCoverage=original conditionedCandidateBuilt=False differentialAlternativeRequired=False "
-                + "originalWallProof=unchanged physicalCommandCleanup=unchanged laterShellProof=unchanged");
+                + $"firstSourceCoverage=original conditionedCandidateBuilt=False differentialAlternativeRequired=False "
+                + $"originalWallProof=unchanged physicalCommandCleanup=unchanged laterShellProof=unchanged");
             return commanded;
         }
 
@@ -1470,7 +1493,7 @@ public static partial class PolygonOps
             if (_originalFirstDelta == delta)
             {
                 Console.WriteLine($"[PolygonOps.OffsetConstructionBypass] delta={delta:R} "
-                    + "reason=certified-original-first-front cached=True laterFronts=conditioned-with-collector-shell-proof");
+                    + $"reason=certified-original-first-front cached=True laterFronts=conditioned-with-collector-shell-proof");
                 if (!compactFront) { DeferredCompactionCount++; return _originalFirstFront!; }
                 return CompactCandidate(_originalFirstFront!, delta, cancellationToken);
             }
@@ -1575,7 +1598,7 @@ public static partial class PolygonOps
                     }
                     constructionOffsetter = _outwardOffsetter;
                     Console.WriteLine($"[PolygonOps.OffsetConstructionBypass] delta={delta:R} "
-                        + "reason=outward-offset originalSites=True");
+                        + $"reason=outward-offset originalSites=True");
                 }
                 else constructionOffsetter = GetOrdinaryOffsetter(cancellationToken);
                 constructionOffsetter.Execute(constructionDelta, solution);
@@ -2307,7 +2330,7 @@ public static partial class PolygonOps
                     + $"ordinaryFallbackComponents={components.Count - originalFirstComponents} "
                     + $"originalBoundaryComponents={originalFirstComponents - holeErosionComponents} "
                     + $"holeProposalRefusalComponents={(useOriginalHoleErosion ? originalFirstComponents - holeErosionComponents : 0)} "
-                    + "completeOriginalSource=True physicalCleanup=unchanged actualCommandProof=required");
+                    + $"completeOriginalSource=True physicalCleanup=unchanged actualCommandProof=required");
             candidate = Clipper.Union(ToPaths64(fronts), FillRule.NonZero);
         }
         else
@@ -2384,7 +2407,8 @@ public static partial class PolygonOps
         double delta,
         double arcTolerance = DefaultArcTolerance,
         double simplifyTolerance = PolygonSimplify.DefaultTolerance,
-        JoinType joinType = JoinType.Round)
+        JoinType joinType = JoinType.Round,
+        bool pruneCollapsedHoles = false)
     {
         var group = ToPaths64(polygons);
         if (group.Count == 0)
@@ -2392,11 +2416,65 @@ public static partial class PolygonOps
 
 
         double scaledDelta = delta * PathUtils.Scale;
+        var originalGroup = group;
+        if (pruneCollapsedHoles && scaledDelta > 0 && joinType == JoinType.Round
+            && group.Sum(path => (long)path.Count) >= 4096 && group.Any(path => Clipper.Area(path) > 0))
+        {
+            // A positive filled-region offset erodes each clockwise hole. If
+            // its complete signed-distance cover cannot contain even the smaller
+            // reserved disk, that hole has no surviving offset operand. Keep all
+            // original edges for the ordinary inversion/repair authority below.
+            long pruneStarted = Stopwatch.GetTimestamp();
+            double guard = 4 * Math.Max(0, arcTolerance) * PathUtils.Scale + 64;
+            double required = scaledDelta - guard;
+            int omitted = 0; long omittedPoints = 0;
+            if (required > 0)
+            {
+                var topology = new Clipper64();
+                var tree = new PolyTree64();
+                topology.AddSubject(originalGroup);
+                topology.Execute(ClipType.Union, FillRule.NonZero, tree);
+                var holes = new List<Path64>();
+                void CollectHoles(PolyPath64 node, bool isHole)
+                {
+                    if (isHole && node.Polygon is { } polygon) holes.Add(polygon);
+                    foreach (PolyPath64 child in node) CollectHoles(child, !isHole);
+                }
+                CollectHoles(tree, true);
+                static bool SameCycle(Path64 a, Path64 b)
+                {
+                    if (a.Count != b.Count) return false;
+                    for (int start = 0; start < b.Count; start++)
+                    {
+                        if (a[0] != b[start]) continue;
+                        bool same = true;
+                        for (int i = 1; i < a.Count && same; i++) same = a[i] == b[(start + i) % b.Count];
+                        if (same) return true;
+                    }
+                    return false;
+                }
+                var retained = new Paths64(group.Count);
+                foreach (var path in group)
+                {
+                    bool collapsed = Clipper.Area(path) < 0 && path.Count >= 3
+                        && holes.Any(hole => SameCycle(path, hole))
+                        && !new BoundarySegmentIndex(new Paths64 { path }).MayContainDisc(required, guard);
+                    if (collapsed) { omitted++; omittedPoints += path.Count; }
+                    else retained.Add(path);
+                }
+                group = retained;
+            }
+            Console.WriteLine($"[PolygonOps.OffsetCollapsedHoles] omittedHoles={omitted} omittedPoints={omittedPoints} "
+                +$"originalPoints={originalGroup.Sum(path=>(long)path.Count)} retainedPoints={group.Sum(path=>(long)path.Count)} "
+                +$"delta={delta:R} radiusReserve={guard/PathUtils.Scale:R} elapsedMs={Stopwatch.GetElapsedTime(pruneStarted).TotalMilliseconds:F1} "
+                +$"proof=complete-signed-distance-cover unresolvedRetainsLiteralHole=True originalValidationAndRepairEdgesRetained=True");
+        }
         if (scaledDelta < 0)
         {
             // A collapsed source component can produce an inverted positive-area offset.
             // Exclude it before offsetting so its rejection never rebuilds a valid neighbor.
             group = KeepInsetComponents(group, scaledDelta, arcTolerance * PathUtils.Scale);
+            originalGroup = group;
             if (group.Count == 0)
                 return new List<List<PointD>>();
         }
@@ -2410,17 +2488,17 @@ public static partial class PolygonOps
         int rawCount = solution.Count;
         long validationStart = PerfLog.Start();
         int rejected = RemoveOffsetInversions(
-            new BoundarySegmentIndex(group), solution, scaledDelta, arcTolerance,
+            new BoundarySegmentIndex(originalGroup), solution, scaledDelta, arcTolerance,
             out bool rejectedSignificantContour, out string details);
         int fallbackCount = 0;
         int fallbackRejected = 0;
         if (rejected > 0 && (solution.Count == 0 || rejectedSignificantContour))
         {
-            solution = BuildConservativeOffset(group, scaledDelta, arcTolerance);
+            solution = BuildConservativeOffset(originalGroup, scaledDelta, arcTolerance);
             fallbackCount = solution.Count;
             var rawCandidate = new Paths64(solution);
             fallbackRejected = RemoveOffsetInversions(
-                new BoundarySegmentIndex(group),
+                new BoundarySegmentIndex(originalGroup),
                 solution,
                 scaledDelta,
                 arcTolerance,
@@ -2430,8 +2508,8 @@ public static partial class PolygonOps
             if (fallbackRejected > 0)
                 details += $";fallbackRejected={fallbackRejected}:{fallbackDetails}";
             if (fallbackSignificant)
-                solution = RepairConservativeOffset(new BoundarySegmentIndex(group),
-                    Clipper.Union(group, FillRule.NonZero), rawCandidate, scaledDelta, arcTolerance, significantDeficit);
+                solution = RepairConservativeOffset(new BoundarySegmentIndex(originalGroup),
+                    Clipper.Union(originalGroup, FillRule.NonZero), rawCandidate, scaledDelta, arcTolerance, significantDeficit);
         }
 
         if (rejected > 0)
@@ -2481,6 +2559,45 @@ public static partial class PolygonOps
         double radius,
         double arcTolerance = DefaultArcTolerance)
     {
+        if(radius<.0001)return new();
+        var source=polygons.ToList();
+        if(!FilledFrontEvidenceCache.Enabled || source.Sum(p=>(long)p.Count)<=256)
+            return BufferCore(source,radius,arcTolerance,forceBoundaryCapsules:false);
+        long started=Stopwatch.GetTimestamp();
+        var key=FilledFrontEvidenceCache.Key.Capture(source,radius,arcTolerance,0,12,null,default);
+        var reused=FilledDilationCache.Find(key,default);
+        if(reused is not null)
+        {
+            var copy=reused.Copy();
+            Console.WriteLine($"[PolygonOps.FilledDilationEvidence] hit=True inputPoints={key!.Points} "
+                +$"outputPoints={copy.Sum(p=>p.Count)} elapsedMs={ElapsedMilliseconds(started):F2} "
+                +$"identity=complete-ordered-source-radius-arc resultOwnership=fresh-copy byteLimit=134217728");
+            return copy;
+        }
+        var output=BufferCore(source,radius,arcTolerance,forceBoundaryCapsules:false);
+        if(key is not null)
+        {
+            var evidence=new CenterlineBufferEvidence(output);
+            FilledDilationCache.Publish(key,evidence,evidence.Bytes,default);
+        }
+        Console.WriteLine($"[PolygonOps.FilledDilationEvidence] hit=False inputPoints={source.Sum(p=>p.Count)} "
+            +$"outputPoints={output.Sum(p=>p.Count)} elapsedMs={ElapsedMilliseconds(started):F2} "
+            +$"identity=complete-ordered-source-radius-arc construction=unchanged byteLimit=134217728");
+        return output;
+    }
+
+    internal static List<List<PointD>> BufferWithBoundaryCapsules(
+        IEnumerable<IReadOnlyList<PointD>> polygons, double radius, double arcTolerance)
+        => BufferCore(polygons, radius, arcTolerance, forceBoundaryCapsules:true);
+
+    internal static List<List<PointD>> BufferWithLiteralSignedOffset(
+        IEnumerable<IReadOnlyList<PointD>> polygons,double radius,double arcTolerance)
+        => BufferCore(polygons,radius,arcTolerance,forceBoundaryCapsules:false,separateSignedClusters:false);
+
+    private static List<List<PointD>> BufferCore(
+        IEnumerable<IReadOnlyList<PointD>> polygons, double radius, double arcTolerance,
+        bool forceBoundaryCapsules,bool separateSignedClusters=true)
+    {
         if (radius < 0.0001)
             return new List<List<PointD>>();
 
@@ -2488,7 +2605,13 @@ public static partial class PolygonOps
         if (group.Count == 0)
             return new List<List<PointD>>();
 
-        if(group.Sum(path=>(long)path.Count)>256)
+        long inputPoints = group.Sum(path=>(long)path.Count);
+        // Tiny clearance shells do not create the large overlapping join
+        // arrangements which require chunking. Use the existing literal signed
+        // round offset at its original radius/tolerance, retaining holes and all
+        // source vertices. Larger physical sweeps keep their bounded builder.
+        bool tinyShell = radius * PathUtils.Scale <= 256;
+        if(inputPoints>256 && (!tinyShell || forceBoundaryCapsules))
         {
             // Positive dilation is the original signed fill plus the disk sweep
             // of every closed boundary (including holes). Bound each join
@@ -2502,10 +2625,16 @@ public static partial class PolygonOps
             var result=Union(source.Concat(bands));
             Console.WriteLine($"[PolygonOps.FilledDilation] sourcePaths={source.Count} sourcePoints={group.Sum(p=>p.Count)} "
                 + $"resultPoints={result.Sum(p=>p.Count)} elapsedMs={ElapsedMilliseconds(started):F1} "
-                + "construction=signed-fill-plus-closed-boundary-capsules holesPreserved=True");
+                + $"construction=signed-fill-plus-closed-boundary-capsules holesPreserved=True");
             return result;
         }
 
+        long offsetStarted = Stopwatch.GetTimestamp();
+        if(tinyShell && !forceBoundaryCapsules && separateSignedClusters && inputPoints>=8192
+            && TryBufferSeparatedSignedClusters(group,radius,arcTolerance,out var separated))
+        {
+            var partitioned=FromPaths64(separated);NormalizeOrder(partitioned);return partitioned;
+        }
         var offsetter = CreateOffsetter(arcTolerance);
         // An outer and its signed holes form one filled group. Adding each
         // contour separately makes a clockwise hole a reversed outer group.
@@ -2514,8 +2643,20 @@ public static partial class PolygonOps
         var solution = new Paths64();
         offsetter.Execute(radius * PathUtils.Scale, solution);
 
-        var output = FromPaths64(Clipper.Union(solution, FillRule.NonZero));
+        // Execute already performs the offset cleanup union with collinear
+        // preservation disabled. Its normally oriented result is canonical;
+        // do not rebuild that same arrangement a second time. A reversed-only
+        // input still uses the original NonZero orientation normalization.
+        var largest=solution.MaxBy(path=>Math.Abs(Clipper.Area(path)));
+        var canonical=forceBoundaryCapsules || largest is not null && !Clipper.IsPositive(largest)
+            ? Clipper.Union(solution,FillRule.NonZero) : solution;
+        var output = FromPaths64(canonical);
         NormalizeOrder(output);
+        if (inputPoints > 256)
+            Console.WriteLine($"[PolygonOps.FilledDilation] sourcePaths={group.Count} sourcePoints={inputPoints} "
+                +$"resultPoints={output.Sum(p=>p.Count)} elapsedMs={ElapsedMilliseconds(offsetStarted):F1} "
+                +$"radius={radius:R} arcTolerance={arcTolerance:R} maximumShellTicks=256 "
+                +$"construction=literal-signed-round-offset sourceVerticesUnchanged=True holesPreserved=True");
         return output;
     }
 
@@ -2639,7 +2780,7 @@ public static partial class PolygonOps
                 + $"maximumChunkChords={maximumChunkChords} points={buffered.Sum(p => p.Count)} elapsedMs={ElapsedMilliseconds(started):F1} "
                 + $"batchChunks=32 batchUnionMs={batchUnionMs:F1} finalUnionMs={finalUnionMs:F1} "
                 + $"workers={(parallelBatches?GeometryParallelism.WorkerLimit:1)} batchUnionTiming=sum-worker-time orderedIntegerOperands=True "
-                + "geometry=round-capped-segment-union sourceVerticesUnchanged=True");
+                + $"geometry=round-capped-segment-union sourceVerticesUnchanged=True");
             return buffered;
         }
 
@@ -2778,6 +2919,22 @@ public static partial class PolygonOps
             new(minX, maxY),
         };
         return Clip(polygons, rect);
+    }
+
+    // Unlike ClipToRect's independently FILLED polygon API, the integer
+    // rectangle clipper retains each input contour's directed winding. Union
+    // the clipped signed rings together, preserving enclosing holes/islands and
+    // overlaps between the captured floor and the first following Cut.
+    internal static List<List<PointD>> ClipSignedToRect(
+        IEnumerable<IReadOnlyList<PointD>> polygons,long minX,long minY,long maxX,long maxY,
+        CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        var clipped=Clipper.RectClip(new Rect64(minX,minY,maxX,maxY),ToPaths64(polygons));
+        token.ThrowIfCancellationRequested();
+        var result=FromPaths64(Clipper.Union(clipped,FillRule.NonZero));
+        NormalizeOrder(result);
+        return result;
     }
 
     /// <summary>

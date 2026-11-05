@@ -51,14 +51,14 @@ internal static class FilledFrontCoverage
         if (canonical.Count != polygons.Count)
             Console.WriteLine($"[FilledFrontCoverage.Topology] inputContours={polygons.Count} "
                 + $"canonicalContours={canonical.Count} components={components.Count} "
-                + "proof=identical-filled-union holesPreserved=True sizeCutoff=False");
+                + $"proof=identical-filled-union holesPreserved=True sizeCutoff=False");
         if (components.Count < 2) return canonical;
         // Credit only cutter strokes the downstream clip will actually emit.
         if (clipBoundary is { Count: >= 3 }
             && PolygonOps.Difference(polygons, new[] { clipBoundary }).Count > 0)
         {
             Console.WriteLine($"[FilledFrontCoverage] components={components.Count} "
-                + "retained=all reason=partially-clipped-front");
+                + $"retained=all reason=partially-clipped-front");
             return canonical;
         }
         const double proofArc = ProofArc;
@@ -79,7 +79,7 @@ internal static class FilledFrontCoverage
                 + $"canonicalPoints={effectKey.Points} components={proof.Components} retained={proof.Retained} "
                 + $"priorBooleanFallbacks={proof.BooleanFallbacks} priorOrderedUnions={proof.OrderedUnionCalls} "
                 + $"newFootprints=0 newOrderedUnions=0 elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F2} "
-                + "key=exact-ordered-signed-coordinate-bits-radius-clip-modes-proof resultOwnership=fresh-copy stockAuthority=unchanged");
+                + $"key=exact-ordered-signed-coordinate-bits-radius-clip-modes-proof resultOwnership=fresh-copy stockAuthority=unchanged");
             return copy;
         }
         double canonicalMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
@@ -229,7 +229,7 @@ internal static class FilledFrontCoverage
             + $"containmentQueries={containmentQueries} containmentProofs={containmentProofs} "
             + $"containmentAmbiguous={containmentAmbiguous} "
             + $"containmentFirstQueryBooleans={containmentFirstQueryBooleans} "
-            + "containmentPrepareAfterQuery=1 enclosedHoles=True "
+            + $"containmentPrepareAfterQuery=1 enclosedHoles=True "
             + $"witnessRadius={witnessRadius:R} originalBooleanOrder=True");
         var statistics = new Statistics(components.Count, retained.Count, witnesses, fallbacks,
             unions, probes, builds, queries, containmentQueries, containmentProofs,
@@ -248,7 +248,7 @@ internal static class FilledFrontCoverage
             + $"orderedUnionMs={Milliseconds(orderedUnionTicks):F2} morphologyMs={Milliseconds(morphologyTicks):F2} "
             + $"elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F2} cacheEnabled={cacheEnabled} "
             + $"resultCacheBytes={RetainedCache.Inspect().Bytes} footprintCacheBytes={FootprintCache.Inspect().Bytes} "
-            + "originalBooleanOrder=True stockAuthority=unchanged");
+            + $"originalBooleanOrder=True stockAuthority=unchanged");
         return result;
     }
 

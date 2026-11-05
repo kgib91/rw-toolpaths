@@ -1,13 +1,14 @@
 namespace RW.Toolpaths.Milling;
 
-/// <summary>Millimetre error budgets for the finished surface, independently
-/// of the point inventory or construction algorithm used to reach it.</summary>
+/// <summary>Shared construction/posting defaults. Operation quality is configured
+/// on each request; these defaults are not a global finished-surface requirement.</summary>
 public static class MachiningAccuracy
 {
-    public const string Policy = "surface-20um-v14-continuous-crest";
-    public const double SurfaceDeviation = .02;
+    public const string Policy = "operation-owned-approximation-v1";
+    // Approximation/finish allowances are operation-owned, not a global rule.
     public const double ArtworkChord = .001;
-    internal const double PathChord = .002;
+    public const double FinalPathChord = .002;
+    internal const double PathChord = FinalPathChord;
     internal const double ProtectedChord = .002;
     internal const double SmoothCoverage = .008;
     internal const double FloorSearch = .0002;

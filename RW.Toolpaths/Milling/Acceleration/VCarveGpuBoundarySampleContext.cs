@@ -120,7 +120,7 @@ internal sealed partial class VCarveGpuDiscWitnessContext
             GpuBoundaryWorkLimits limits, CancellationToken token, Action<string>? diagnostic,
             out BoundarySampleContext? context, out string reason)
             => TryCreate(segments, nodes, limits,
-                Environment.GetEnvironmentVariable("RW_TOOLPATHS_VCARVE_GPU_BOUNDARY_FP32") == "1",
+                VCarveGenerationPolicy.Capture().GpuBoundaryFp32,
                 token, diagnostic, out context, out reason);
 
         // Explicit mode is useful for isolated controls; the normal factory's

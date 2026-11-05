@@ -19,6 +19,7 @@ internal static class VCarvePhysicalSweep
     private const int UnionBatchSize = 32;
     private const int FlatRunChunkChords = 256;
     private const int MaximumUnionHierarchyDepth = 2;
+    private const int ParallelUnionMinimumSourceChords = 4096;
     private const double ConsolidationMaximumPlanarCoordinate = 10_000;
     private const double ConsolidationMaximumZCoordinate = 100;
     private const double ConsolidationMaximumDepth = 100;
@@ -145,27 +146,32 @@ internal static class VCarvePhysicalSweep
         double offsetMilliseconds = 0, unionMilliseconds = 0;
         long sourceChords = paths.Sum(path => (long)Math.Max(0, path.Points.Count - 1));
         string bound = nominationUnion is not null ? "untrusted-lower-nomination" : upperBound ? "upper" : "lower";
+        MillingGeometryTrace.Capture("physical-sweep-" + bound, 0, paths);
         Console.WriteLine($"[VCarve.PhysicalSweep.Stage] event=start bound={bound} paths={paths.Count} " +
-            $"sourceChords={sourceChords} constantDepthRuns={accelerateConstantDepthRuns} effectiveTolerance={tolerance:R} " +
+            $"sourceChords={sourceChords} outputSurfaceZ={outputSurfaceZ:R} constantDepthRuns={accelerateConstantDepthRuns} effectiveTolerance={tolerance:R} " +
             $"hullUnionBatchSize={UnionBatchSize} maximumUnionHierarchyDepth={MaximumUnionHierarchyDepth} " +
             $"hemisphereConsolidationRequested={consolidateHemisphereChords} lowerOnly=True " +
             $"taperedRunsRequested={enableTaperedRadiusRuns} taperedRunsEnabled={taperedMode} " +
             $"taperedMaximumChords={TaperedRadiusRun.MaximumChords} taperedLossBudget={interpolationBudget:R} " +
-            "taperedAuthority=vertex-disc-domination-and-same-section-concavity taperedArithmetic=directed-enclosures " +
+            $"taperedAuthority=vertex-disc-domination-and-same-section-concavity taperedArithmetic=directed-enclosures " +
             $"consolidationMaximumXY={ConsolidationMaximumPlanarCoordinate:R} " +
             $"consolidationMaximumWorldZ={ConsolidationMaximumZCoordinate:R} " +
             $"consolidationMaximumDepth={ConsolidationMaximumDepth:R} " +
             $"consolidationMaximumSphereRadius={ConsolidationMaximumSphereRadius:R} " +
             $"consolidationSphereJoinReserve={ConsolidationDepthRoundoff:R} " +
-            "consolidationRefusal=literal-original-pieces originalUpperUnchanged=True");
+            $"consolidationRefusal=literal-original-pieces originalUpperUnchanged=True");
         double maximumRadialError = 0;
 
         Paths64 Union(Paths64 source) => nominationUnion is null
             ? Clipper.Union(source, FillRule.NonZero) : nominationUnion(source);
 
-        using var parallelUnions = enableParallelLeafUnions && nominationUnion is null
+        // Execute the same leaf operands and ordered hierarchy concurrently.
+        // The source and Boolean construction are identical to the serial oracle;
+        // this also covers upper channels, independently of nomination policies.
+        bool automaticParallelUnions = sourceChords >= ParallelUnionMinimumSourceChords;
+        using var parallelUnions = (enableParallelLeafUnions || automaticParallelUnions) && nominationUnion is null
             && GeometryParallelism.WorkerLimit > 1
-            ? new VCarveOrderedUnionQueue(cancellationToken, Math.Min(4, GeometryParallelism.WorkerLimit)) : null;
+            ? new VCarveOrderedUnionQueue(cancellationToken, GeometryParallelism.WorkerLimit) : null;
         var orderedUnionSlots = parallelUnions is null ? null : new List<VCarveOrderedUnionQueue.Slot>();
 
         void Progress(string stage, bool force = false)
@@ -274,7 +280,16 @@ internal static class VCarvePhysicalSweep
         void Emit(Point3D a, Point3D b, double ra, double rb, double radialError)
         {
             if (++pieces > 2_000_000)
-                throw new InvalidOperationException("V-carve physical sweep exceeded two million certified chord pieces.");
+            {
+                string detail = $"bound={bound} sourcePaths={paths.Count} sourceChords={sourceChords} "
+                    + $"processedChords={chords} hullPieces={pieces} subdivisions={subdivisions} "
+                    + $"flatChords={flatChords} taperedChords={taperedChords} outputSurfaceZ={outputSurfaceZ:R} "
+                    + $"effectiveTolerance={tolerance:R} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}";
+                Console.Error.WriteLine("[VCarve.PhysicalSweep.Rejected] reason=certified-chord-piece-budget " + detail);
+                var error = new InvalidOperationException("V-carve physical sweep exceeded two million certified chord pieces.");
+                error.Data["VCarvePhysicalSweep"] = detail;
+                throw error;
+            }
             maximumRadialError = Math.Max(maximumRadialError, radialError);
             if (!upperBound)
             {
@@ -503,9 +518,14 @@ internal static class VCarvePhysicalSweep
         // within the four-quantum radial reserve. A third hierarchy level would
         // exceed that reserve. Offset runs have their additional arc reserve.
         int hierarchyDepth = 0;
+        long hierarchyParallelBatches=0,hierarchyParallelPeakBytes=0;
+        double hierarchyParallelComputeMs=0;
         while (unionGroups.Count > 64 && hierarchyDepth < MaximumUnionHierarchyDepth)
         {
             var next = new List<Paths64>();
+            using var hierarchyQueue=parallelUnions is null?null:new VCarveOrderedUnionQueue(
+                cancellationToken,GeometryParallelism.WorkerLimit,maximumPathsPerLeaf:128);
+            var hierarchySlots=hierarchyQueue is null?null:new List<VCarveOrderedUnionQueue.Slot>();
             for (int first = 0; first < unionGroups.Count; first += 32)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -514,8 +534,22 @@ internal static class VCarvePhysicalSweep
                 // the isolated negative contour into falsely covered material.
                 var source = new Paths64();
                 for (int i = first; i < Math.Min(unionGroups.Count, first + 32); i++) source.AddRange(unionGroups[i]);
-                next.Add(Union(source));
+                if(hierarchyQueue is null)next.Add(Union(source));
+                else if(source.Count>128)
+                {
+                    hierarchyQueue.Drain();
+                    hierarchySlots!.Add(VCarveOrderedUnionQueue.Slot.Completed(Union(source)));
+                }
+                else hierarchySlots!.Add(hierarchyQueue.Submit(source));
                 Progress("union-batch");
+            }
+            if(hierarchyQueue is not null)
+            {
+                hierarchyQueue.Complete();
+                foreach(var slot in hierarchySlots!)next.Add(hierarchyQueue.Read(slot));
+                hierarchyParallelBatches+=hierarchyQueue.Submitted;
+                hierarchyParallelPeakBytes=Math.Max(hierarchyParallelPeakBytes,hierarchyQueue.PeakRetainedInputBytes);
+                hierarchyParallelComputeMs+=hierarchyQueue.ComputeMilliseconds;
             }
             unionGroups = next;
             hierarchyDepth++;
@@ -538,7 +572,8 @@ internal static class VCarvePhysicalSweep
         Console.WriteLine($"[VCarve.PhysicalSweep] bound={bound} paths={paths.Count} " +
             $"chords={chords} pieces={pieces} subdivisions={subdivisions} ignored={ignored} contours={result.Count} " +
             $"requestedTolerance={spatialTolerance:R} effectiveTolerance={tolerance:R} radialError={maximumRadialError:R} " +
-            $"gridReserve={GridReserve:R} unionHierarchyDepth={hierarchyDepth} " +
+            $"gridReserve={GridReserve:R} unionHierarchyDepth={hierarchyDepth} hierarchyParallelBatches={hierarchyParallelBatches} " +
+            $"hierarchyParallelPeakInputBytes={hierarchyParallelPeakBytes} hierarchyParallelComputeMs={hierarchyParallelComputeMs:F1} " +
             $"hullRoundingBound={(hierarchyDepth + 3) * Math.Sqrt(.5) / PathUtils.Scale:R} " +
             $"postUnionReserve={PostUnionReserve:R} postUnionArcTolerance={PostUnionArcTolerance:R} " +
             $"completeUncertaintyBound={uncertaintyBound:R} postUnionMs={postUnionMilliseconds:F1} " +
@@ -558,6 +593,7 @@ internal static class VCarvePhysicalSweep
             $"unionMs={unionMilliseconds:F1} orderedDiscHulls={orderedDiscHulls} " +
             $"serialLeafUnionMs={serialLeafUnionMilliseconds:F3} hierarchyFinalAndPostUnionMs={unionMilliseconds - serialLeafUnionMilliseconds:F3} " +
             $"parallelLeafUnionsRequested={enableParallelLeafUnions} parallelLeafUnionWorkers={parallelUnions?.WorkerCount ?? 0} " +
+            $"parallelLeafUnionsAutomatic={automaticParallelUnions} parallelLeafUnionMinimumSourceChords={ParallelUnionMinimumSourceChords} " +
             $"parallelLeafUnionBatches={parallelUnions?.Submitted ?? 0} parallelLeafUnionLiteralFallbacks={parallelUnions?.LiteralFallbacks ?? 0} " +
             $"parallelLeafUnionComputeMs={parallelUnions?.ComputeMilliseconds ?? 0:F3} parallelLeafUnionWaitMs={parallelUnions?.WaitMilliseconds ?? 0:F3} " +
             $"parallelLeafUnionPeakInFlight={parallelUnions?.PeakInFlight ?? 0} parallelLeafUnionPeakInputBytes={parallelUnions?.PeakRetainedInputBytes ?? 0} " +

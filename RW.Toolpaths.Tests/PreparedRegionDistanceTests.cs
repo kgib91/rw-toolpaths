@@ -18,6 +18,7 @@ public sealed class PreparedRegionDistanceTests
         {
             var canonical=Clipper.Union(PathUtils.ToClipper(source),FillRule.NonZero);
             var region=new PreparedRegionDistance(source);
+            var worker=region.CreateQueryWorker();
             for(int ix=-16;ix<=20;ix++)
             for(int iy=-20;iy<=24;iy++)
             {
@@ -38,6 +39,9 @@ public sealed class PreparedRegionDistanceTests
                 double expected=nearest<=PreparedRegionDistance.Uncertainty?0:inside?nearest:-nearest;
                 Assert.Equal(expected,region.SignedDistanceUncached(point),9);
                 Assert.Equal(expected,region.SignedDistance(point),9);
+                Assert.Equal(expected,worker.SignedDistanceUncached(point),9);
+                Assert.Equal(expected,worker.SignedDistance(point),9);
+                Assert.Equal(expected,worker.SignedDistance(point),9);
             }
         }
     }

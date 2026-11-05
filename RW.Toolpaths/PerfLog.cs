@@ -1,21 +1,29 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.CompilerServices;
+using RW.Diagnostics;
 
 namespace RW.Toolpaths;
 
 public static class PerfLog
 {
-    private static readonly bool TimingEnabled = ResolveEnabled();
-    private static readonly string? TimingFilePath = ResolveFilePath();
+    private static readonly bool TimingAllowed = ResolveEnabled();
+    private static readonly Lazy<string?> TimingFilePath = new(ResolveFilePath);
     private static readonly object FileLock = new();
 
-    public static bool IsEnabled => TimingEnabled;
+    public static bool IsEnabled => TimingAllowed && DiagnosticLog.IsEnabled("perf");
 
-    public static long Start() => TimingEnabled ? Stopwatch.GetTimestamp() : 0L;
+    public static long Start() => IsEnabled ? Stopwatch.GetTimestamp() : 0L;
+
+    public static void Stop(string area, long startTimestamp,
+        [InterpolatedStringHandlerArgument("startTimestamp")] ref TimingDetailsHandler details)
+    {
+        if (details.Enabled) Stop(area, startTimestamp, details.GetText());
+    }
 
     public static void Stop(string area, long startTimestamp, string? details = null)
     {
-        if (!TimingEnabled || startTimestamp == 0L)
+        if (!IsEnabled || startTimestamp == 0L)
             return;
 
         double elapsedMs = (Stopwatch.GetTimestamp() - startTimestamp) * 1000.0 / Stopwatch.Frequency;
@@ -35,11 +43,11 @@ public static class PerfLog
 
         Console.Error.WriteLine(message);
 
-        if (!string.IsNullOrWhiteSpace(TimingFilePath))
+        if (!string.IsNullOrWhiteSpace(TimingFilePath.Value))
         {
             lock (FileLock)
             {
-                File.AppendAllText(TimingFilePath!, message + Environment.NewLine);
+                File.AppendAllText(TimingFilePath.Value!, message + Environment.NewLine);
             }
         }
     }
@@ -54,11 +62,7 @@ public static class PerfLog
                    !string.Equals(env, "off", StringComparison.OrdinalIgnoreCase);
         }
 
-#if DEBUG
         return true;
-#else
-        return false;
-#endif
     }
 
     private static string? ResolveFilePath()
@@ -81,5 +85,25 @@ public static class PerfLog
         {
             return null;
         }
+    }
+
+    // Disabled timing never evaluates interpolated detail expressions at the call site.
+    [InterpolatedStringHandler]
+    public ref struct TimingDetailsHandler
+    {
+        private DefaultInterpolatedStringHandler _builder;
+        internal bool Enabled;
+
+        public TimingDetailsHandler(int literalLength, int formattedCount, long startTimestamp, out bool shouldAppend)
+        {
+            Enabled = shouldAppend = startTimestamp != 0L && IsEnabled;
+            _builder = Enabled ? new DefaultInterpolatedStringHandler(literalLength, formattedCount) : default;
+        }
+
+        public void AppendLiteral(string value) => _builder.AppendLiteral(value);
+        public void AppendFormatted<T>(T value) => _builder.AppendFormatted(value);
+        public void AppendFormatted<T>(T value, string? format) => _builder.AppendFormatted(value, format);
+        public void AppendFormatted<T>(T value, int alignment, string? format = null) => _builder.AppendFormatted(value, alignment, format);
+        internal string GetText() => _builder.ToStringAndClear();
     }
 }

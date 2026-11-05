@@ -189,7 +189,8 @@ public sealed class VCarveRoughingCoordinationTests
         Assert.NotEmpty(plan.Toolpaths);
         Assert.Contains(plan.Toolpaths, path => path.Category == "clearing" && path.DepthPassIndex == 0);
         Assert.True(plan.Toolpaths.Where(path => path.Category == "clearing" && path.DepthPassIndex == 0)
-            .SelectMany(path => path.Points).All(point => -point.Z <= .501));
+            .SelectMany(path => path.Spans.Count == 0 ? path.Points : path.Spans.Where(span => span.Kind == ToolpathSpanKind.Cut)
+                .SelectMany(span => path.Points.Skip(span.StartIndex).Take(span.PointCount))).All(point => -point.Z <= .501));
         Assert.Equal(3, depth.StartDepth); Assert.Equal(2, depth.SkipDepthPasses); Assert.False(options.IncludeInteriorFill);
         Assert.Throws<InvalidOperationException>(() => VCarveToolpaths.Generate(new[] { region }, tool,
             depth with { DepthPerPass = .75 }, options with { Preparation = preparation, RoughingAnalysis = analysis }, new RejectProvider()));

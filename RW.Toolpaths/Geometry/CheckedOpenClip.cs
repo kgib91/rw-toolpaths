@@ -28,7 +28,7 @@ internal static class CheckedOpenClip
     {
         if (Try(paths, clips, operation, token, out var output, execute)) return output;
         Console.Error.WriteLine($"[Geometry.OpenClipRefusal] owner={owner} operation={operation} "
-            + "completed=False partialPathsCredited=False decision=abort");
+            + $"completed=False partialPathsCredited=False decision=abort");
         throw new InvalidOperationException($"{owner}: open clipping could not be completed; partial paths cannot be emitted or credited.");
     }
 }

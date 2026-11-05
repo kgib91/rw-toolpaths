@@ -160,7 +160,7 @@ internal static class FilledFrontCoverageFallbackCapture
                     + $"materializedBefore={snapshot.MaterializedBefore} materializedAfter={snapshot.MaterializedAfter} "
                     + $"points={snapshot.CombinedPoints} pathRows={snapshot.CombinedPathRows} minimumAccepted={MinimumAcceptedFootprints} "
                     + $"outcome={snapshot.Outcome} retained={snapshot.Retained} "
-                    + "selectionAuthority=False prefixOrder=unchanged snapshots=detached-readonly");
+                    + $"selectionAuthority=False prefixOrder=unchanged snapshots=detached-readonly");
             }
             catch (Exception exception)
             {

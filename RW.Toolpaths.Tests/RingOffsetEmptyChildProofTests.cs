@@ -93,6 +93,7 @@ public sealed class RingOffsetEmptyChildProofTests
             using var output = new StringWriter();
             try
             {
+                using var logSelection = RW.Diagnostics.DiagnosticLog.PushNamespaces("*");
                 Console.SetOut(output);
                 result = MedialAxisGeometry.BuildConcentricFill(
                     [new MillingRegion([new(0, 0), new(2, 0), new(2, .15), new(0, .15)], [])],

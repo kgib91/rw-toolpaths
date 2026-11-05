@@ -6,6 +6,9 @@ namespace RW.Toolpaths.Milling;
 /// <summary>Configuration for concentric-offset pocket clearing.</summary>
 public sealed record PocketOptions
 {
+    /// <summary>Common machine rates, transfer plane and optional earlier-stock proof.
+    /// Null retains geometric routing when machine context is unavailable.</summary>
+    public MillingMotionSettings? Motion { get; init; }
     public MillingBoundaryAccess? BoundaryAccess { get; init; }
     internal IReadOnlyList<IReadOnlyList<PointD>>? KnownEmptyBoundary { get; init; }
     internal double KnownEmptyFloor { get; init; } = double.PositiveInfinity;
@@ -191,6 +194,16 @@ public sealed class ToolpathPlan
     /// <summary>Optional whole physical native/posted clearance authority for
     /// a downstream replacement chord, in the plan's workspace coordinates.</summary>
     public Func<Point3D,Point3D,bool>? ReplacementChordGuard { get; internal init; }
+    /// <summary>Native-only clearance against the same immutable physical stock
+    /// and target used by construction; excludes controller quantization.</summary>
+    public Func<Point3D,Point3D,bool>? NativeReplacementChordGuard { get; internal init; }
+    public Func<ToolMove,bool>? NativeReplacementCurveGuard { get; internal init; }
+
+
+    /// <summary>Optional positive full-cutter clearance authority against immutable
+    /// earlier posted stock. Applies to literal FINAL approach chords in workspace
+    /// coordinates; legality alone never authorizes faster travel.</summary>
+    public Func<Point3D,Point3D,bool>? ClearedTravelGuard { get; internal init; }
 
     /// <summary>Area the cutter sweeps, for stock tracking by later operations.</summary>
     public IReadOnlyList<List<PointD>> SweptArea { get; }
@@ -246,7 +259,7 @@ public static class PocketToolpaths
         Console.WriteLine($"[Pocket.SmoothRoughing] event=analysis-start owner=current-pocket "
             + $"regions={regions.Count} physicalToolRadius={tool.Radius:R} ownFloor={depth.Depth:R} "
             + $"ownRampAngleDegrees={options.SmoothRampAngleDegrees:R} ownEdgeOffset={options.StockToLeave:R} "
-            + "futureOperationsRead=False retainedRoughingStrategyUnchanged=True");
+            + $"futureOperationsRead=False retainedRoughingStrategyUnchanged=True");
         var preparation = VCarveToolpaths.Prepare(regions, tool, depth,
             new VCarveOptions
             {
@@ -267,7 +280,7 @@ public static class PocketToolpaths
             + $"features={analysis.Basins.Count} omittedFeatures={analysis.Basins.Count(feature => feature.OmitRoughing)} "
             + $"protectedSources={analysis.ProtectedSourceRegionIndices.Count} protectedArea={analysis.ProtectedArea:R} "
             + $"preparation={preparation.Fingerprint} originalGeometry={preparation.OriginalGeometryFingerprint} "
-            + "futureOperationsRead=False analysisComplete=True policy=complete-footprint-flat-plateau");
+            + $"futureOperationsRead=False analysisComplete=True policy=complete-footprint-flat-plateau");
         return analysis;
     }
 
@@ -295,9 +308,8 @@ public static class PocketToolpaths
         // A flat cutter clears the same plateau with raster strips plus the
         // compensated perimeter; all existing footprint / access proofs remain.
         long protectedPoints=options.ProtectedBoundary?.Sum(p=>(long)p.Count)??0;
-        bool uniformFlat=tool.VCarveProfile is { } physical
-            ? (float)physical.TipRadius==(float)tool.Radius && physical.PhysicalRadiusAtDepth(depth.Depth)==physical.TipRadius
-            : tool.ConeLength is null;
+        bool uniformFlat=PocketContinuationRouter.TryFlatCylinderRadius(tool,
+            PocketContinuationRouter.RequiredPostedCylinderHeight(depth),out _);
         if(options.SmoothRoughing && protectedPoints>=20_000)
             Console.WriteLine($"[Pocket.SurfaceStrategy.Selection] protectedPoints={protectedPoints} uniformFlat={uniformFlat} "
                 +$"assignedRadius={tool.Radius:R} physicalTipRadius={tool.VCarveProfile?.TipRadius:R} radiusIdentity=binary32-assignment-and-uniform-physical-section maxRings={options.MaxRings}");
@@ -309,7 +321,7 @@ public static class PocketToolpaths
             double angle=height>width?90:0;
             Console.WriteLine($"[Pocket.SurfaceStrategy] policy={MachiningAccuracy.Policy} strategy=raster-with-compensated-perimeter "
                 +$"reason=dense-protected-flat-plateau protectedPoints={protectedPoints} angle={angle:R} "
-                +"originalConcentricPathsRequired=False authoredFloorStepdownAndAllowanceRetained=True fullPhysicalProtectionRequired=True");
+                +$"originalConcentricPathsRequired=False authoredFloorStepdownAndAllowanceRetained=True fullPhysicalProtectionRequired=True");
             progress?.Invoke(0,"Clearing the protected roughing plateau");
             var raster=ScanlinePocketToolpaths.Generate(regions,tool,depth,options with {
                 IndependentRasterEntries=true,
@@ -684,9 +696,11 @@ public static class PocketToolpaths
         // continuation. Certify floor links in the final execution order.
         if (category == Category)
         {
+            MillingGeometryTrace.Capture("pocket-constructed", 0, toolpaths);
             var ordered = PocketContinuationRouter.Route(toolpaths, depth, options, tool.Radius, cancellationToken,
                 tool: tool);
             toolpaths = ordered.Paths;
+            MillingGeometryTrace.Capture("pocket-routed", 0, toolpaths);
             linkLifts += ordered.Lifts;
             plunges += ordered.Plunges;
             linearRamps += ordered.LinearRamps;
@@ -1396,12 +1410,9 @@ public static class PocketToolpaths
                         double dx = firstRing[0].x - target.X;
                         double dy = firstRing[0].y - target.Y;
                         double connectorLength = Math.Sqrt(dx * dx + dy * dy);
-                        double connectorDrop = RampDropForDistance(
-                            options.Ramp,
-                            connectorLength,
-                            topZ - bottomZ);
-                        ringEntryZ = topZ - connectorDrop;
-                        rampFromPreviousPass = connectorDrop > 1e-9;
+                        ringEntryZ = RampPlanner.PlanTransitionEntry(target,
+                            new(firstRing[0].x,firstRing[0].y,bottomZ),options.Ramp).Z;
+                        rampFromPreviousPass = topZ - ringEntryZ > 1e-9;
                         if (rampFromPreviousPass && connectorLength > 1e-9)
                             radialDepthRamps++;
                     }
@@ -1612,22 +1623,6 @@ public static class PocketToolpaths
             return false;
 
         return clearance.IsTravelSafe(from, to, toolRadius);
-    }
-
-    private static double RampDropForDistance(
-        RampSettings settings,
-        double horizontalDistance,
-        double requestedDrop)
-    {
-        if (settings.Strategy == RampStrategy.Plunge
-            || settings.AngleRadians <= 0
-            || horizontalDistance <= 1e-9
-            || requestedDrop <= 1e-9)
-        {
-            return 0;
-        }
-
-        return Math.Min(requestedDrop, horizontalDistance * Math.Tan(settings.AngleRadians));
     }
 
     internal static bool TryFindSafeRebase(
@@ -1911,7 +1906,7 @@ public static class PocketToolpaths
                 Console.WriteLine($"[Pocket.SourceTravel] event=refuse from=({from.X:R},{from.Y:R},{from.Z:R}) "
                     + $"to=({to.X:R},{to.Y:R},{to.Z:R}) requestedRadius={_requestedRadius:R} "
                     + $"nativeChordRadius={(_radius + 4) / PathUtils.Scale:R} "
-                    + "sourceApproximationCredited=False proof=complete-original-source-capsule");
+                    + $"sourceApproximationCredited=False proof=complete-original-source-capsule");
             return safe;
         }
 
@@ -1919,7 +1914,7 @@ public static class PocketToolpaths
             + $"sourceRefusals={_sourceRefusals} callerRefusals={_callerRefusals} clipRefusals={_clipRefusals} "
             + $"requestedRadius={_requestedRadius:R} nativeChordRadius={(_radius + 4) / PathUtils.Scale:R} "
             + $"sourceMemoHits={SourceMemoHits} sourceMemoMisses={_sourceMemoMisses} sourceMemoEvictions={_sourceMemoEvictions} sourceMemoLimit=65536 "
-            + "scope=all-offset-links sourceApproximationCredited=False");
+            + $"scope=all-offset-links sourceApproximationCredited=False");
     }
 
     private static double CutLength(IReadOnlyList<Point3D> points, IReadOnlyList<ToolpathSpan> spans)

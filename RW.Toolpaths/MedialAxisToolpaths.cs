@@ -103,6 +103,7 @@ public readonly record struct TaggedToolpath
     internal int? ContinuationSourceOrdinal {get;init;}=null;
     internal bool ContinuationCircuit {get;init;}=false;
     internal ToolpathCircuitBuilder.Definition? ContinuationCircuitDefinition {get;init;}=null;
+    internal VCarveRingOrder.Visit? ConcentricSource {get;init;}=null;
 
     public IReadOnlyList<Point3D> Points { get; init; }
 
@@ -157,8 +158,8 @@ public interface IMedialAxisProvider
     ///   inscribed-circle radius exceeds this are omitted.
     /// </param>
     /// <param name="filteringAngle">
-    ///   Maximum cell angle (in radians) above which a medial-axis edge is
-    ///   filtered out.  Prunes edges at sharp interior corners.
+    ///   Maximum angle of two segment sites meeting at one input corner.
+    ///   PI retains the complete inner graph; ordinary construction requests 3PI/4.
     /// </param>
     /// <param name="useBigIntegers">
     ///   When <c>true</c>, the Voronoi computation uses 128-bit integer
@@ -173,7 +174,7 @@ public interface IMedialAxisProvider
         IReadOnlyList<IReadOnlyList<PointD>> holes,
         double tolerance,
         double maxRadius,
-        double filteringAngle = 3 * Math.PI / 4,
+        double filteringAngle = Math.PI,
         bool   useBigIntegers = true);
 
     /// <summary>Cancelable, observable overload; older providers remain compatible.</summary>
@@ -232,8 +233,9 @@ public static class MedialAxisToolpaths
     /// <summary>
     /// Generates raw medial-axis segments for visualization/debugging.
     ///
-    /// Uses the same preprocessing/grouping/provider contract as the production
-    /// path, but keeps radius values in XY-space (no Z conversion, no trimming).
+    /// Retains the unconditioned diagnostic contract with XY-space radii.
+    /// Ordinary nominal construction is owned by VCarveMedialConstruction;
+    /// this raw diagnostic does not apply that preparation policy.
     /// </summary>
     public static IReadOnlyList<MedialSegment> GenerateRawMedialAxisSegments(
         IMedialAxisProvider provider,
@@ -264,18 +266,18 @@ public static class MedialAxisToolpaths
         double maxRadius = maxRadiusOverride ?? profile.PassRadius;
         double scale = InitialScale;
 
-        List<List<PointD>>? simplifiedLayer = null;
+        List<List<PointD>>? quantizedLayer = null;
         IReadOnlyList<MedialSegment> raw = Array.Empty<MedialSegment>();
 
         for (int attempt = 0; attempt < 4; attempt++)
         {
-            simplifiedLayer = GenerateSimplifiedLayer(normalizedBoundary, scale);
-            if (simplifiedLayer is null || simplifiedLayer.Count == 0)
+            quantizedLayer = QuantizeMedialBoundary(normalizedBoundary, scale);
+            if (quantizedLayer is null || quantizedLayer.Count == 0)
                 return Array.Empty<MedialSegment>();
 
             raw = GenerateMedialAxis(
                 provider,
-                simplifiedLayer,
+                quantizedLayer,
                 maxRadius,
                 scale,
                 tolerance,
@@ -290,7 +292,7 @@ public static class MedialAxisToolpaths
             foreach (var seg in raw)
                 maxR = Math.Max(maxR, Math.Max(seg.Point0.Radius, seg.Point1.Radius));
 
-            var bb = BoundingBox(simplifiedLayer.SelectMany(r => r));
+            var bb = BoundingBox(quantizedLayer.SelectMany(r => r));
             double minor = Math.Min(bb.maxX - bb.minX, bb.maxY - bb.minY);
             if (maxR < minor * 0.55)
                 return raw;
@@ -379,7 +381,8 @@ public static class MedialAxisToolpaths
         Action<double, string, bool>? progress = null,
         double outputSurfaceZ = 0,
         IReadOnlyList<MedialSegment>? preparedMedialGraph = null,
-        CertifiedInsetReuse? insetReuse = null)
+        CertifiedInsetReuse? insetReuse = null,
+        Func<double,double,VCarveMaterialSurface.ClearingLayer?>? materialClearingInset = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         diagnostic?.Invoke("stage=medial-axis event=start");
@@ -398,7 +401,7 @@ public static class MedialAxisToolpaths
             coneLengthOverride,
             cancellationToken, cutterProfile, diagnostic,
             (fraction, stage, indeterminate) => progress?.Invoke(4.0 / 7 * fraction, stage, indeterminate),
-            outputSurfaceZ, preparedMedialGraph, insetReuse, includeInteriorFill);
+            outputSurfaceZ, preparedMedialGraph, insetReuse, includeInteriorFill, materialClearingInset);
 
         if (result is null)
         {
@@ -577,11 +580,15 @@ public static class MedialAxisToolpaths
         Action<double, string, bool>? progress = null,
         double outputSurfaceZ = 0,
         int skipDepthPasses = 0,
-        double startingDepth = 0)
+        double startingDepth = 0,
+        double excludedDiscRadius = 0,
+        IReadOnlyList<VCarveRoughingChord>? roughingChords = null)
         => GenerateClearingPassesTaggedCore(boundary, startDepth, endDepth, radianTipAngle,
             depthPerPass, stepOver, regionIndex, bottomRadiusOverride, topRadiusOverride,
             coneLengthOverride, includeInteriorFill, detectCurves, diagnostic, cutterProfile,
-            cancellationToken, edgeFillWidth, progress, outputSurfaceZ, skipDepthPasses, startingDepth, null);
+            cancellationToken, edgeFillWidth, progress, outputSurfaceZ, skipDepthPasses, startingDepth, null,
+            excludedDiscRadius: excludedDiscRadius,
+            restFillStock:excludedDiscRadius>0 ? new VCarvePostedFloorSweep(roughingChords??Array.Empty<VCarveRoughingChord>()) : null);
 
     private static List<TaggedToolpath> GenerateClearingPassesTaggedCore(
         IReadOnlyList<IReadOnlyList<PointD>> boundary,
@@ -607,7 +614,11 @@ public static class MedialAxisToolpaths
         CertifiedInsetReuse? insetReuse = null,
         RW.Toolpaths.Milling.Acceleration.RawInitialClearingInsetNomination? initialInsetNomination = null,
         bool retainRawFirst = true, bool retainRawCore = true, bool retainRawMiddle = true,
-        Action<bool>? selectedRawRolesCompleted = null)
+        Action<bool>? selectedRawRolesCompleted = null,
+        bool concentricClearingOnly = false,
+        double excludedDiscRadius = 0,
+        VCarvePostedFloorSweep? restFillStock = null,
+        Func<double,double,VCarveMaterialSurface.ClearingLayer?>? materialClearingInset = null)
     {
         var geometries = GenerateClearingPassGeometries(
             boundary,
@@ -621,7 +632,7 @@ public static class MedialAxisToolpaths
             coneLengthOverride,
             includeInteriorFill,
             diagnostic, cutterProfile, cancellationToken, edgeFillWidth, progress, outputSurfaceZ, skipDepthPasses, startingDepth, insetReuse, initialInsetNomination,
-            retainRawFirst, retainRawCore, retainRawMiddle, selectedRawRolesCompleted);
+            retainRawFirst, retainRawCore, retainRawMiddle, selectedRawRolesCompleted, concentricClearingOnly, excludedDiscRadius, restFillStock, materialClearingInset);
 
         var result = new List<TaggedToolpath>(geometries.Count);
         foreach (var (points, depthPassIndex) in geometries)
@@ -660,7 +671,11 @@ public static class MedialAxisToolpaths
         CertifiedInsetReuse? insetReuse = null,
         RW.Toolpaths.Milling.Acceleration.RawInitialClearingInsetNomination? initialInsetNomination = null,
         bool retainRawFirst = true, bool retainRawCore = true, bool retainRawMiddle = true,
-        Action<bool>? selectedRawRolesCompleted = null)
+        Action<bool>? selectedRawRolesCompleted = null,
+        bool concentricClearingOnly = false,
+        double excludedDiscRadius = 0,
+        VCarvePostedFloorSweep? restFillStock = null,
+        Func<double,double,VCarveMaterialSurface.ClearingLayer?>? materialClearingInset = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentOutOfRangeException.ThrowIfNegative(skipDepthPasses);
@@ -678,6 +693,8 @@ public static class MedialAxisToolpaths
         // contour simplification step is for medial-axis stability, not pocket
         // offset fidelity.
         var clearingBoundary = normalizedBoundary;
+        var discExclusion = excludedDiscRadius > 0 && (includeInteriorFill||edgeFillWidth>0)
+            ? new VCarveDiscSweepExclusion(clearingBoundary,excludedDiscRadius,cancellationToken,diagnostic,"oriented-layer-boundary") : null;
 
         var profile = ResolveToolProfile(
             startDepth,
@@ -724,6 +741,7 @@ public static class MedialAxisToolpaths
         bool CloseTo(double a, double x) => Math.Abs(a - x) < Eps;
         int plannedLayers = nominalLayers - effectiveSkipped;
         int preparationIndex = 0;
+        var materialRadii=new Dictionary<double,double>();
 
         HashSet<double>? rawNominationDepths = initialInsetNomination?.CollectorNominationCaptured == true ? new() : null;
 
@@ -739,7 +757,13 @@ public static class MedialAxisToolpaths
                 $"commandedDepth={commandedDepth:R} radius={radius:R} nominalRadius={nominalRadius:R} " +
                 $"surfaceZ={outputSurfaceZ:R} zDecimals=3 sourceRings={clearingBoundary.Count}");
             List<List<PointD>> rings;
-            if(initialInsetNomination is not null&&initialInsetNomination.TryNominate(clearingBoundary,radius,cancellationToken,diagnostic,out var rawNomination,out string rawReason))
+            var contact=materialClearingInset?.Invoke(layerDepth,radius);
+            if(contact is not null)
+            {
+                rings=contact.Rings;
+                materialRadii.Add(layerDepth,contact.MinimumRadius);
+            }
+            else if(initialInsetNomination is not null&&initialInsetNomination.TryNominate(clearingBoundary,radius,cancellationToken,diagnostic,out var rawNomination,out string rawReason))
             {
                 rings=rawNomination!;
                 rawNominationDepths?.Add(layerDepth);
@@ -762,7 +786,7 @@ public static class MedialAxisToolpaths
                 profile.RadiusSlope, startDepth, k, outputSurfaceZ, coneLengthOverride);
             var layer = ContractLayer(k, contractAmount);
             if (layer.Count > 0)
-                layers.Add((-k, -N, layer, false, contractAmount, nominalRadius, nominalPassIndex));
+                layers.Add((-k, -N, layer, false, materialRadii.GetValueOrDefault(k,contractAmount), nominalRadius, nominalPassIndex));
 
             N = k;
             k += depthPerPass;
@@ -787,12 +811,12 @@ public static class MedialAxisToolpaths
                 // radius at endDepth == profile.FinalRadius, so any tool-centre path
                 // closer to the boundary than that would cut outside the glyph.
                 if (bt.Count > 0)
-                    layers.Add((-k, -N, bt, true, finalCommandRadius, finalRadius, nominalPassIndex));
+                    layers.Add((-k, -N, bt, true, materialRadii.GetValueOrDefault(endDepth,finalCommandRadius), finalRadius, nominalPassIndex));
             }
             else if (bt.Count > 0)
             {
                 // Overshot endDepth slightly â€” just add bottom layer.
-                layers.Add((-b, -N, bt, true, finalCommandRadius, finalRadius, nominalPassIndex));
+                layers.Add((-b, -N, bt, true, materialRadii.GetValueOrDefault(endDepth,finalCommandRadius), finalRadius, nominalPassIndex));
             }
         }
 
@@ -872,7 +896,7 @@ public static class MedialAxisToolpaths
                 // RAW band candidate is shared literally: it has no physical or
                 // filled-set credit before original Smooth Protect. The old
                 // source-index/chord constructor remains the whole fallback.
-                terminalCore = rawBandNominated ? edgeCore
+                terminalCore = materialRadii.ContainsKey(-z) ? PolygonOps.Intersect(edgeCore!,rings) : rawBandNominated ? edgeCore
                     : PolygonOps.CutterInset(clearingBoundary, layerRadius, edgeCore!, cancellationToken);
             }
             diagnostic?.Invoke($"stage=clearing-band event=limit depth={-z:R} origin=original-boundary " +
@@ -988,7 +1012,7 @@ public static class MedialAxisToolpaths
                         LevelProgress = ReportRing,
                     },
                     layerRadius,
-                    preserveTerminalPaths: true,
+                    preserveTerminalPaths: !concentricClearingOnly,
                     cancellationToken: cancellationToken);
             }
             diagnostic?.Invoke($"stage=raw-absolute-clearing-collector depth={-z:R} requested={rawCollectorRequested} " +
@@ -1004,6 +1028,7 @@ public static class MedialAxisToolpaths
                 && (!retainRawCore || terminalCore is { Count: > 0 });
             selectedRawRolesCompleted?.Invoke(selectedRawRolesSupported);
             var paths = new List<List<Point3D>>(collected.Count);
+            bool contourRest=discExclusion is not null && (includeInteriorFill||maximumInset>0);
             int literalFirstRings = 0, literalTerminalRings = 0;
             if (collectorNomination)
             {
@@ -1015,7 +1040,7 @@ public static class MedialAxisToolpaths
                         var trace = front.Select(p => new Point3D(p.x, p.y, z)).ToList();
                         if (trace.Count > 1 && trace[0] != trace[^1]) trace.Add(trace[0]);
                         if (trace.Count < 2) throw new InvalidOperationException("A bounded RAW clearing front lost its literal ring.");
-                        paths.Add(trace);
+                        if(!contourRest||!terminal)paths.Add(trace);
                         if (terminal) literalTerminalRings++; else literalFirstRings++;
                     }
                 }
@@ -1029,6 +1054,7 @@ public static class MedialAxisToolpaths
                     && ring.IsClosed && ring.OffsetDistance == maximumInset))) continue;
                 var stroke = MaterializeClearingRing(ring, z);
                 if (stroke.Count < 2) continue;
+                if(contourRest&&ring.Level>0)continue;
                 // Intermediate fronts and open terminals retain the authored
                 // centerline band guard. The canonical final contour is already
                 // that guard's boundary; clipping it against an independently
@@ -1045,6 +1071,18 @@ public static class MedialAxisToolpaths
                 diagnostic?.Invoke($"stage=clearing-band event=clipped depth={-z:R} " +
                     $"inputPaths={bandCandidates.Count} clippedPaths={clipped.Count} canonicalFinalFrontWhole=True");
             }
+            if(contourRest)
+            {
+                // Preserve the mandatory perimeter's original visit before
+                // adding independent rest-pocket cycles at shared vertices.
+                paths=JoinTouchingClearingCycles(paths);
+                IReadOnlyList<IReadOnlyList<PointD>> area=hasEdgeCore ? PolygonOps.Difference(rings,edgeCore!) : rings;
+                var cleared=restFillStock?.AtDepth(-z,cancellationToken,diagnostic)??Array.Empty<IReadOnlyList<PointD>>();
+                var rest=discExclusion!.Fill(area,cleared,fillPitch,maximumInset,cancellationToken,diagnostic);
+                RingOffsetEngine.BuildNesting(rest);
+                foreach(int ordinal in RingOffsetEngine.BuildTraversal(rest,false).Order)
+                    paths.Add(MaterializeClearingRing(rest[ordinal],z));
+            }
             diagnostic?.Invoke($"stage=clearing-concentric event=topology depth={-z:R} " +
                 $"closed={collected.Count(ring => ring.IsClosed)} open={collected.Count(ring => !ring.IsClosed)} " +
                 $"sharedCollector=True fixedCompensatedBoundary=True");
@@ -1057,7 +1095,7 @@ public static class MedialAxisToolpaths
                 "tinyRingAreaCutoffAdded=False originalRingWorkCaps=True " +
                 "physicalTerminalProofCredit=False originalFloorArtworkGradeRequired=True stockCredit=False unsupportedWholeOriginalCollectorFallback=True");
             int separateCycles = paths.Count;
-            paths = JoinTouchingClearingCycles(paths);
+            if(!contourRest)paths = JoinTouchingClearingCycles(paths);
             if (paths.Count != separateCycles)
                 diagnostic?.Invoke($"stage=clearing-topology depth={-z:R} sourceCycles={separateCycles} " +
                     $"connectedVisits={paths.Count} preservedCoverage=True");
@@ -1305,7 +1343,12 @@ public static class MedialAxisToolpaths
         double startingDepth = 0,
         IReadOnlyList<MedialSegment>? preparedMedialGraph = null,
         RW.Toolpaths.Milling.Acceleration.RawInitialClearingInsetNomination? initialInsetNomination = null,
-        bool supplementalInitialBand = true)
+        bool supplementalInitialBand = true,
+        bool concentricClearingOnly = false,
+        bool includeClearingPasses = true,
+        double excludedDiscRadius = 0,
+        VCarvePostedFloorSweep? restFillStock = null,
+        Func<double,double,VCarveMaterialSurface.ClearingLayer?>? materialClearingInset = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         long t0 = PerfLog.Start();
@@ -1316,7 +1359,7 @@ public static class MedialAxisToolpaths
         diagnostic?.Invoke($"stage=clearing event=start interiorFill={includeInteriorFill} detectCurves={detectCurves} " +
             $"mode={(includeInteriorFill ? "interior-and-perimeters" : edgeFillWidth > 0 ? "edge-band" : "perimeters-only")} " +
             $"edgeFillWidth={edgeFillWidth:R} edgeFillOrigin=original-boundary");
-        var clearing = GenerateClearingPassesTaggedCore(
+        var clearing = includeClearingPasses ? GenerateClearingPassesTaggedCore(
             boundary,
             startDepth,
             endDepth,
@@ -1331,8 +1374,11 @@ public static class MedialAxisToolpaths
             detectCurves,
             diagnostic, cutterProfile, cancellationToken, edgeFillWidth,
             (fraction, stage, indeterminate) => progress?.Invoke(.3 * fraction, stage, indeterminate),
-            outputSurfaceZ, skipDepthPasses, startingDepth, insetReuse, initialInsetNomination);
-        diagnostic?.Invoke($"stage=clearing event=complete paths={clearing.Count} points={clearing.Sum(path => (long)path.Points.Count)}");
+            outputSurfaceZ, skipDepthPasses, startingDepth, insetReuse, initialInsetNomination,
+            concentricClearingOnly: concentricClearingOnly, excludedDiscRadius: excludedDiscRadius,restFillStock:restFillStock,
+            materialClearingInset:materialClearingInset) : new List<TaggedToolpath>();
+        diagnostic?.Invoke($"stage=clearing event=complete paths={clearing.Count} points={clearing.Sum(path => (long)path.Points.Count)} "
+            + $"concentricClearingOnly={concentricClearingOnly}");
         cancellationToken.ThrowIfCancellationRequested();
         result.AddRange(clearing);
 
@@ -1444,7 +1490,7 @@ public static class MedialAxisToolpaths
             includeInteriorFill,
             diagnostic, cutterProfile,
             (fraction, stage, indeterminate) => progress?.Invoke(.3 + .7 * fraction, stage, indeterminate),
-            outputSurfaceZ, preparedMedialGraph, insetReuse);
+            outputSurfaceZ, preparedMedialGraph, insetReuse, materialClearingInset);
         cancellationToken.ThrowIfCancellationRequested();
         if (finalPass is not null)
         {
@@ -1673,7 +1719,8 @@ public static class MedialAxisToolpaths
             double outputSurfaceZ = 0,
             IReadOnlyList<MedialSegment>? preparedMedialGraph = null,
             CertifiedInsetReuse? insetReuse = null,
-            bool includeInteriorFill = true)
+            bool includeInteriorFill = true,
+            Func<double,double,VCarveMaterialSurface.ClearingLayer?>? materialClearingInset = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         long t0 = PerfLog.Start();
@@ -1708,20 +1755,21 @@ public static class MedialAxisToolpaths
             // Only GenerateCore's actual interior-fill branch consumes this
             // region. Retain the original Contract call/cache on that branch.
             var preparedFlat = includeInteriorFill
-                ? Contract(normalizedBoundary, commandRadius, cancellationToken, insetReuse)
+                ? materialClearingInset?.Invoke(endDepth,commandRadius)?.Rings
+                    ?? Contract(normalizedBoundary, commandRadius, cancellationToken, insetReuse)
                 : new List<List<PointD>>();
             diagnostic?.Invoke($"stage=flat-area-work branch=prepared-medial computed={includeInteriorFill} "
                 + $"reason={(includeInteriorFill ? "interior-fill-consumer" : "no-interior-fill-consumer")} "
                 + $"radius={commandRadius:R} rings={preparedFlat.Count} medialConversionUnchanged=True");
-            diagnostic?.Invoke($"stage=medial-axis event=reused originalGraphEdges={preparedMedialGraph.Count} " +
-                "sourceClearancePreserved=True originalArtworkBoundary=True");
+            diagnostic?.Invoke($"stage=medial-axis event=reused preparedGraphEdges={preparedMedialGraph.Count} " +
+                "physicalDepthBoundary=original-artwork depthFidelityRequired=True");
             cancellationToken.ThrowIfCancellationRequested();
             return (converted, preparedFlat);
         }
         double scale    = InitialScale;
         string? lastErr  = null;
 
-        List<List<PointD>>?       simplifiedLayer = null;
+        List<List<PointD>>?       quantizedLayer = null;
         List<MedialSegment>       medialAxis      = new();
 
         for (int attempt = 0; attempt < 4; attempt++)
@@ -1729,9 +1777,9 @@ public static class MedialAxisToolpaths
             cancellationToken.ThrowIfCancellationRequested();
             long tAttempt = PerfLog.Start();
             progress?.Invoke(0, $"Preparing medial geometry (attempt {attempt + 1}/4)...", true);
-            // Simplify/scale the polygon layer
-            simplifiedLayer = GenerateSimplifiedLayer(normalizedBoundary, scale);
-            if (simplifiedLayer is null || simplifiedLayer.Count == 0)
+            // Quantize the original polygon layer without contour cleanup
+            quantizedLayer = QuantizeMedialBoundary(normalizedBoundary, scale);
+            if (quantizedLayer is null || quantizedLayer.Count == 0)
             {
                 PerfLog.Stop("MedialAxisToolpaths.GenerateMedialAxisToolpaths.Attempt", tAttempt, $"attempt={attempt + 1} empty-simplified");
                 PerfLog.Stop("MedialAxisToolpaths.GenerateMedialAxisToolpaths", t0, "empty-simplified");
@@ -1741,7 +1789,7 @@ public static class MedialAxisToolpaths
             // Compute medial axis via Voronoi-of-segments
             var rawSegments = GenerateMedialAxis(
                 provider,
-                simplifiedLayer,
+                quantizedLayer,
                 maxRadius,
                 scale,
                 tolerance,
@@ -1769,7 +1817,7 @@ public static class MedialAxisToolpaths
             }
 
             // Success condition: no radius exceeds 55 % of bounding box minor axis
-            var bb = BoundingBox(simplifiedLayer.SelectMany(r => r));
+            var bb = BoundingBox(quantizedLayer.SelectMany(r => r));
             double minor = Math.Min(bb.maxX - bb.minX, bb.maxY - bb.minY);
             if (maxR < minor * 0.55)
             {
@@ -1787,7 +1835,7 @@ public static class MedialAxisToolpaths
             Console.Error.WriteLine($"medial-axis: failed after scale increases; {lastErr}");
 
         // Flat bottom region: contract by cutter radius at final depth.
-        // Use the raw normalized boundary (not the morph-opened simplifiedLayer) so this region
+        // Use the raw normalized boundary so this region
         // matches exactly the area the clearing passes fill at endZ; otherwise the Difference
         // clip in GenerateFlatAreaFill removes medial-axis flat strokes from sub-regions that
         // are not covered by clearing rings, producing a visible toolpath gap.
@@ -1797,7 +1845,8 @@ public static class MedialAxisToolpaths
         // Contract's original entry check also applies when its unused work is skipped.
         cancellationToken.ThrowIfCancellationRequested();
         List<List<PointD>> flatArea = includeInteriorFill
-            ? Contract(normalizedBoundary, flatCommandRadius, cancellationToken, insetReuse)
+            ? materialClearingInset?.Invoke(endDepth,flatCommandRadius)?.Rings
+                ?? Contract(normalizedBoundary, flatCommandRadius, cancellationToken, insetReuse)
             : new List<List<PointD>>();
         diagnostic?.Invoke($"stage=flat-area-work branch=constructed-medial computed={includeInteriorFill} "
             + $"reason={(includeInteriorFill ? "interior-fill-consumer" : "no-interior-fill-consumer")} "
@@ -1907,100 +1956,17 @@ public static class MedialAxisToolpaths
         return PathUtils.CanonicalizeRings(rings);
     }
 
-    // --- generateSimplifiedLayer (contour-pass) ----------------------------------------
-
-    /// <summary>
-    /// Returns the polygon region at the first cut depth, simplified and scaled
-    /// to integer coordinates for numerical stability.
-    ///
-    /// Port of <c>gh(contour-pass(n), scale)</c> which expands to:
-    /// <code>
-    ///   n.simplify(undefined, scale)
-    ///    .contract(OFFSET_DISTANCE, MiterJoin)
-    ///    .expand(2 * OFFSET_DISTANCE, MiterJoin)
-    ///    .contract(OFFSET_DISTANCE, MiterJoin)
-    ///    .simplify(undefined, scale)
-    ///    .clean()
-    /// </code>
-    /// where <c>OFFSET_DISTANCE = 16 / 32768</c> workspace units.  The
-    /// contract->expand->contract morphological pass removes sharp concavities
-    /// that would destabilise the Voronoi/medial-axis computation.
-    /// </summary>
-    internal static List<List<PointD>>? GenerateSimplifiedLayer(
-        IReadOnlyList<IReadOnlyList<PointD>> boundary,
-        double scale)
+    /// <summary>Quantizes the original boundary for the native integer sites.
+    /// Preserves its vertices and topology without contour smoothing.</summary>
+    internal static List<List<PointD>> QuantizeMedialBoundary(
+        IReadOnlyList<IReadOnlyList<PointD>> boundary, double scale)
     {
-        long t0 = PerfLog.Start();
-        // The algorithm works in an integer coordinate space where
-        //   1 unit  = (1 / scale) workspace units
-        //   1 unit  = (PathUtils.Scale / scale) Clipper64 integer units
-        // With scale = p_ = 4096:
-        //   OFFSET_DISTANCE = 16/32768 workspace  =  (16/32768)*4096 = 2 integer units
-        //   Clipper64 delta = 2 * (PathUtils.Scale / scale) = 2 * (32768/4096) = 16
-        // OFFSET_DISTANCE = 16/32768 workspace units.
-        // Clipper64 integer coords here = workspace_coord * scale
-        // -> delta = (16/32768) * scale  (e.g. scale=4096 -> delta=2; scale=32768 -> delta=16)
-        long morphDelta = (long)Math.Round(16.0 / 32768.0 * scale);
-
-        // 1. Scale up to [scale]-scaled Clipper64 coords + lighten (= simplify)
-        // active scale to preserve the same geometric threshold.
-        double simplifyTolerance = 64.0 * (scale / PathUtils.Scale);
-        if (simplifyTolerance < 1.0) simplifyTolerance = 1.0;
-
         var scaled = PathUtils.ToClipper(boundary.Select(r => r.Select(p =>
             new PointD(p.x * scale / PathUtils.Scale, p.y * scale / PathUtils.Scale))));
-
-        // Match medial-axis preprocessing simplification strength
-        // without affecting other pipelines that use PathUtils.Lighten.
-        var pass1 = PathUtils.Lighten(scaled, simplifyTolerance);
-        if (pass1.Count == 0)
-        {
-            PerfLog.Stop("MedialAxisToolpaths.GenerateSimplifiedLayer", t0, $"scale={scale:R} input={boundary.Count} pass1=0");
-            return null;
-        }
-
-        // 2. contract(OFFSET_DISTANCE, Miter) -> expand(2*OFFSET_DISTANCE, Miter) -> contract(OFFSET_DISTANCE, Miter)
-        //    Net: zero offset, but removes sharp inward features (opening morph)
-        var contracted1 = Clipper.InflatePaths(pass1,         -morphDelta, JoinType.Miter, EndType.Polygon);
-        if (contracted1.Count == 0)
-        {
-            PerfLog.Stop("MedialAxisToolpaths.GenerateSimplifiedLayer", t0, $"scale={scale:R} input={boundary.Count} contracted1=0");
-            return null;
-        }
-        var expanded    = Clipper.InflatePaths(contracted1,  2 * morphDelta, JoinType.Miter, EndType.Polygon);
-        if (expanded.Count == 0)
-        {
-            PerfLog.Stop("MedialAxisToolpaths.GenerateSimplifiedLayer", t0, $"scale={scale:R} input={boundary.Count} expanded=0");
-            return null;
-        }
-        var contracted2 = Clipper.InflatePaths(expanded,       -morphDelta, JoinType.Miter, EndType.Polygon);
-        if (contracted2.Count == 0)
-        {
-            PerfLog.Stop("MedialAxisToolpaths.GenerateSimplifiedLayer", t0, $"scale={scale:R} input={boundary.Count} contracted2=0");
-            return null;
-        }
-
-        // 3. simplify again + clean (drop rings with < 3 points)
-        var pass2 = PathUtils.Lighten(contracted2, simplifyTolerance);
-        if (pass2.Count == 0)
-        {
-            PerfLog.Stop("MedialAxisToolpaths.GenerateSimplifiedLayer", t0, $"scale={scale:R} input={boundary.Count} pass2=0");
-            return null;
-        }
-
-        // 4. Scale back to workspace coordinates
-        var simplified = PathUtils.FromClipper(pass2)
-            .Select(r => r.Select(p => new PointD(p.x * PathUtils.Scale / scale, p.y * PathUtils.Scale / scale))
-                          .ToList())
-            .Where(r => r.Count >= 3)   // clean(): discard degenerate rings
-            .ToList<List<PointD>>();
-
-        PerfLog.Stop(
-            "MedialAxisToolpaths.GenerateSimplifiedLayer",
-            t0,
-            $"scale={scale:R} input={boundary.Count} output={simplified.Count}");
-
-        return simplified;
+        return PathUtils.FromClipper(scaled)
+            .Select(r => r.Select(p => new PointD(p.x * PathUtils.Scale / scale,
+                p.y * PathUtils.Scale / scale)).ToList())
+            .Where(r => r.Count >= 3).ToList();
     }
 
     // --- generateMedialAxis (ridge-pass) ----------------------------------------------
@@ -2012,7 +1978,7 @@ public static class MedialAxisToolpaths
     /// </summary>
     private static IReadOnlyList<MedialSegment> GenerateMedialAxis(
         IMedialAxisProvider provider,
-        IReadOnlyList<List<PointD>> simplifiedLayer,
+        IReadOnlyList<List<PointD>> quantizedLayer,
         double maxRadius,
         double scale,
         double tolerance,
@@ -2023,7 +1989,7 @@ public static class MedialAxisToolpaths
         cancellationToken.ThrowIfCancellationRequested();
         long t0 = PerfLog.Start();
         // Group into boundary + holes via NonIntersectingPathGroups
-        var groups = NonIntersectingPathGroups(simplifiedLayer).ToList();
+        var groups = NonIntersectingPathGroups(quantizedLayer).ToList();
         var result = new List<MedialSegment>();
         int groupCount = 0;
         foreach (var (outerBoundary, holes) in groups)
@@ -2034,11 +2000,13 @@ public static class MedialAxisToolpaths
 
             var segments = MedialAxisGeometry.Build(outerBoundary,
                 holes.Select(hole => (IReadOnlyList<PointD>)hole).ToList(), provider,
-                tolerance, maxRadius, 3.0 * Math.PI / 4.0, cancellationToken, diagnostic,
+                tolerance, maxRadius, Math.PI, cancellationToken, diagnostic,
                 (fraction, stage, indeterminate) => progress?.Invoke(
                     (groupCount - 1 + fraction) / groups.Count,
                     $"Medial group {groupCount}/{groups.Count}: {stage}", indeterminate),
                 coordinateScale: scale);
+            diagnostic?.Invoke($"stage=medial-policy contourCleanup=False anglePruning=False scale={scale:R} "
+                + "source=quantized-original-boundary insideOutsideClassificationPreserved=True");
 
             if (segments.Count > 0)
                 result.Capacity = Math.Max(result.Capacity, result.Count + segments.Count);
@@ -2385,7 +2353,7 @@ public static class MedialAxisToolpaths
     /// containment.  Each outer CCW ring is paired with its CW hole rings.
     ///
     /// </summary>
-    private static IEnumerable<(List<PointD> Boundary, List<List<PointD>> Holes)>
+    internal static IEnumerable<(List<PointD> Boundary, List<List<PointD>> Holes)>
         NonIntersectingPathGroups(IReadOnlyList<List<PointD>> rings)
     {
         // Convert each ring once to integer coordinates and reuse for winding + containment tests.
@@ -3103,6 +3071,41 @@ public static class MedialAxisToolpaths
             return Math.Max(0, Math.BitDecrement(dx * dx + dy * dy));
         }
 
+        // The literal separation evaluator uses the polygon-box lower bound
+        // only for edges wholly outside the expanded chord box. Never prune a
+        // possibly touching edge: its unchanged stationary-point arithmetic
+        // must still run. Far subtree bounds are rounded outward/downward.
+        internal double QueryCutterSeparation(Point3D a,Point3D b,double radius,
+            Func<(PointD A,PointD B),double> evaluate)
+        {
+            if(_nodes.Length==0)return double.PositiveInfinity;
+            double x0=Math.Min(a.X,b.X),x1=Math.Max(a.X,b.X),y0=Math.Min(a.Y,b.Y),y1=Math.Max(a.Y,b.Y);
+            var expanded=new Box(x0-radius,y0-radius,x1+radius,y1+radius);
+            double radiusSquaredUpper=Math.BitIncrement(radius*radius),minimum=double.PositiveInfinity;
+            double Lower(Box bounds)
+            {
+                double dx=Math.Max(0,Math.Max(bounds.MinX-x1,x0-bounds.MaxX));
+                double dy=Math.Max(0,Math.Max(bounds.MinY-y1,y0-bounds.MaxY));
+                dx=Math.Max(0,Math.BitDecrement(dx));dy=Math.Max(0,Math.BitDecrement(dy));
+                double xx=Math.Max(0,Math.BitDecrement(dx*dx)),yy=Math.Max(0,Math.BitDecrement(dy*dy));
+                double square=Math.Max(0,Math.BitDecrement(xx+yy));
+                return Math.BitDecrement(square-radiusSquaredUpper);
+            }
+            void Visit(int ordinal)
+            {
+                var node=_nodes[ordinal];
+                if(!node.Bounds.Intersects(expanded)&&Lower(node.Bounds)>=minimum)return;
+                if(node.Left<0)
+                {
+                    for(int i=node.First;i<node.First+node.Count;i++)minimum=Math.Min(minimum,evaluate(_segments[_order[i]]));
+                    return;
+                }
+                double left=Lower(_nodes[node.Left].Bounds),right=Lower(_nodes[node.Right].Bounds);
+                if(left<=right){Visit(node.Left);Visit(node.Right);}else{Visit(node.Right);Visit(node.Left);}
+            }
+            Visit(0);return minimum;
+        }
+
         public double QueryDistance(double x, double y)
         {
             if (_segments.Length == 0) return 0.0;
@@ -3642,4 +3645,3 @@ public static class MedialAxisToolpaths
     }
 
 }
-

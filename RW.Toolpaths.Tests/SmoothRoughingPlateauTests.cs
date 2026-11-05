@@ -7,6 +7,21 @@ namespace RW.Toolpaths.Tests;
 public sealed class SmoothRoughingPlateauTests
 {
     [Fact]
+    public void ParallelConstantOffsetsRetainEveryLiteralMaskVertexAndUnionLevel()
+    {
+        var points=Enumerable.Range(0,9001).Select(i=>new Point3D(
+            20*Math.Cos(i*Math.PI/4500),20*Math.Sin(i*Math.PI/4500),-1)).ToArray();
+        var path=new TaggedToolpath(points,[],0,"final-carve",null,detectCurves:false);
+        IReadOnlyList<PointD>[] boundary=[[new(-40,-40),new(40,-40),new(40,40),new(-40,40)]];
+        var serial=SmoothRoughingPlateau.Build([path],boundary,3,.7,default,
+            target:boundary,parallelLeafUnions:false);
+        var parallel=SmoothRoughingPlateau.Build([path],boundary,3,.7,default,
+            target:boundary,parallelLeafUnions:true);
+        Assert.Equal(serial.Count,parallel.Count);
+        for(int i=0;i<serial.Count;i++)Assert.Equal(serial[i],parallel[i]);
+    }
+
+    [Fact]
     public void PairedGradeFieldsPreserveTheIndependentResultsAndVisitMetadata()
     {
         TaggedToolpath Path(params Point3D[] points) => new(points, [], 2, "final-carve", 1, 17, detectCurves: false);

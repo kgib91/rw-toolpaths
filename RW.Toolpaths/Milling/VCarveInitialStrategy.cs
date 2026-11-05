@@ -5,12 +5,6 @@ namespace RW.Toolpaths.Milling;
 public sealed class VCarveInitialStrategy
 {
     public const string Version = "bounded-smooth-rest-finishing-v3";
-    private static readonly string[] Names = {
-        "RW_TOOLPATHS_VCARVE_RAW_INITIAL_INSET_NOMINATION",
-        "RW_TOOLPATHS_VCARVE_INITIAL_FRONT_CONDITIONING",
-        "RW_TOOLPATHS_VCARVE_INITIAL_STOCK_COHORT",
-        "RW_TOOLPATHS_VCARVE_SUPPLEMENTAL_INITIAL_BAND",
-        "RW_TOOLPATHS_VCARVE_PARALLEL_SWEEP_UNIONS" };
     private readonly bool _smooth, _interior;
     private readonly double _angle, _width, _depth, _stepOver, _restWidth;
     private readonly VCarveCutterProfile? _profile;
@@ -22,14 +16,17 @@ public sealed class VCarveInitialStrategy
     public int Mask { get; }
     public bool AutomaticEligible { get; }
     public string Origin { get; }
+    /// <summary>The remaining requested nominations captured with this strategy.</summary>
+    public VCarveGenerationPolicy GenerationPolicy { get; }
     public string CacheSignature => Mask == 0 ? string.Empty : $"|{Version}:{Mask:X2}";
     private VCarveInitialStrategy(VCarveOptions options,VCarveCutterProfile? profile,double depth,
-        int mask,bool eligible,string origin)
+        int mask,bool eligible,string origin,VCarveGenerationPolicy generationPolicy)
     {
         _smooth=options.SmoothVCarving;_interior=options.IncludeInteriorFill;
         _angle=options.SmoothRampAngleDegrees;_width=options.EdgeFillWidth;_depth=depth;_profile=profile;_stepOver=options.StepOver;
         _restWidth=options.RoughingRestWidth;
         Mask=mask;AutomaticEligible=eligible;Origin=origin;
+        GenerationPolicy=generationPolicy;
     }
     public static VCarveInitialStrategy Capture(VCarveOptions options,VCarveCutterProfile? profile,double effectiveDepth)
     {
@@ -44,20 +41,15 @@ public sealed class VCarveInitialStrategy
             &&double.IsFinite(effectiveDepth)&&effectiveDepth>1e-6&&effectiveDepth<=profile.MaximumDepth
             &&double.IsFinite(profile.RadiusAtDepth(effectiveDepth))&&profile.RadiusAtDepth(effectiveDepth)>0
             &&profile.RadiusAtDepth(effectiveDepth)<=100;
-        int explicitOnes=0;bool original=false,invalid=false;
-        for(int i=0;i<Names.Length;i++)
-        {
-            string? value=Environment.GetEnvironmentVariable(Names[i]);
-            if(value=="0")original=true;
-            else if(value=="1")explicitOnes|=1<<i;
-            else if(!string.IsNullOrEmpty(value))invalid=true;
-        }
+        var policy = VCarveGenerationPolicy.Capture();
+        int explicitOnes = policy.ExplicitInitialMask;
+        bool original = policy.OriginalInitialRequested, invalid = policy.InvalidInitialRequest;
         // Explicit zero is atomic: never ship a half-enabled automatic policy.
         int mask=!options.SmoothVCarving||original||invalid?0:eligible?31:explicitOnes;
         string origin=original?"explicit-zero-original":invalid?"invalid-environment-original":eligible?
             explicitOnes==0?"automatic-eligible":"automatic-eligible-with-literal-one":
             explicitOnes!=0?"literal-one-diagnostic":"ineligible-original";
-        return new(options,profile,effectiveDepth,mask,eligible,origin);
+        return new(options,profile,effectiveDepth,mask,eligible,origin,policy);
     }
     internal bool Matches(VCarveOptions options,VCarveCutterProfile profile,double depth)
     {

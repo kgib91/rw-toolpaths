@@ -102,19 +102,42 @@ public class PolygonOpsTests
         Assert.False(PolygonOps.Contains(stroke,10,0));
     }
 
-    [Fact]
-    public void DenseFilledDilationKeepsInteriorAndSignedHoles()
+    [Theory]
+    [InlineData(1.0)]
+    [InlineData(.00318310546875)]
+    [InlineData(.0023837890625)]
+    public void DenseFilledDilationKeepsInteriorAndSignedHoles(double radius)
     {
         var outer=Circle(0,0,10,1024);var hole=Circle(0,0,5,512);hole.Reverse();
-        var expanded=PolygonOps.Buffer([outer,hole],1,.001);
+        var expanded=PolygonOps.Buffer([outer,hole],radius,.001);
         Assert.False(PolygonOps.Contains(expanded,0,0));
-        Assert.False(PolygonOps.Contains(expanded,3.998,0));
-        Assert.True(PolygonOps.Contains(expanded,4.002,0));
+        Assert.False(PolygonOps.Contains(expanded,5-radius-.002,0));
+        Assert.True(PolygonOps.Contains(expanded,5-radius+.002,0));
         Assert.True(PolygonOps.Contains(expanded,7,0));
-        Assert.True(PolygonOps.Contains(expanded,10.998,0));
-        Assert.False(PolygonOps.Contains(expanded,11.002,0));
-        var solid=PolygonOps.Buffer([outer],1,.001);
+        Assert.True(PolygonOps.Contains(expanded,10+radius-.002,0));
+        Assert.False(PolygonOps.Contains(expanded,10+radius+.002,0));
+        var solid=PolygonOps.Buffer([outer],radius,.001);
         Assert.True(PolygonOps.Contains(solid,0,0));
+    }
+
+    [Fact]
+    public void ReusedFilledDilationRetainsLiteralInputsAndIndependentOutputOwnership()
+    {
+        var outer=Circle(0,0,10,1024);var hole=Circle(0,0,5,512);hole.Reverse();
+        IReadOnlyList<PointD>[] source=[outer,hole];
+        var reference=PolygonOps.BufferWithBoundaryCapsules(source,1,.001);
+        var first=PolygonOps.Buffer(source,1,.001);
+        first[0][0]=new(1000,1000);first.Clear();
+        var second=PolygonOps.Buffer(source,1,.001);
+        Assert.Equal(reference.Count,second.Count);
+        for(int i=0;i<reference.Count;i++)Assert.Equal(reference[i],second[i]);
+        // A changed radius and changed original knot must each use their own
+        // complete construction; neither may inherit the old geometric answer.
+        outer[0]=new(10.1,0);
+        reference=PolygonOps.BufferWithBoundaryCapsules(source,.75,.001);
+        var changed=PolygonOps.Buffer(source,.75,.001);
+        Assert.Equal(reference.Count,changed.Count);
+        for(int i=0;i<reference.Count;i++)Assert.Equal(reference[i],changed[i]);
     }
 
     [Fact]

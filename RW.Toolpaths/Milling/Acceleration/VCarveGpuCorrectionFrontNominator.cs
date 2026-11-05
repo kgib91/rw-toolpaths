@@ -71,7 +71,7 @@ internal sealed class VCarveGpuCorrectionFrontNominator : IDisposable
 
     internal static bool TryCreate(IReadOnlyList<IReadOnlyList<PointD>> originalChannel,
         CancellationToken token, Action<string>? diagnostic,
-        out VCarveGpuCorrectionFrontNominator? context, out string reason)
+        out VCarveGpuCorrectionFrontNominator? context, out string reason, VCarveGenerationPolicy? policy = null)
     {
         context = null; token.ThrowIfCancellationRequested();
         if (originalChannel is null || originalChannel.Count is < 1 or > 16_384)
@@ -84,7 +84,7 @@ internal sealed class VCarveGpuCorrectionFrontNominator : IDisposable
         }
         if (!VCarveGpuDistanceFrontNominator.BoundarySnapshot.TryPrepare(originalChannel, token,
             out var snapshot, out reason)) return false;
-        if (!snapshot!.TryCreateSampler(token, diagnostic, out var sampler, out reason)) return false;
+        if (!snapshot!.TryCreateSampler(token, diagnostic, out var sampler, out reason, policy)) return false;
         VCarveGpuCorrectionFrontNominator? owner = null;
         try
         {

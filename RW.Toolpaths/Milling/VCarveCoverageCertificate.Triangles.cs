@@ -170,7 +170,8 @@ internal static partial class VCarveCoverageCertificate
             VCarveGpuDiscWitnessContext.BoundarySampleContext? boundaryGpu = null;
             if (limits.UseGpuBoundaryNominations)
             {
-                BoundaryGpuAvailable = boundary.TryCreateBoundaryGpu(diagnostic, out boundaryGpu, out BoundaryGpuReason);
+                BoundaryGpuAvailable = boundary.TryCreateBoundaryGpu(diagnostic, out boundaryGpu, out BoundaryGpuReason,
+                    limits.GenerationPolicy);
                 if (BoundaryGpuAvailable) BoundaryGpuReason = "ready";
             }
             using var boundaryGpuOwner = boundaryGpu;

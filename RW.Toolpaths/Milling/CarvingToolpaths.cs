@@ -9,6 +9,9 @@ public sealed record CarvingSamplingRegion(double X, double Y, double Width, dou
 
 public sealed record CarvingOptions
 {
+    /// <summary>Common machine rates, transfer plane and optional earlier-stock proof.
+    /// Null retains geometric routing when machine context is unavailable.</summary>
+    public MillingMotionSettings? Motion { get; init; }
     public double StepOver { get; init; } = 0.1;
     public double SurfaceAllowance { get; init; }
     public double RadialAllowance { get; init; }
@@ -16,6 +19,8 @@ public sealed record CarvingOptions
     public bool BothWays { get; init; } = true;
     public bool InsideOut { get; init; }
     public double Tolerance { get; init; } = 0.02;
+    /// <summary>Explicit permitted upward detail filtering; zero disables extra lift.</summary>
+    public double MicrotextureLiftAllowanceMm { get; init; }
     /// <summary>Legacy physical clearance-field spacing in millimeters. Used only when SamplingPercent is zero.</summary>
     public double SamplingSpacing { get; init; }
     /// <summary>Percentage of each source image dimension used for the raster guide field.
@@ -228,7 +233,7 @@ public static class CarvingRoughingToolpaths
             // One interval only: rebuilding the full depth schedule for every slice repeats cuts.
             var plan = PocketToolpaths.Generate(regions, tool,
                 new DepthSchedule(depth - previous, depth - previous) { SurfaceZ = surface.SurfaceZ - previous },
-                new PocketOptions {
+                new PocketOptions { Motion=options.Motion,
                     StepOver = options.StepOver, StockToLeave = options.RadialAllowance,
                     InsideOut = options.InsideOut, Ramp = options.Ramp,
                     Tolerances = new GeometryTolerances { ArcTolerance = options.Tolerance / 4, SimplifyTolerance = 0 },
@@ -276,7 +281,7 @@ public static class CarvingRoughingToolpaths
                 paths.Add(path with { Category = "carving-rough", DepthPassIndex = pass, VisitIdentity = paths.Count });
             swept.AddRange(passPlans[pass].SweptArea);
         }
-        paths = ToolpathContinuationPlanner.Reconnect(paths,"carving-rough",2*tool.Radius,cancellationToken);
+        paths = ToolpathContinuationPlanner.Reconnect(paths,"carving-rough",2*tool.Radius,cancellationToken,motion:options.Motion,surface:surface.SurfaceZ);
         return new ToolpathPlan(paths, swept, new ToolpathDiagnostics { PathCount = paths.Count, DepthPassCount = count });
     }
 
@@ -354,7 +359,8 @@ public static class CarvingFinishingToolpaths
         // chord accuracy. Limit it to 5% of the ball-tip diameter and 0.05 mm;
         // only sub-tip valleys can be bridged, always above the proven path.
         double microtextureSpan = ballNose ? 2 * tipRadius : 0;
-        double microtextureLift = ballNose ? Math.Min(0.05, tipRadius * 0.1) : 0;
+        if(!double.IsFinite(options.MicrotextureLiftAllowanceMm)||options.MicrotextureLiftAllowanceMm<0)throw new ArgumentOutOfRangeException(nameof(options.MicrotextureLiftAllowanceMm));
+        double microtextureLift = ballNose ? options.MicrotextureLiftAllowanceMm : 0;
         long started = System.Diagnostics.Stopwatch.GetTimestamp();
         int workers = Math.Clamp(Environment.ProcessorCount - 2, 1, 16);
         Console.WriteLine($"[Carving.Finish] start rows={rows + 1} workers={workers} tolerance={options.Tolerance:R}");
@@ -655,11 +661,11 @@ public static class CarvingFinishingToolpaths
         Console.WriteLine($"[Carving.Finish] complete rows={rows + 1} samples={totalSamples} points={totalPoints} paths={paths.Count} tolerance={options.Tolerance:R} elapsedMs={System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}");
         if (discontinuityBridges > 0)
             Console.WriteLine($"[Carving.Discontinuity] bridges={discontinuityBridges} maximumSpan={rowMaximumBridgeSpan.Max():R} " +
-                "clearance=original-source-rectangle");
+                $"clearance=original-source-rectangle");
         Console.WriteLine($"[Carving.SourceProof] method=correlated-section-support exactPointQueries={exactPointQueries} physicalChordQueries={physicalChordQueries} " +
             $"guideRejects={guideRejects} physicalRejects={physicalRejects} failedProofs={failedProofs} rejectedValleys={rejectedValleys}");
         field?.ReportFallbacks();
-        paths = ToolpathContinuationPlanner.Reconnect(paths,"carving-finish",2*tool.Radius,cancellationToken);
+        paths = ToolpathContinuationPlanner.Reconnect(paths,"carving-finish",2*tool.Radius,cancellationToken,motion:options.Motion,surface:surface.SurfaceZ);
         return new ToolpathPlan(paths, new List<List<PointD>>(), new ToolpathDiagnostics { PathCount = paths.Count, DepthPassCount = 1 });
     }
     internal static Point3D[] ClampRasterToSurface(IReadOnlyList<Point3D> points, double top,
