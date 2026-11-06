@@ -1,4 +1,5 @@
 using Clipper2Lib;
+using System.Diagnostics;
 
 namespace RW.Toolpaths.Milling;
 
@@ -59,6 +60,9 @@ internal static class ProfileRoutePlanner
     {
         public long SegmentPairsConsidered;
         public long SegmentPairsPruned;
+        public long SourceSegmentPairsConsidered,SourceSegmentPairsPruned,SourcePortalSolveTicks;
+        public long IndexBuilds,IndexQueries,IndexNodeVisits,IndexCandidates,IndexRejectedPairs,IndexFallbackSolves;
+        public long IndexReservedBytes,IndexBuildTicks,PortalSolveTicks;
     }
 
     private readonly record struct BoundaryBounds(
@@ -67,28 +71,149 @@ internal static class ProfileRoutePlanner
         double MaxX,
         double MaxY);
 
+    internal const long MaximumSegmentIndexBytes=64L<<20;
+    private const int MinimumIndexedSegments=32;
+
+    // Portal geometry is literal double precision. The shared polygon index
+    // quantizes to integer machining coordinates, so it cannot own these ties.
+    private sealed class SegmentIndex
+    {
+        private readonly record struct Entry(BoundaryBounds Bounds,int Ordinal);
+        private readonly record struct Node(BoundaryBounds Bounds,int First,int Count,int Left,int Right);
+        internal BoundaryBounds[] OriginalBounds{get;}
+        private readonly Entry[] entries;
+        private readonly Node[] nodes;
+        internal static long Reservation(int count)=>256L+128L*count;
+        internal SegmentIndex(IReadOnlyList<PointD> points)
+        {
+            OriginalBounds=new BoundaryBounds[points.Count];entries=new Entry[points.Count];
+            for(int i=0;i<points.Count;i++)
+            {
+                OriginalBounds[i]=GetSegmentBounds(points[i],points[(i+1)%points.Count]);
+                entries[i]=new(PortalArithmeticEnvelope(OriginalBounds[i]),i);
+            }
+            var built=new List<Node>();Build(0,entries.Length);nodes=built.ToArray();
+            int Build(int first,int count)
+            {
+                var bounds=entries[first].Bounds;
+                for(int i=first+1;i<first+count;i++)bounds=Union(bounds,entries[i].Bounds);
+                int index=built.Count;built.Add(default);
+                if(count<=16){built[index]=new(bounds,first,count,-1,-1);return index;}
+                bool x=bounds.MaxX-bounds.MinX>=bounds.MaxY-bounds.MinY;
+                Array.Sort(entries,first,count,Comparer<Entry>.Create((a,b)=>{
+                    double av=x?a.Bounds.MinX/2+a.Bounds.MaxX/2:a.Bounds.MinY/2+a.Bounds.MaxY/2;
+                    double bv=x?b.Bounds.MinX/2+b.Bounds.MaxX/2:b.Bounds.MinY/2+b.Bounds.MaxY/2;
+                    int order=av.CompareTo(bv);return order!=0?order:a.Ordinal.CompareTo(b.Ordinal);
+                }));
+                int half=count/2,left=Build(first,half),right=Build(first+half,count-half);
+                built[index]=new(bounds,first,0,left,right);return index;
+            }
+        }
+        internal void Query(BoundaryBounds first,double best,List<int> ordinals,PortalSearchMetrics? metrics)
+        {
+            ordinals.Clear();if(metrics is not null)metrics.IndexQueries++;
+            Visit(0);ordinals.Sort();
+            if(metrics is not null){metrics.IndexCandidates+=ordinals.Count;metrics.IndexRejectedPairs+=entries.Length-ordinals.Count;}
+            void Visit(int ordinal)
+            {
+                if(metrics is not null)metrics.IndexNodeVisits++;
+                var node=nodes[ordinal];
+                if(ConservativeBoundsDistanceSquared(first,node.Bounds)>=best)return;
+                if(node.Count==0){Visit(node.Left);Visit(node.Right);return;}
+                for(int i=node.First;i<node.First+node.Count;i++)
+                    if(ConservativeBoundsDistanceSquared(first,entries[i].Bounds)<best)ordinals.Add(entries[i].Ordinal);
+            }
+        }
+        private static BoundaryBounds Union(BoundaryBounds a,BoundaryBounds b)=>new(
+            Math.Min(a.MinX,b.MinX),Math.Min(a.MinY,b.MinY),Math.Max(a.MaxX,b.MaxX),Math.Max(a.MaxY,b.MaxY));
+    }
+
+    private sealed class PortalIndexOwner(long limit,PortalSearchMetrics metrics)
+    {
+        private sealed class Entry
+        {
+            internal SegmentIndex? Index;
+            internal bool Attempted,CheckedDomain,Eligible;
+        }
+        private readonly Dictionary<IReadOnlyList<PointD>,Entry> entries=new(ReferenceEqualityComparer.Instance);
+        internal readonly List<int> Scratch=new();
+        private Entry? GetEntry(IReadOnlyList<PointD> points)
+        {
+            if(entries.TryGetValue(points,out var entry))return entry;
+            // Covers metadata objects and dictionary resize scratch as well.
+            if(256>limit-metrics.IndexReservedBytes)return null;
+            entry=new();entries.Add(points,entry);metrics.IndexReservedBytes+=256;return entry;
+        }
+        internal bool Eligible(IReadOnlyList<PointD> points)
+        {
+            var entry=GetEntry(points);if(entry is null)return false;
+            if(!entry.CheckedDomain){entry.Eligible=FinitePortalDomain(points);entry.CheckedDomain=true;}
+            return entry.Eligible;
+        }
+        internal SegmentIndex? Get(IReadOnlyList<PointD> points)
+        {
+            var entry=GetEntry(points);if(entry is null)return null;
+            if(entry.Attempted)return entry.Index;entry.Attempted=true;
+            long bytes=SegmentIndex.Reservation(points.Count);
+            if(points.Count<MinimumIndexedSegments||!Eligible(points)||bytes>limit-metrics.IndexReservedBytes)return null;
+            long started=Stopwatch.GetTimestamp();var index=new SegmentIndex(points);
+            metrics.IndexBuildTicks+=Stopwatch.GetTimestamp()-started;metrics.IndexBuilds++;metrics.IndexReservedBytes+=bytes;
+            return entry.Index=index;
+        }
+    }
+
+    private static bool FinitePortalDomain(IReadOnlyList<PointD> points)=>points.Count>0
+        &&points.All(p=>double.IsFinite(p.x)&&double.IsFinite(p.y)&&Math.Abs(p.x)<=1e12&&Math.Abs(p.y)<=1e12);
+
+    private static BoundaryBounds PortalArithmeticEnvelope(BoundaryBounds bounds)
+    {
+        // This bounds the ORIGINAL leaf-box predicate, not an ideal projection.
+        // Outward boxes plus monotone nonnegative arithmetic and downward
+        // rounding cannot exceed that predicate for any enclosed leaf. The
+        // unchanged leaf predicate therefore skips every omitted pair too.
+        // The finite domain also keeps the legacy best distance finite and
+        // nonincreasing; unsupported domains retain the literal full scan.
+        return new(Math.BitDecrement(bounds.MinX),Math.BitDecrement(bounds.MinY),
+            Math.BitIncrement(bounds.MaxX),Math.BitIncrement(bounds.MaxY));
+    }
+    private static double ConservativeBoundsDistanceSquared(BoundaryBounds a,BoundaryBounds b)
+    {
+        static double Down(double x)=>x>0&&double.IsFinite(x)?Math.Max(0,Math.BitDecrement(x)):0;
+        double x=Math.Max(Down(a.MinX-b.MaxX),Down(b.MinX-a.MaxX));
+        double y=Math.Max(Down(a.MinY-b.MaxY),Down(b.MinY-a.MaxY));
+        return Down(Down(x*x)+Down(y*y));
+    }
+
     internal static ProfileRouteForest Plan(
         IReadOnlyList<OffsetRing> rings,
         IReadOnlyList<ProfileSourceComponent> sourceComponents,
         double toolRadius,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,bool useSegmentIndex=true,long maximumSegmentIndexBytes=MaximumSegmentIndexBytes)
     {
+        if(maximumSegmentIndexBytes<0||maximumSegmentIndexBytes>MaximumSegmentIndexBytes)throw new ArgumentOutOfRangeException(nameof(maximumSegmentIndexBytes));
         long t0 = PerfLog.Start();
         if (rings.Count == 0)
             return new ProfileRouteForest(Array.Empty<ProfileRouteTree>(), 0, toolRadius);
 
+        var portalSearchMetrics = new PortalSearchMetrics();
+        PortalIndexOwner? portalIndices=null;
+        if(useSegmentIndex&&maximumSegmentIndexBytes>=256)
+        {
+            portalSearchMetrics.IndexReservedBytes=256;
+            portalIndices=new(maximumSegmentIndexBytes,portalSearchMetrics);
+        }
         var ringClusters = BuildRingClusters(
             rings,
             sourceComponents,
             toolRadius + LinkClearance.DefaultTolerance,
             cancellationToken,
+            portalIndices,portalSearchMetrics,
             out int sourcePairCandidates,
             out int sourcePairSolves);
         var trees = new List<ProfileRouteTree>(ringClusters.Count);
         int portalCount = 0;
         int portalSolves = 0;
         int portalFrontierChecks = 0;
-        var portalSearchMetrics = new PortalSearchMetrics();
         foreach (var ringCluster in ringClusters)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -96,7 +221,7 @@ internal static class ProfileRoutePlanner
                 rings,
                 ringCluster,
                 cancellationToken,
-            portalSearchMetrics,
+                portalSearchMetrics,portalIndices,
                 out int treePortalSolves,
                 out int treePortalFrontierChecks);
             trees.Add(tree);
@@ -126,6 +251,10 @@ internal static class ProfileRoutePlanner
             $"portalSolves={portalSolves} portalFrontierChecks={portalFrontierChecks} " +
             $"segmentPairs={portalSearchMetrics.SegmentPairsConsidered} " +
             $"segmentPairsPruned={portalSearchMetrics.SegmentPairsPruned} " +
+            $"sourceSegmentPairs={portalSearchMetrics.SourceSegmentPairsConsidered} sourceSegmentPairsPruned={portalSearchMetrics.SourceSegmentPairsPruned} sourcePortalSolveMs={portalSearchMetrics.SourcePortalSolveTicks*1000.0/Stopwatch.Frequency:F3} " +
+            $"segmentIndexBuilds={portalSearchMetrics.IndexBuilds} segmentIndexQueries={portalSearchMetrics.IndexQueries} segmentIndexNodeVisits={portalSearchMetrics.IndexNodeVisits} " +
+            $"segmentIndexCandidates={portalSearchMetrics.IndexCandidates} segmentIndexRejectedPairs={portalSearchMetrics.IndexRejectedPairs} segmentIndexFallbackSolves={portalSearchMetrics.IndexFallbackSolves} " +
+            $"segmentIndexBuildMs={portalSearchMetrics.IndexBuildTicks*1000.0/Stopwatch.Frequency:F3} portalSolveMs={portalSearchMetrics.PortalSolveTicks*1000.0/Stopwatch.Frequency:F3} segmentIndexReservedBytes={portalSearchMetrics.IndexReservedBytes} segmentIndexByteLimit={maximumSegmentIndexBytes} segmentOrdinalOrder=original physicalAuthorityUnchanged=True " +
             $"sourceProximity={toolRadius:F3}");
         return new ProfileRouteForest(trees, portalCount, toolRadius);
     }
@@ -135,6 +264,7 @@ internal static class ProfileRoutePlanner
         IReadOnlyList<ProfileSourceComponent> sourceComponents,
         double proximity,
         CancellationToken cancellationToken,
+        PortalIndexOwner? portalIndices,PortalSearchMetrics portalSearchMetrics,
         out int sourcePairCandidates,
         out int sourcePairSolves)
     {
@@ -191,7 +321,7 @@ internal static class ProfileRoutePlanner
                     continue;
                 }
                 sourcePairSolves++;
-                if (ClosestBoundaryDistanceSquared(firstSource.Boundaries, secondSource.Boundaries)
+                if (ClosestBoundaryDistanceSquared(firstSource.Boundaries, secondSource.Boundaries,portalIndices,portalSearchMetrics)
                     <= proximitySquared)
                 {
                     Union(first, second);
@@ -246,7 +376,7 @@ internal static class ProfileRoutePlanner
         IReadOnlyList<OffsetRing> rings,
         IReadOnlyList<int> ringIndices,
         CancellationToken cancellationToken,
-        PortalSearchMetrics portalSearchMetrics,
+        PortalSearchMetrics portalSearchMetrics,PortalIndexOwner? portalIndices,
         out int portalSolves,
         out int portalFrontierChecks)
     {
@@ -266,12 +396,13 @@ internal static class ProfileRoutePlanner
             cancellationToken.ThrowIfCancellationRequested();
             foreach (int toRingIndex in ringIndices.Where(index => !visited.Contains(index)))
             {
-                ProfilePortal candidate = FindClosestPortal(
+                var secondIndex=portalIndices is not null&&portalIndices.Eligible(rings[addedRingIndex].Points)?portalIndices.Get(rings[toRingIndex].Points):null;
+                ProfilePortal candidate = FindClosestPortalCore(
                     addedRingIndex,
                     rings[addedRingIndex].Points,
                     toRingIndex,
                     rings[toRingIndex].Points,
-                    portalSearchMetrics);
+                    portalSearchMetrics,secondIndex,portalIndices?.Scratch);
                 portalSolves++;
                 if (!frontier.TryGetValue(toRingIndex, out var current)
                     || IsBetterPortal(candidate, current))
@@ -315,35 +446,63 @@ internal static class ProfileRoutePlanner
         IReadOnlyList<PointD> first,
         int secondRingIndex,
         IReadOnlyList<PointD> second,
-        PortalSearchMetrics? portalSearchMetrics = null)
+        PortalSearchMetrics? portalSearchMetrics = null,bool useSegmentIndex=true,
+        long maximumSegmentIndexBytes=MaximumSegmentIndexBytes)
     {
+        if(maximumSegmentIndexBytes<0||maximumSegmentIndexBytes>MaximumSegmentIndexBytes)throw new ArgumentOutOfRangeException(nameof(maximumSegmentIndexBytes));
+        SegmentIndex? index=null;
+        if(useSegmentIndex&&second.Count>=MinimumIndexedSegments&&FinitePortalDomain(first)&&FinitePortalDomain(second)
+            &&SegmentIndex.Reservation(second.Count)<=maximumSegmentIndexBytes)
+        {
+            long started=Stopwatch.GetTimestamp();index=new(second);
+            if(portalSearchMetrics is not null){portalSearchMetrics.IndexBuildTicks+=Stopwatch.GetTimestamp()-started;
+                portalSearchMetrics.IndexBuilds++;portalSearchMetrics.IndexReservedBytes+=SegmentIndex.Reservation(second.Count);}
+        }
+        return FindClosestPortalCore(firstRingIndex,first,secondRingIndex,second,portalSearchMetrics,index,null);
+    }
+
+    private static ProfilePortal FindClosestPortalCore(int firstRingIndex,IReadOnlyList<PointD> first,
+        int secondRingIndex,IReadOnlyList<PointD> second,PortalSearchMetrics? portalSearchMetrics,
+        SegmentIndex? index,List<int>? scratch,bool sourceClustering=false)
+    {
+        long solveStarted=Stopwatch.GetTimestamp();
+        try
+        {
         PointD bestFirst = first[0];
         PointD bestSecond = second[0];
         double bestDistanceSquared = double.MaxValue;
-        var secondSegments = new BoundaryBounds[second.Count];
-        for (int secondSegment = 0; secondSegment < second.Count; secondSegment++)
+        var secondSegments=index?.OriginalBounds??new BoundaryBounds[second.Count];
+        if(index is null)
         {
-            PointD secondStart = second[secondSegment];
-            PointD secondEnd = second[(secondSegment + 1) % second.Count];
-            secondSegments[secondSegment] = GetSegmentBounds(secondStart, secondEnd);
+            if(portalSearchMetrics is not null)portalSearchMetrics.IndexFallbackSolves++;
+            for (int secondSegment = 0; secondSegment < second.Count; secondSegment++)
+            {
+                PointD secondStart = second[secondSegment];
+                PointD secondEnd = second[(secondSegment + 1) % second.Count];
+                secondSegments[secondSegment] = GetSegmentBounds(secondStart, secondEnd);
+            }
         }
+        else scratch??=new List<int>();
 
         for (int firstSegment = 0; firstSegment < first.Count; firstSegment++)
         {
             PointD firstStart = first[firstSegment];
             PointD firstEnd = first[(firstSegment + 1) % first.Count];
             BoundaryBounds firstBounds = GetSegmentBounds(firstStart, firstEnd);
-            for (int secondSegment = 0; secondSegment < second.Count; secondSegment++)
+            if(index is not null)index.Query(PortalArithmeticEnvelope(firstBounds),bestDistanceSquared,scratch!,portalSearchMetrics);
+            int nominations=index is null?second.Count:scratch!.Count;
+            for (int candidateOrdinal = 0; candidateOrdinal < nominations; candidateOrdinal++)
             {
+                int secondSegment=index is null?candidateOrdinal:scratch![candidateOrdinal];
                 PointD secondStart = second[secondSegment];
                 PointD secondEnd = second[(secondSegment + 1) % second.Count];
 
                 if (portalSearchMetrics != null)
-                    portalSearchMetrics.SegmentPairsConsidered++;
+                {if(sourceClustering)portalSearchMetrics.SourceSegmentPairsConsidered++;else portalSearchMetrics.SegmentPairsConsidered++;}
                 if (BoundsDistanceSquared(firstBounds, secondSegments[secondSegment]) >= bestDistanceSquared)
                 {
                     if (portalSearchMetrics != null)
-                        portalSearchMetrics.SegmentPairsPruned++;
+                    {if(sourceClustering)portalSearchMetrics.SourceSegmentPairsPruned++;else portalSearchMetrics.SegmentPairsPruned++;}
                     continue;
                 }
 
@@ -389,18 +548,23 @@ internal static class ProfileRoutePlanner
             bestFirst = firstPoint;
             bestSecond = secondPoint;
         }
+        }
+        finally{if(portalSearchMetrics is not null){long ticks=Stopwatch.GetTimestamp()-solveStarted;
+            if(sourceClustering)portalSearchMetrics.SourcePortalSolveTicks+=ticks;else portalSearchMetrics.PortalSolveTicks+=ticks;}}
     }
 
     private static double ClosestBoundaryDistanceSquared(
         IReadOnlyList<IReadOnlyList<PointD>> first,
-        IReadOnlyList<IReadOnlyList<PointD>> second)
+        IReadOnlyList<IReadOnlyList<PointD>> second,PortalIndexOwner? portalIndices,PortalSearchMetrics metrics)
     {
         double best = double.MaxValue;
         foreach (var firstBoundary in first)
         {
             foreach (var secondBoundary in second)
             {
-                ProfilePortal portal = FindClosestPortal(0, firstBoundary, 1, secondBoundary);
+                var index=portalIndices is not null&&portalIndices.Eligible(firstBoundary)?portalIndices.Get(secondBoundary):null;
+                ProfilePortal portal = FindClosestPortalCore(0,firstBoundary,1,secondBoundary,metrics,index,
+                    portalIndices?.Scratch,sourceClustering:true);
                 best = Math.Min(best, portal.Distance * portal.Distance);
             }
         }

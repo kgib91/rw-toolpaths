@@ -1,4 +1,5 @@
 using Clipper2Lib;
+using System.Diagnostics;
 using RW.Toolpaths.Geometry;
 
 namespace RW.Toolpaths.Milling;
@@ -78,7 +79,7 @@ internal static partial class ToolpathSourceTraversal
 
         static bool CutStart(TaggedToolpath p,out int start)
         {
-            start=0;if(p.DetectCurves||p.Points.Count<2)return false;
+            start=0;if(p.RequiresSourcePreservation||p.Points.Count<2)return false;
             bool cutting=false;
             foreach(var span in p.Spans)
             {
@@ -105,9 +106,13 @@ internal static partial class ToolpathSourceTraversal
     internal static List<TaggedToolpath> RingPortals(IReadOnlyList<TaggedToolpath> source,double reach,
         Func<Point3D,Point3D> firstLayer,Func<Point3D,Point3D,bool> guard,
         CancellationToken token,Action<string>? log=null,
-        Action<IReadOnlyList<ToolpathContinuationComponents.Edge>>? capturePortals=null)
+        Action<IReadOnlyList<ToolpathContinuationComponents.Edge>>? capturePortals=null,
+        Func<VCarveSmoothing.ContinuationProofWorker?>? workerFactory=null,
+        Func<Point3D,Point3D,bool>? privateWorkerPrefix=null,int? maximumWorkers=null)
     {
-        bool Eligible(int i)=>source[i].Category=="clearing"&&!source[i].DetectCurves
+        if(maximumWorkers is <=0)throw new ArgumentOutOfRangeException(nameof(maximumWorkers));
+        long started=Stopwatch.GetTimestamp();
+        bool Eligible(int i)=>source[i].Category=="clearing"&&!source[i].RequiresSourcePreservation
             &&!source[i].ContinuationCircuit&&source[i].Points.Count>2
             &&source[i].Points[0]==source[i].Points[^1]&&source[i].Spans.All(s=>s.Kind==ToolpathSpanKind.Cut);
         var segments=new List<Segment>();var boxes=new Paths64();
@@ -123,6 +128,7 @@ internal static partial class ToolpathSourceTraversal
         var additions=new Dictionary<(int Owner,int End),List<(double T,Point3D P)>>();
         var counts=new int[source.Count];int candidates=0,proofs=0,accepted=0,capped=0;
         var portals=capturePortals is null?null:new List<ToolpathContinuationComponents.Edge>();
+        long nominationStarted=Stopwatch.GetTimestamp();
         for(int owner=0;owner<source.Count&&candidates<MaximumCandidates&&proofs<20_000;owner++)if(Eligible(owner))
         {
             var points=source[owner].Points;int stride=Math.Max(1,(points.Count-1+63)/64);
@@ -159,11 +165,28 @@ internal static partial class ToolpathSourceTraversal
                 }
             }
         }
-        var result=new List<TaggedToolpath>(source.Count);int retained=0,refusedSources=0;
-        var refusedOwners=new HashSet<int>();
-        for(int owner=0;owner<source.Count;owner++)
+        double nominationMs=Stopwatch.GetElapsedTime(nominationStarted).TotalMilliseconds;
+        long auditStarted=Stopwatch.GetTimestamp();
+        // Counts, additions and source are frozen after the original ordered
+        // nomination loop. Final source reconstruction/proof is independent per
+        // owner, and requires an explicit private full-continuation capability.
+        var changed=Enumerable.Range(0,source.Count).Where(i=>counts[i]>0).ToArray();
+        int workerCount=Math.Min(Math.Min(6,GeometryParallelism.WorkerLimit),Math.Min(maximumWorkers??6,changed.Length));
+        VCarveSmoothing.ContinuationProofWorker[]? workers=null;
+        if(workerFactory is not null&&workerCount>1)
         {
-            var original=source[owner];if(counts[owner]==0){result.Add(original);continue;}
+            workers=new VCarveSmoothing.ContinuationProofWorker[workerCount];
+            for(int i=0;i<workers.Length;i++)
+            {
+                token.ThrowIfCancellationRequested();var worker=workerFactory();
+                if(worker is null){workers=null;break;}workers[i]=worker;
+            }
+        }
+        bool parallel=workers is not null;var output=source.ToArray();
+        var added=new int[source.Count];var refused=new bool[source.Count];var audited=new long[source.Count];
+        void Rebuild(int owner,Func<Point3D,Point3D,bool> audit)
+        {
+            token.ThrowIfCancellationRequested();var original=source[owner];
             var points=new List<Point3D>{original.Points[0]};
             for(int end=1;end<original.Points.Count;end++)
             {
@@ -173,18 +196,53 @@ internal static partial class ToolpathSourceTraversal
             }
             // Splitting several times on one chord changes command rounding.
             // Recheck the complete final subdivision, not just each nomination.
-            if(Enumerable.Range(1,points.Count-1).Any(i=>!guard(points[i-1],points[i])))
-            {result.Add(original);refusedSources++;refusedOwners.Add(owner);}
+            bool legal=true;
+            for(int i=1;i<points.Count;i++)
+            {
+                token.ThrowIfCancellationRequested();audited[owner]++;
+                if(!audit(points[i-1],points[i])){legal=false;break;}
+            }
+            if(!legal)refused[owner]=true;
             else
             {
-                retained+=points.Count-original.Points.Count;
-                result.Add(new(points,Array.Empty<ToolpathSpan>(),original.RegionIndex,original.Category,
+                added[owner]=points.Count-original.Points.Count;
+                output[owner]=new(points,Array.Empty<ToolpathSpan>(),original.RegionIndex,original.Category,
                     original.DepthPassIndex,original.VisitIdentity,detectCurves:false)
-                    {ConcentricSource=original.ConcentricSource});
+                    {ConcentricSource=original.ConcentricSource};
             }
         }
+        if(!parallel)
+        {
+            foreach(int owner in changed)Rebuild(owner,guard);
+            workerCount=1;
+        }
+        else
+        {
+            var errors=new System.Runtime.ExceptionServices.ExceptionDispatchInfo?[source.Count];int next=-1,failed=0;
+            Parallel.For(0,workerCount,new ParallelOptions{MaxDegreeOfParallelism=workerCount},worker=>
+            {
+                using var owned=GeometryParallelism.EnterWorker();
+                while(!token.IsCancellationRequested&&Volatile.Read(ref failed)==0)
+                {
+                    int index=Interlocked.Increment(ref next);if(index>=changed.Length)break;int owner=changed[index];
+                    try{Rebuild(owner,(a,b)=>(privateWorkerPrefix is null||privateWorkerPrefix(a,b))&&workers![worker].Prove(a,b));}
+                    catch(Exception error)
+                    {errors[owner]=System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error);Interlocked.Exchange(ref failed,1);}
+                }
+            });
+            // All private guards are idle before parent caches, external logs,
+            // capture callbacks or returned source geometry can be published.
+            token.ThrowIfCancellationRequested();foreach(var error in errors)error?.Throw();
+            foreach(var worker in workers!)worker.Complete(log,"ring-portal-audit");
+        }
+        token.ThrowIfCancellationRequested();
+        var result=output.ToList();int retained=added.Sum();var refusedOwners=Enumerable.Range(0,source.Count).Where(i=>refused[i]).ToHashSet();
+        int refusedSources=refusedOwners.Count;double auditMs=Stopwatch.GetElapsedTime(auditStarted).TotalMilliseconds;
         log?.Invoke($"stage=ring-span-portals candidates={candidates} proofs={proofs} accepted={accepted} retained={retained} refusedSources={refusedSources} cappedQueries={capped} "
-            +"maximumPortalsPerSource=8 maximumSampledVerticesPerSource=64 finalSubdivisionsRechecked=True newSourceChords=0");
+            +$"nominationMs={nominationMs:F3} finalAuditMs={auditMs:F3} finalAuditChords={audited.Sum()} finalAuditOwners={changed.Length} finalAuditWorkers={workerCount} "
+            +$"privateQueryOwners={parallel} allWorkersJoined=True sourcePoints={source.Sum(p=>(long)p.Points.Count)} retainedPoints={result.Sum(p=>(long)p.Points.Count)} "
+            +$"elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F3} "
+            +"maximumPortalsPerSource=8 maximumSampledVerticesPerSource=64 finalSubdivisionsRechecked=True newSourceChords=0 nominationOrderAndBudgetsUnchanged=True");
         if(portals is not null)
         {
             var surviving=portals.Where(p=>!refusedOwners.Contains(p.A.Owner)).Distinct().ToArray();
@@ -192,6 +250,7 @@ internal static partial class ToolpathSourceTraversal
             log?.Invoke($"stage=ring-span-portals event=literal-nominations pairs={surviving.Length} rejectedSplitOwners={refusedOwners.Count} "
                 +"coarseSamplingCannotEraseNominations=True componentProofStillRequired=True");
         }
+        token.ThrowIfCancellationRequested();
         return result;
     }
 
@@ -201,7 +260,7 @@ internal static partial class ToolpathSourceTraversal
         Action<int,IReadOnlyList<int>>? attachedMembers=null)
     {
         token.ThrowIfCancellationRequested();
-        if(source.Count<2||source.Any(p=>p.Points.Count<2||p.DetectCurves||p.Spans.Any(s=>s.Kind!=ToolpathSpanKind.Cut)))return source.ToList();
+        if(source.Count<2||source.Any(p=>p.Points.Count<2||p.RequiresSourcePreservation||p.Spans.Any(s=>s.Kind!=ToolpathSpanKind.Cut)))return source.ToList();
         var segments=new List<Segment>();var boxes=new Paths64();
         for(int owner=0;owner<source.Count;owner++)
         for(int end=1;end<source[owner].Points.Count;end++)

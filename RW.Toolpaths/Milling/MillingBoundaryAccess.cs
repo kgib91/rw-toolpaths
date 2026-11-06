@@ -1,6 +1,7 @@
 using Clipper2Lib;
 using RW.Toolpaths.Geometry;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 
 namespace RW.Toolpaths.Milling;
 
@@ -39,6 +40,8 @@ public sealed record MillingBoundaryAccess(
         internal bool CuttingRegionsPrepared=>Volatile.Read(ref _commandDomain) is not null;
         private readonly double _contactReach;
         internal bool OpenEdgeBandPrepared => Volatile.Read(ref _openEdges) is not null;
+        internal sealed record PocketPreparation(IReadOnlyList<MillingRegion> Regions,
+            IReadOnlyList<IReadOnlyList<PointD>> EmptyBoundary);
         private readonly IReadOnlyList<IReadOnlyList<PointD>> _physicalBoundary;
         private readonly IReadOnlyList<IReadOnlyList<PointD>> _protectedBoundary;
         private readonly PolygonOps.BoundarySegmentIndex _protectedMaterial;
@@ -48,8 +51,86 @@ public sealed record MillingBoundaryAccess(
         private readonly string? _context;
         private IReadOnlyList<IReadOnlyList<PointD>>? _rampInterior;
         private IReadOnlyList<IReadOnlyList<PointD>>? _rampWallBand;
+        private long _rampWallClipOperations;
+        internal long RampWallClipOperations=>Interlocked.Read(ref _rampWallClipOperations);
         private readonly (double MinX,double MinY,double MaxX,double MaxY) _windowBounds;
         private readonly (long MinX,long MinY,long MaxX,long MaxY)? _rectangularPart;
+
+        internal PocketPreparation PreparePocket(double radius,double allowance,double emptyReserve,
+            CancellationToken token,int maximumConcurrency=3)
+        {
+            if(maximumConcurrency<1||maximumConcurrency>3)throw new ArgumentOutOfRangeException(nameof(maximumConcurrency));
+            return PreparePocketRecipes(t=>{GetCommandDomain(t);},t=>PocketRegions(radius,allowance,t),
+                t=>CertifiedEmptyBoundary(emptyReserve,t),Math.Min(maximumConcurrency,GeometryParallelism.WorkerLimit),
+                token,message=>Console.WriteLine(message),_context);
+        }
+
+        // These recipes read one immutable resolved authority. Only CommandDomain
+        // publishes a memo, under its existing lock; each Boolean/offset owns its
+        // own kernel. Join every admitted helper before returning or throwing.
+        internal static PocketPreparation PreparePocketRecipes(Action<CancellationToken> commandDomain,
+            Func<CancellationToken,IReadOnlyList<MillingRegion>> pocketRegions,
+            Func<CancellationToken,IReadOnlyList<IReadOnlyList<PointD>>> emptyBoundary,
+            int maximumConcurrency,CancellationToken token,Action<string>? diagnostic=null,string? context=null)
+        {
+            if(maximumConcurrency<1||maximumConcurrency>3)throw new ArgumentOutOfRangeException(nameof(maximumConcurrency));
+            token.ThrowIfCancellationRequested();long started=Stopwatch.GetTimestamp();
+            using var cancellation=CancellationTokenSource.CreateLinkedTokenSource(token);
+            var workToken=cancellation.Token;long commandTicks=0,pocketTicks=0,emptyTicks=0;
+            IReadOnlyList<MillingRegion>? regions=null;IReadOnlyList<IReadOnlyList<PointD>>? empty=null;
+            bool completed=false;ExceptionDispatchInfo? failure=null;
+            void Command(){long s=Stopwatch.GetTimestamp();try{commandDomain(workToken);}finally{commandTicks+=Stopwatch.GetTimestamp()-s;}}
+            void Empty(){long s=Stopwatch.GetTimestamp();try{empty=emptyBoundary(workToken);}finally{emptyTicks+=Stopwatch.GetTimestamp()-s;}}
+            void Helper(Action recipe)
+            {
+                using var nested=GeometryParallelism.EnterWorker();
+                try{workToken.ThrowIfCancellationRequested();recipe();}
+                catch{cancellation.Cancel();throw;}
+            }
+            // Two slots run command+empty in one helper. Three slots give each
+            // independent recipe a helper; caller retains the original guide.
+            var helpers=new List<Task>(2);
+            try
+            {
+                try
+                {
+                    if(maximumConcurrency>1)helpers.Add(Task.Run(()=>Helper(CommandAndMaybeEmpty)));
+                    if(maximumConcurrency==3)helpers.Add(Task.Run(()=>Helper(Empty)));
+                }
+                catch(Exception error){cancellation.Cancel();failure=ExceptionDispatchInfo.Capture(error);}
+                using(var nested=GeometryParallelism.EnterWorker())
+                try
+                {
+                    workToken.ThrowIfCancellationRequested();
+                    if(maximumConcurrency==1)Command();
+                    long s=Stopwatch.GetTimestamp();
+                    try{regions=pocketRegions(workToken);}finally{pocketTicks+=Stopwatch.GetTimestamp()-s;}
+                    if(maximumConcurrency==1)Empty();
+                }
+                catch(Exception error){cancellation.Cancel();failure??=ExceptionDispatchInfo.Capture(error);}
+                try{Task.WhenAll(helpers).GetAwaiter().GetResult();}
+                catch(Exception error)
+                {
+                    cancellation.Cancel();
+                    // A helper fault can cancel the caller. Preserve the actual
+                    // fault rather than reporting only its cooperative symptom.
+                    if(failure is null||failure.SourceException is OperationCanceledException
+                        &&error is not OperationCanceledException)failure=ExceptionDispatchInfo.Capture(error);
+                }
+                failure?.Throw();token.ThrowIfCancellationRequested();completed=true;
+                return new(regions!,empty!);
+            }
+            finally
+            {
+                double Ms(long ticks)=>ticks*1000.0/Stopwatch.Frequency;
+                diagnostic?.Invoke($"[Milling.OutsideEdges.PocketSetup] operation={context} completed={completed} "
+                    +$"workers={maximumConcurrency} commandDomainMs={Ms(commandTicks):F3} pocketGuideMs={Ms(pocketTicks):F3} "
+                    +$"emptyBoundaryMs={Ms(emptyTicks):F3} totalMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F3} "
+                    +$"helpersJoined={helpers.All(t=>t.IsCompleted)} originalRecipes=True nestedGeometryWorkers=1 "
+                    +"timing=overlapping-owned-wall-guide-includes-command-domain-wait authority=unchanged-resolved-domain");
+            }
+            void CommandAndMaybeEmpty(){Command();if(maximumConcurrency==2){workToken.ThrowIfCancellationRequested();Empty();}}
+        }
 
         /// <summary>
         /// Pocket fronts follow the cutting target, with a local allowance for cutter overrun.
@@ -64,7 +145,7 @@ public sealed record MillingBoundaryAccess(
             // either side. At the platform edge, compensate a radius-wide apron so the
             // outermost centreline stays on the platform, while the cutter can overhang.
             double expansion = 2 * radius + Math.Max(0, allowance);
-            var guide = PolygonOps.Offset(Target, expansion, .0001, 0, pruneCollapsedHoles: true);
+            var guide = PolygonOps.OffsetPocketGuide(Target, expansion, .0001, token);
             double expansionMilliseconds = Stopwatch.GetElapsedTime(guideStarted).TotalMilliseconds;
             var platform = PolygonOps.Offset(new[] { PartBoundary }, radius + allowance - .001, .0001, 0);
             guide = PolygonOps.Intersect(guide,platform);
@@ -303,12 +384,22 @@ public sealed record MillingBoundaryAccess(
 
         internal IReadOnlyList<(PointD A, PointD B)> RetainedRampEdges(
             IReadOnlyList<IReadOnlyList<PointD>> boundary, CancellationToken token)
-            => RetainedRampEdges(boundary,token,out _);
+            => RetainedRampEdges(boundary,token,proveAllRetained:false,out _);
 
         internal IReadOnlyList<(PointD A, PointD B)> RetainedRampEdges(
             IReadOnlyList<IReadOnlyList<PointD>> boundary, CancellationToken token,out bool allRetained)
+            => RetainedRampEdges(boundary,token,proveAllRetained:true,out allRetained);
+
+        private readonly record struct RampWallClipRecipe(IReadOnlyList<IReadOnlyList<PointD>> Closed,
+            IReadOnlyList<IReadOnlyList<PointD>> Clip,bool WindowInterior,ClipType RetainedOperation,ClipType ProofOperation,
+            double WallRadius,double BandReserve);
+
+        // The original retained-edge and complementary-empty proofs share one
+        // literal recipe. Keeping it here binds both consumers to the same
+        // window test, reserves, Boolean operations and lazy geometry owners.
+        private RampWallClipRecipe PrepareRampWallClip(IReadOnlyList<IReadOnlyList<PointD>> boundary,CancellationToken token)
         {
-            long started=Stopwatch.GetTimestamp();
+            token.ThrowIfCancellationRequested();
             double wallRadius=2*VCarvePreparation.GeometricErrorBound;
             const double bandArc=.0001;
             double bandReserve=4*bandArc+32/PathUtils.Scale;
@@ -330,13 +421,7 @@ public sealed record MillingBoundaryAccess(
                         wallRadius+bandReserve,bandArc);
                     band=Interlocked.CompareExchange(ref _rampWallBand,prepared,null)??prepared;
                 }
-                var retained=CheckedOpenClip.Require(closed,band,ClipType.Intersection,token,"outside-ramp-protected-wall-band");
-                allRetained=CheckedOpenClip.Require(closed,band,ClipType.Difference,token,"outside-ramp-unchanged-wall-proof").Count==0;
-                var edges=retained.SelectMany(path=>Enumerable.Range(1,path.Count-1).Select(i=>(path[i-1],path[i]))).ToArray();
-                Console.WriteLine($"[Milling.OutsideEdges.RampWalls] operation={_context} mode=protected-wall-band "
-                    +$"edges={edges.Length} radius={wallRadius:R} outerReserve={bandReserve:R} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
-                    +$"windowInteriorProved=True protectedAnchorsConservative=True");
-                return edges;
+                return new(closed,band,true,ClipType.Intersection,ClipType.Difference,wallRadius,bandReserve);
             }
             // Keep original finite wall segments. Only portions strictly inside
             // approved access lose their ramp anchor; protected walls stay exact.
@@ -347,10 +432,45 @@ public sealed record MillingBoundaryAccess(
                     -2 * VCarvePreparation.GeometricErrorBound, .0001, 0);
                 interior = Interlocked.CompareExchange(ref _rampInterior, prepared, null) ?? prepared;
             }
-            var walls = CheckedOpenClip.Require(closed, interior, ClipType.Difference, token, "outside-ramp-walls");
-            allRetained=CheckedOpenClip.Require(closed,interior,ClipType.Intersection,token,"outside-ramp-unchanged-wall-proof").Count==0;
-            return walls.SelectMany(path => Enumerable.Range(1, path.Count - 1)
+            return new(closed,interior,false,ClipType.Difference,ClipType.Intersection,wallRadius,bandReserve);
+        }
+
+        // Owned analytical reuse needs only the SAME complementary-empty
+        // certificate. A positive avoids constructing a discarded retained
+        // intersection; it does not nominate walls or grant cutting access.
+        internal bool RampWallsPreserved(IReadOnlyList<IReadOnlyList<PointD>> boundary,CancellationToken token)
+        {
+            long started=Stopwatch.GetTimestamp();var recipe=PrepareRampWallClip(boundary,token);
+            bool result=ClipRampWalls(recipe,true,token).Count==0;
+            token.ThrowIfCancellationRequested();
+            Console.WriteLine($"[Milling.OutsideEdges.RampWalls] operation={_context} mode={(recipe.WindowInterior?"protected-wall-band":"eroded-domain")} "
+                +$"allRetained={result} unchangedWallProofOnly=True retainedEdgesMaterialized=False openClipOperations=1 "
+                +$"elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} sameOriginalComplementProof=True");
+            token.ThrowIfCancellationRequested();return result;
+        }
+
+        private List<List<PointD>> ClipRampWalls(RampWallClipRecipe recipe,bool proof,CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();Interlocked.Increment(ref _rampWallClipOperations);
+            return CheckedOpenClip.Require(recipe.Closed,recipe.Clip,proof?recipe.ProofOperation:recipe.RetainedOperation,token,
+                proof?"outside-ramp-unchanged-wall-proof":recipe.WindowInterior?"outside-ramp-protected-wall-band":"outside-ramp-walls");
+        }
+
+        private IReadOnlyList<(PointD A, PointD B)> RetainedRampEdges(
+            IReadOnlyList<IReadOnlyList<PointD>> boundary, CancellationToken token,bool proveAllRetained,out bool allRetained)
+        {
+            long started=Stopwatch.GetTimestamp();var recipe=PrepareRampWallClip(boundary,token);
+            var walls=ClipRampWalls(recipe,false,token);
+            // Generic and out-parameter consumers keep their original retained
+            // clip first, then the requested complementary proof, unchanged.
+            allRetained=proveAllRetained&&ClipRampWalls(recipe,true,token).Count==0;
+            var result=walls.SelectMany(path => Enumerable.Range(1, path.Count - 1)
                 .Select(i => (path[i - 1], path[i]))).ToArray();
+            Console.WriteLine($"[Milling.OutsideEdges.RampWalls] operation={_context} mode={(recipe.WindowInterior?"protected-wall-band":"eroded-domain")} "
+                +$"edges={result.Length} radius={recipe.WallRadius:R} outerReserve={recipe.BandReserve:R} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
+                +$"windowInteriorProved={recipe.WindowInterior} protectedAnchorsConservative=True "
+                +$"unchangedWallProofRequested={proveAllRetained} openClipOperations={(proveAllRetained?2:1)}");
+            return result;
         }
 
         internal List<TaggedToolpath> NominateOpenEdges(VCarveCutterProfile profile,DepthSchedule depth,
@@ -456,7 +576,47 @@ public sealed record MillingBoundaryAccess(
             CancellationToken token, bool openEdgesOnly = false, double surface = 0,
             PolygonOps.BoundarySegmentIndex? clipIndex = null, bool restrictCentres = true,
             bool retainContactingChords=false,ICollection<int>? interpolatedFragments=null)
+            =>TrimCore(paths,radiusAtDepth,token,openEdgesOnly,surface,clipIndex,restrictCentres,
+                retainContactingChords,interpolatedFragments,false,null);
+
+        internal static readonly AsyncLocal<bool?> ContourInteriorFirstEnabled=new();
+        // The caller supplies the immutable physical profile, not an opaque
+        // radius callback. Keep generic Trim and its callback order literal.
+        internal List<TaggedToolpath> TrimOwnedContours(IEnumerable<TaggedToolpath> paths,VCarveCutterProfile profile,
+            CancellationToken token,Action<string>? diagnostic=null)
         {
+            ArgumentNullException.ThrowIfNull(profile);token.ThrowIfCancellationRequested();
+            return TrimCore(paths,profile.PhysicalRadiusAtDepth,token,false,0,null,true,false,null,
+                ContourInteriorFirstEnabled.Value is not false,diagnostic);
+        }
+
+        // Completed protected source and flat-pocket callers own their radius
+        // recipes. They may prefer the SAME existing FullContact certificate;
+        // generic radius delegates retain literal callback/query ordering above.
+        internal List<TaggedToolpath> TrimOwnedPhysicalProfile(IEnumerable<TaggedToolpath> paths,VCarveCutterProfile profile,
+            CancellationToken token,double surface=0,bool retainContactingChords=false,
+            ICollection<int>? interpolatedFragments=null,Action<string>? diagnostic=null)
+        {
+            ArgumentNullException.ThrowIfNull(profile);token.ThrowIfCancellationRequested();
+            return TrimCore(paths,profile.PhysicalRadiusAtDepth,token,false,surface,null,true,
+                retainContactingChords,interpolatedFragments,ContourInteriorFirstEnabled.Value is not false,diagnostic,
+                "owned-profile-trim","immutable-physical-profile");
+        }
+
+        internal List<TaggedToolpath> TrimOwnedFlatRadius(IEnumerable<TaggedToolpath> paths,double radius,
+            CancellationToken token,double surface=0,Action<string>? diagnostic=null)
+        {
+            token.ThrowIfCancellationRequested();
+            return TrimCore(paths,_=>radius,token,false,surface,null,true,false,null,
+                ContourInteriorFirstEnabled.Value is not false,diagnostic,"owned-flat-trim","fixed-flat-radius");
+        }
+
+        private List<TaggedToolpath> TrimCore(IEnumerable<TaggedToolpath> paths,Func<double,double> radiusAtDepth,
+            CancellationToken token,bool openEdgesOnly,double surface,PolygonOps.BoundarySegmentIndex? clipIndex,
+            bool restrictCentres,bool retainContactingChords,ICollection<int>? interpolatedFragments,
+            bool interiorFirst,Action<string>? diagnostic,string stage="owned-contour-trim",string radiusOwner="immutable-physical-profile")
+        {
+            long started=Stopwatch.GetTimestamp(),contactQueries=0,interiorHits=0;
             var index = clipIndex ?? (openEdgesOnly ? GetOpenEdges(token).Index : _target);
             var output = new List<TaggedToolpath>();
             long wholeContactChords=0,unchangedChords=0,insertedFragments=0;
@@ -484,7 +644,11 @@ public sealed record MillingBoundaryAccess(
                     while (spanIndex+1<path.Spans.Count && path.Spans[spanIndex].EndIndex<i) spanIndex++;
                     var kind = path.Spans.Count==0 ? ToolpathSpanKind.Cut : path.Spans[spanIndex].Kind;
                     double radius = radiusAtDepth(Math.Max(0,surface-Math.Min(a.Z,b.Z)));
-                    var contact = index.ContactIntervals(Native(a),Native(b),Math.Max(0,radius)*PathUtils.Scale,token,out _);
+                    contactQueries++;bool interiorHit=false;
+                    var contact = interiorFirst
+                        ?index.ContactIntervalsInteriorFirst(Native(a),Native(b),Math.Max(0,radius)*PathUtils.Scale,token,out _,out interiorHit)
+                        :index.ContactIntervals(Native(a),Native(b),Math.Max(0,radius)*PathUtils.Scale,token,out _);
+                    if(interiorHit)interiorHits++;
                     var centres = restrictCentres ? _centres.ContactIntervals(Native(a),Native(b),0,token,out _) : null;
                     // A protected source chord is the physical proof unit.
                     // Cutting it at a demand-contact parameter creates new F3
@@ -521,6 +685,11 @@ public sealed record MillingBoundaryAccess(
             if(retainContactingChords)Console.WriteLine($"[Milling.OutsideEdges.PostedSourceTrim] operation={_context} "
                 +$"wholeContactChords={wholeContactChords} unchangedChords={unchangedChords} interpolatedFragments={insertedFragments} "
                 +$"demandUnchanged=True sourceChordGeometryRetained=True platformCentreClip=True newVerticesRequireFreshProtection=True");
+            diagnostic?.Invoke($"stage={stage} event=complete insideFirstEnabled={interiorFirst} contactQueries={contactQueries} "
+                +$"interiorShortcutHits={interiorHits} nearestBoundaryQueriesAvoided={interiorHits} outputPaths={output.Count} "
+                +$"elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F3} originalIntegerMidpointAndExtent=True "
+                +$"originalFullContactPositiveBranch=True centreClippingUnchanged=True originalPathAndFragmentOrder=True radiusOwner={radiusOwner} "
+                +"opaqueRadiusCallbacks=False parallelWorkers=1");
             return output;
         }
         private static Point64 Native(Point3D p)=>new((long)Math.Round(p.X*PathUtils.Scale),(long)Math.Round(p.Y*PathUtils.Scale));

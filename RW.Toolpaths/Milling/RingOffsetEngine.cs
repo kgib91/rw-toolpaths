@@ -1,6 +1,7 @@
 using Clipper2Lib;
 using RW.Toolpaths.Geometry;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 
 namespace RW.Toolpaths.Milling;
 
@@ -188,6 +189,10 @@ public sealed record RingOffsetOptions(double FirstOffset, double StepOver)
     // existing complete angular source graph and cache contract.
     internal bool BoundOriginalSourceMedial { get; init; }
     internal bool PreserveSourceNativeGrid { get; init; }
+    // Only an owned collector may opt in. Unknown construction callbacks keep
+    // the established serial invocation and traversal contract.
+    internal bool ParallelSourceRegions { get; init; }
+    internal bool RegionTerminalCallbacksOwned { get; init; }
 
     // Null retains diagnostic opt-in for generic shared fill callers. Pocket
     // passes its already captured policy; other strategies have no new default.
@@ -246,7 +251,7 @@ public static class RingOffsetEngine
     {
         long t0 = PerfLog.Start();
         options = CaptureExactFirstCoverageMode(CaptureParentLocalRescueMode(CaptureTrialFilledSweepMode(options)));
-        var rings = new List<OffsetRing>();
+        var allRings = new List<OffsetRing>();
 
         double stepOver = options.StepOver;
         if (double.IsNaN(options.MaximumInset) || options.MaximumInset < 0)
@@ -272,13 +277,14 @@ public static class RingOffsetEngine
             ?? (Environment.GetEnvironmentVariable("RW_TOOLPATHS_TWO_ORIGIN_EXPERIMENT") == "1"
                 && Environment.GetEnvironmentVariable("RW_TOOLPATHS_TWO_ORIGIN_REFERENCE") != "1"
                 && Environment.GetEnvironmentVariable("RW_TOOLPATHS_COHERENCE_REFERENCE") != "1");
-        for (int regionIndex = 0; regionIndex < regions.Count; regionIndex++)
+        List<OffsetRing> BuildRegion(int regionIndex,Action<double,string>? reportProgress)
         {
+            var rings=new List<OffsetRing>();
             long regionStart = PerfLog.Start();
             cancellationToken.ThrowIfCancellationRequested();
 
             var region = regions[regionIndex];
-            progress?.Invoke((double)regionIndex / regions.Count, $"Preparing pocket region {regionIndex + 1}/{regions.Count}");
+            reportProgress?.Invoke((double)regionIndex / regions.Count, $"Preparing pocket region {regionIndex + 1}/{regions.Count}");
             // An inward ring cannot survive past half the smaller bounding-box span.
             // This is an upper work bound; regions with holes can finish earlier.
             double maxInset = region.Outer.Count == 0 ? 0 : Math.Min(region.Outer.Max(p => p.x) - region.Outer.Min(p => p.x),
@@ -505,7 +511,7 @@ public static class RingOffsetEngine
                 double regionProgress = adaptive && maxInset > options.FirstOffset
                     ? Math.Min(.99, additionalInset / Math.Max(stepOver, Math.Min(maxInset - options.FirstOffset, options.MaximumInset)))
                     : Math.Min(.99, level / estimatedLevels);
-                progress?.Invoke((regionIndex + regionProgress) / regions.Count,
+                reportProgress?.Invoke((regionIndex + regionProgress) / regions.Count,
                     $"Pocket region {regionIndex + 1}/{regions.Count}, offset {level + 1}, inset {distance:R}");
                 foreach (var trace in terminalPaths)
                     rings.Add(new OffsetRing(trace.ToList(), level, regionIndex, isHole: false,
@@ -661,13 +667,59 @@ public static class RingOffsetEngine
                 $"acceptedInsetSeeded={preparedOffset.AcceptedInsetSeeded} seedMs={preparedOffset.AcceptedInsetSeedMilliseconds:F2} " +
                 $"denseInsetReuses={preparedOffset.DenseInsetReuseCount} denseSourceConstructions={preparedOffset.DenseSourceConstructionCount} " +
                 $"seededConstructionFallbacks={seededConstructionFallbacks} establishedOffsetCount={establishedOffset?.OffsetCount ?? 0}");
+            return rings;
         }
 
+        bool callbacksOwned=options.LevelProgress is null&&options.MaximumInsetFront is null
+            &&(options.TerminalPaths is null||options.RegionTerminalCallbacksOwned);
+        int workers=options.ParallelSourceRegions&&callbacksOwned
+            ?Math.Min(regions.Count,GeometryParallelism.WorkerLimit):1;
+        long collectionStarted=Stopwatch.GetTimestamp();
+        if(workers>1)
+        {
+            var results=new List<OffsetRing>[regions.Count];
+            var reports=new List<(double Fraction,string Message)>[regions.Count];
+            var failures=new ExceptionDispatchInfo?[regions.Count];ExceptionDispatchInfo? loopFailure=null;
+            // Every source keeps one mutable offset/history/terminal owner.
+            // The loop joins failures and cancellation before anything escapes.
+            try{Parallel.For(0,regions.Count,new ParallelOptions{MaxDegreeOfParallelism=workers,
+                CancellationToken=cancellationToken},regionIndex=>
+            {
+                using var nested=GeometryParallelism.EnterWorker();
+                try
+                {
+                    var events=new List<(double,string)>();
+                    results[regionIndex]=BuildRegion(regionIndex,progress is null?null:(fraction,message)=>events.Add((fraction,message)));
+                    reports[regionIndex]=events;
+                }
+                catch(Exception error){failures[regionIndex]=ExceptionDispatchInfo.Capture(error);}
+            });}catch(Exception error){loopFailure=ExceptionDispatchInfo.Capture(error);}
+            // No worker result or buffered callback escapes a failed collection.
+            // Keep the exception type/stack of the earliest original source.
+            for(int regionIndex=0;regionIndex<failures.Length;regionIndex++)
+                if(failures[regionIndex] is { } failure)
+                {
+                    Console.WriteLine($"[RingOffsetEngine.RegionCollection] state=failed firstSourceRegion={regionIndex} helpersJoined=True partialCollectionPublished=False reason={failure.SourceException.GetType().Name}");
+                    failure.Throw();
+                }
+            loopFailure?.Throw();
+            for(int regionIndex=0;regionIndex<regions.Count;regionIndex++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                foreach(var item in reports[regionIndex]){progress?.Invoke(item.Fraction,item.Message);cancellationToken.ThrowIfCancellationRequested();}
+                allRings.AddRange(results[regionIndex]);
+            }
+        }
+        else for(int regionIndex=0;regionIndex<regions.Count;regionIndex++)allRings.AddRange(BuildRegion(regionIndex,progress));
+        Console.WriteLine($"[RingOffsetEngine.RegionCollection] requested={options.ParallelSourceRegions} callbacksOwned={callbacksOwned} "
+            +$"workers={Math.Max(1,workers)} regions={regions.Count} rings={allRings.Count} elapsedMs={Stopwatch.GetElapsedTime(collectionStarted).TotalMilliseconds:F3} "
+            +$"publication=original-source-region-then-original-front-order nestedGeometryWorkers={(workers>1?1:GeometryParallelism.WorkerLimit)} helpersJoined=True regionRingLimitsUnchanged=True");
         PerfLog.Stop("RingOffsetEngine.BuildRings", t0,
-            $"regions={regions.Count} rings={rings.Count} step={stepOver:F4} limit={ringLimit}");
+            $"regions={regions.Count} rings={allRings.Count} step={stepOver:F4} limit={ringLimit}");
 
         progress?.Invoke(1, "Pocket offsets complete");
-        return rings;
+        cancellationToken.ThrowIfCancellationRequested();
+        return allRings;
     }
 
     private sealed record CoherentFront(double Distance, List<List<PointD>> Polygons,

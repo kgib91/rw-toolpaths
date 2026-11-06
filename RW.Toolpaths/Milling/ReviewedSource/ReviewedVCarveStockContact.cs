@@ -11,6 +11,7 @@ public sealed partial class ReviewedVCarveStockContact
     readonly IReadOnlyList<IReadOnlyList<IReadOnlyList<PointD>>> boundaries;
     readonly VCarveCutterProfile profile;
     readonly double maximumDepth;
+    readonly double surface;
     readonly CancellationToken token;
     readonly Action<string>? diagnostic;
     public sealed record Receipt(int OriginalNodes,int ContactNodes,int OriginalEdges,int ContactEdges,
@@ -20,9 +21,15 @@ public sealed partial class ReviewedVCarveStockContact
         CancellationToken token=default,Action<string>? diagnostic=null)
     {
         if(!double.IsFinite(tolerance)||tolerance<=0)throw new ArgumentOutOfRangeException(nameof(tolerance));
-        priorStock=stock;this.tolerance=tolerance;this.boundaries=boundaries;this.profile=profile;maximumDepth=depth.Depth;this.token=token;this.diagnostic=diagnostic;
+        priorStock=stock;this.tolerance=tolerance;this.boundaries=boundaries;this.profile=profile;maximumDepth=depth.Depth;surface=depth.SurfaceZ;this.token=token;this.diagnostic=diagnostic;
         if(stock is not null)owner=new VCarveMaterialSurface(boundaries.SelectMany(x=>x),stock,profile,depth.Depth,depth.SurfaceZ,token,diagnostic);
     }
+
+    /// <summary>Retain the immutable stock/target authority used to construct
+    /// this source, including its already established full-cutter proofs.</summary>
+    public ToolpathPlan AttachClearance(IReadOnlyList<TaggedToolpath> raw,Action<string>? diagnostic=null)
+        =>ReviewedVCarvePlan.AttachClearance(raw,boundaries,profile,surface,owner,token,
+            diagnostic??this.diagnostic,reusedAuthority:owner is not null);
     // One cap for the original graph, derived from the same full-cutter
     // stock layers used for finishing. No corner selection or appended visits.
     private Paths64? depthFront;

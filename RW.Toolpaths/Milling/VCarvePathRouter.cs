@@ -67,6 +67,13 @@ internal static partial class VCarvePathRouter
         if (Observer.Value is { } observer)
             observer(new(paths, boundary, tool, depth, options, localEdgeFillWidth, start,
                 continuationCutGuard, materialEntryHeight));
+        var roughingPreparation=options.SmoothVCarving&&continuationCutGuard is not null
+            &&options.RoughingRestChords.Count>0&&options.OwnedRouteRoughingValues is not null
+            &&VCarveContinuationAdapter.RoughingPreparationEnabled.Value!=false
+            ?new VCarveContinuationAdapter.RoughingPreparation(options.RoughingRestChords,ownedSnapshot:options.OwnedRouteRoughingValues):null;
+        bool routeCompleted=false;
+        try
+        {
         if(options.SmoothVCarving&&continuationCutGuard is not null&&paths.Any(p=>p.ConcentricSource is not null)
             &&paths.All(p=>p.RegionIndex==paths[0].RegionIndex))
         {
@@ -82,22 +89,31 @@ internal static partial class VCarvePathRouter
                     diagnostic?.Invoke($"stage=spatial-routing-policy event=selected owner=automatic-large-single-pass-region axis={automatic.Axis} windowMm={automatic.WindowMm:R} "
                         +"scope=complete-source-region sourceSplitting=False configuredDepthDirectionUnchanged=True geometricOrTravelAuthority=False");
                 }
-                return VCarveRingRouter.Route(paths,tool,depth,options,start,continuationCutGuard,materialEntryHeight,
+                var ringRouted=VCarveRingRouter.Route(paths,tool,depth,options,start,continuationCutGuard,materialEntryHeight,
                     cancellationToken,diagnostic,(other,cursor)=>RouteCore(other,boundary,tool,depth,options,
-                        localEdgeFillWidth,cursor,cancellationToken,diagnostic,continuationCutGuard,materialEntryHeight));
+                        localEdgeFillWidth,cursor,cancellationToken,diagnostic,continuationCutGuard,materialEntryHeight,roughingPreparation));
+                routeCompleted=true;return ringRouted;
             }finally{
                 VCarveRingOrder.SpatialSweepOverride.Value=previousSweep;
                 VCarveRingRouter.SpatialMixedSourcesOverride.Value=previousMixed;
                 SpatialIndependentSourcesOverride.Value=previousIndependent;
             }
         }
-        return RouteCore(paths,boundary,tool,depth,options,localEdgeFillWidth,start,cancellationToken,diagnostic,
-            continuationCutGuard,materialEntryHeight);
+        var sourceRouted=RouteCore(paths,boundary,tool,depth,options,localEdgeFillWidth,start,cancellationToken,diagnostic,
+            continuationCutGuard,materialEntryHeight,roughingPreparation);
+        routeCompleted=true;return sourceRouted;
+        }
+        finally
+        {
+            if(routeCompleted)roughingPreparation?.Report(diagnostic);
+            else try{roughingPreparation?.Report(diagnostic);}catch{/* Keep the original routing/cancellation failure. */}
+        }
     }
     private static List<TaggedToolpath> RouteCore(IReadOnlyList<TaggedToolpath> paths,
         IReadOnlyList<IReadOnlyList<PointD>> boundary,ToolGeometry tool,DepthSchedule depth,VCarveOptions options,
         double localEdgeFillWidth,Point3D? start,CancellationToken cancellationToken,Action<string>? diagnostic,
-        Func<Point3D,Point3D,bool>? continuationCutGuard,Func<Point3D,double>? materialEntryHeight)
+        Func<Point3D,Point3D,bool>? continuationCutGuard,Func<Point3D,double>? materialEntryHeight,
+        VCarveContinuationAdapter.RoughingPreparation? roughingPreparation)
     {
         bool branchFinishing=!options.SmoothVCarving&&!options.DetectCurves&&options.Motion is not null
             &&continuationCutGuard is not null&&materialEntryHeight is not null
@@ -123,7 +139,7 @@ internal static partial class VCarvePathRouter
                 continuation?.Report();
                 var family=paths.Skip(first).TakeWhile(p=>p.RegionIndex==representative.RegionIndex
                     &&p.ContinuationComponentIndex==representative.ContinuationComponentIndex).ToArray();
-                continuation=new(tool,depth,options,continuationCutGuard,cancellationToken,diagnostic,family);
+                continuation=new(tool,depth,options,continuationCutGuard,cancellationToken,diagnostic,family,roughingPreparation);
                 if(result.Count>0)continuation.Record(result[^1]);
             }
             int end = first + 1;

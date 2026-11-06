@@ -18,11 +18,14 @@ public sealed class VCarveRoughingAnalysis
 {
     internal VCarveRoughingAnalysis(VCarvePreparation preparation,
         IReadOnlyList<IReadOnlyList<PointD>> boundary, IReadOnlyList<VCarveBasinDecision> basins,
-        IReadOnlySet<int> protectedSources, IReadOnlySet<int> entireSources)
+        IReadOnlySet<int> protectedSources, IReadOnlySet<int> entireSources,
+        Func<IReadOnlyList<VCarveBasinDecision>>? completeBasinDiagnostics = null)
     {
         Preparation = preparation;
         ProtectedBoundary = boundary;
-        Basins = basins;
+        _basins = basins;
+        _completeBasins = completeBasinDiagnostics is null ? null : new(completeBasinDiagnostics,
+            LazyThreadSafetyMode.ExecutionAndPublication);
         ProtectedSourceRegionIndices = protectedSources;
         EntireProtectedSourceRegionIndices = entireSources;
         ProtectedRegions = PolygonOps.DifferenceToComponents(boundary, Array.Empty<IReadOnlyList<PointD>>())
@@ -33,7 +36,12 @@ public sealed class VCarveRoughingAnalysis
     public VCarvePreparation Preparation { get; }
     public IReadOnlyList<IReadOnlyList<PointD>> ProtectedBoundary { get; }
     public IReadOnlyList<MillingRegion> ProtectedRegions { get; }
-    public IReadOnlyList<VCarveBasinDecision> Basins { get; }
+    private readonly IReadOnlyList<VCarveBasinDecision> _basins;
+    private readonly Lazy<IReadOnlyList<VCarveBasinDecision>>? _completeBasins;
+    public IReadOnlyList<VCarveBasinDecision> Basins => _completeBasins?.Value ?? _basins;
+    /// <summary>Summary counts require no detailed depth-field materialization.</summary>
+    public int DecisionCount => _basins.Count;
+    public int OmittedDecisionCount => _basins.Count(basin => basin.OmitRoughing);
     public IReadOnlySet<int> ProtectedSourceRegionIndices { get; }
     public IReadOnlySet<int> EntireProtectedSourceRegionIndices { get; }
     public double ProtectedArea { get; }
@@ -43,7 +51,8 @@ public sealed class VCarveRoughingAnalysis
         Preparation = preparation;
         ProtectedBoundary = source.ProtectedBoundary;
         ProtectedRegions = source.ProtectedRegions;
-        Basins = source.Basins;
+        _basins = source._basins;
+        _completeBasins = source._completeBasins;
         ProtectedSourceRegionIndices = source.ProtectedSourceRegionIndices;
         EntireProtectedSourceRegionIndices = source.EntireProtectedSourceRegionIndices;
         ProtectedArea = source.ProtectedArea;
@@ -70,12 +79,95 @@ public sealed class VCarveRoughingAnalysis
 /// </summary>
 public sealed partial class VCarvePreparation
 {
+    // Preserve the original ambient budget for optional pure prefetch builders.
+    // Only an explicit false selects the one-worker diagnostic comparison.
+    // Exact request keys retain the caller's ambient policy in either case.
+    internal static readonly AsyncLocal<bool?> InitialOutlinePrefetchAmbientWorkers=new();
+    internal readonly record struct OutlinePrefetchWorkerBudget(string Phase,int AmbientGeometryWorkers,
+        int AmbientStockFitWorkers,int EffectiveGeometryWorkers,int EffectiveStockFitWorkers,
+        int RestoredGeometryWorkers,int RestoredStockFitWorkers);
     // Reuse the established smooth-coverage geometric error; this is not a pocket-size cutoff.
     public const double GeometricErrorBound = VCarveSmoothing.CoverageTolerance;
     private const double MaximumSampleSpacing = .25;
     private readonly ToolGeometry _tool;
     private readonly DepthSchedule _depth;
     private readonly VCarveOptions _options;
+    private const long MaximumOutlineBytes=64L<<20;
+    private sealed class OutlineState
+    {
+        internal readonly FilledFrontEvidenceCache.Cache<OutlineSnapshot> Cache=new(MaximumOutlineBytes,4);
+        internal readonly object Gate=new();
+        internal OutlineFlight? Flight;
+        internal long Constructions;
+        internal OutlinePrefetchWorkerBudget? LastWorkerBudget;
+    }
+    private sealed class OutlineFlight(FilledFrontEvidenceCache.Key key)
+    {
+        internal readonly FilledFrontEvidenceCache.Key Key=key;
+        internal Task Work=Task.CompletedTask;
+    }
+    private sealed class OutlineSnapshot
+    {
+        // The entire original graph stays private until Cache.Take atomically
+        // transfers its sole ownership. Reconstructing OffsetRing would repeat
+        // winding/area arithmetic; sharing mutable Points/Children is forbidden.
+        internal readonly List<OffsetRing> Rings;
+        internal readonly RestFillPrefetch? RestFill;
+        internal OutlineSnapshot(List<OffsetRing> rings,RestFillPrefetch? restFill=null)
+        {Rings=rings;RestFill=restFill;}
+    }
+    internal sealed class RestFillKey
+    {
+        private readonly FilledFrontEvidenceCache.Key boundary,crests,target;
+        private readonly string policy;
+        private readonly ulong hash;
+        internal long Bytes=>boundary.Bytes+crests.Bytes+target.Bytes+64L+2L*policy.Length;
+        internal ulong Hash=>hash;
+        private RestFillKey(FilledFrontEvidenceCache.Key boundary,FilledFrontEvidenceCache.Key crests,
+            FilledFrontEvidenceCache.Key target,string policy)
+        {
+            this.boundary=boundary;this.crests=crests;this.target=target;this.policy=policy;
+            hash=unchecked((boundary.Hash*1099511628211UL^crests.Hash)*1099511628211UL^target.Hash);
+            foreach(char word in policy)hash=unchecked((hash^word)*1099511628211UL);
+        }
+        internal bool Same(RestFillKey other)=>policy==other.policy&&boundary.Same(other.boundary)
+            &&crests.Same(other.crests)&&target.Same(other.target);
+        internal static RestFillKey? Capture(VCarveRampSurface.RestFillRequest request,CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            // Sources currently construct exactly two crest endpoints at Z=0.
+            // Refuse unsupported future source layouts rather than omit a
+            // consumed ordinate from this exact-input key.
+            if(request.Crests.Any(p=>p.Points.Any(q=>BitConverter.DoubleToInt64Bits(q.Z)!=0)))return null;
+            var boundary=FilledFrontEvidenceCache.Key.Capture(request.Boundary,request.Depth,request.Grade,request.DiscRadius,1,null,token);
+            var crests=FilledFrontEvidenceCache.Key.Capture(request.Crests.Select(p=>(IReadOnlyList<PointD>)p.Points
+                .Select(q=>new PointD(q.X,q.Y)).ToArray()),request.Depth,request.Grade,request.DiscRadius,2,null,token);
+            var target=FilledFrontEvidenceCache.Key.Capture(request.Target??Array.Empty<IReadOnlyList<PointD>>(),
+                request.Depth,request.Grade,request.DiscRadius,request.Target is null?0:1,null,token);
+            return boundary is null||crests is null||target is null?null:new(boundary,crests,target,OutlinePolicy(request.PlateauConstantOffsetLeafVertices));
+        }
+    }
+    internal sealed class RestFillPrefetch(RestFillKey key,VCarveRampSurface.RestFillPreparation value)
+    {
+        private int consumed;
+        internal long Bytes=>96+key.Bytes+value.EstimatedBytes;
+        internal VCarveRampSurface.RestFillPreparation? Take(VCarveRampSurface.RestFillRequest request,
+            CancellationToken token,Action<string>? diagnostic)
+        {
+            token.ThrowIfCancellationRequested();var actual=RestFillKey.Capture(request,token);
+            bool hit=Interlocked.Exchange(ref consumed,1)==0&&actual is not null&&key.Same(actual);
+            diagnostic?.Invoke($"stage=rest-fill-prefetch event={(hit?"hit":"miss")} keyHash={key.Hash:X16} "
+                +$"actualKeyHash={(actual is null?"unavailable":actual.Hash.ToString("X16",CultureInfo.InvariantCulture))} exactOrderedInputs=True consumedOnce={hit} "
+                +$"retainedBytes={Bytes} plateauBuildMs={value.PlateauMilliseconds:F3} discBuildMs={value.DiscMilliseconds:F3} "
+                +"stockRead=False footprintCredit=False physicalGuardsUnchanged=True");
+            token.ThrowIfCancellationRequested();return hit?value:null;
+        }
+    }
+    private readonly OutlineState outlines;
+    internal FilledFrontEvidenceCache.State InitialOutlineCacheState=>outlines.Cache.Inspect();
+    internal long InitialOutlineConstructions=>Interlocked.Read(ref outlines.Constructions);
+    internal OutlinePrefetchWorkerBudget? InitialOutlinePrefetchBudget
+    {get{lock(outlines.Gate)return outlines.LastWorkerBudget;}}
     private CompletedFinish? _completedFinish;
     // The consumer permits .001mm comparison tolerance. Withhold that amount
     // from an actual commanded physical witness so tolerance cannot add stock.
@@ -263,18 +355,59 @@ public sealed partial class VCarvePreparation
         return slope;
     }
 
-    internal sealed record PreparedRegion(int RegionIndex, IReadOnlyList<IReadOnlyList<PointD>> Boundary,
-        IReadOnlyList<MedialSegment> OriginalMedialGraph, IReadOnlyList<IReadOnlyList<MedialPoint>> SourceClearancePaths,
-        IReadOnlyList<TaggedToolpath> OriginalMedialPaths,
-        IReadOnlyList<TaggedToolpath> SmoothedMedialPaths, IReadOnlyList<TaggedToolpath> UpperMedialPaths,
-        double MaximumChordLength);
+    internal sealed record PreparedRegion
+    {
+        public int RegionIndex { get; init; }
+        public IReadOnlyList<IReadOnlyList<PointD>> Boundary { get; init; }
+        public IReadOnlyList<MedialSegment> OriginalMedialGraph { get; init; }
+        private IReadOnlyList<IReadOnlyList<MedialPoint>>? _clearance;
+        private IReadOnlyList<TaggedToolpath>? _original, _smooth, _upper;
+        private double _maximumChordLength;
+        private DeferredRegionDepths? _deferred;
+        public IReadOnlyList<IReadOnlyList<MedialPoint>> SourceClearancePaths
+        { get => _clearance ?? Complete(default).SourceClearancePaths; init { ResolveForEdit();_clearance = value; } }
+        public IReadOnlyList<TaggedToolpath> OriginalMedialPaths
+        { get => _original ?? Complete(default).OriginalMedialPaths; init { ResolveForEdit();_original = value; } }
+        public IReadOnlyList<TaggedToolpath> SmoothedMedialPaths
+        { get => _smooth ?? Complete(default).SmoothedMedialPaths; init { ResolveForEdit();_smooth = value; } }
+        public IReadOnlyList<TaggedToolpath> UpperMedialPaths
+        { get => _upper ?? Complete(default).UpperMedialPaths; init { ResolveForEdit();_upper = value; } }
+        public double MaximumChordLength
+        { get => _deferred is null ? _maximumChordLength : Complete(default).MaximumChordLength; init { ResolveForEdit();_maximumChordLength = value; } }
+        internal bool HasDeferredDepths => _deferred is not null;
+        internal bool HasCompletedDepths => _deferred?.HasCompleted ?? true;
+        internal double? SampledUpperWitness => _deferred?.SampledUpperWitness;
+        internal PreparedRegion Complete(CancellationToken token) => _deferred?.Complete(token) ?? this;
+        private void ResolveForEdit()
+        {
+            if(_deferred is null)return;
+            var complete=Complete(default);
+            _clearance=complete._clearance;_original=complete._original;_smooth=complete._smooth;
+            _upper=complete._upper;_maximumChordLength=complete._maximumChordLength;
+            _deferred=null;
+        }
+
+        internal PreparedRegion(int regionIndex,IReadOnlyList<IReadOnlyList<PointD>> boundary,
+            IReadOnlyList<MedialSegment> originalMedialGraph,IReadOnlyList<IReadOnlyList<MedialPoint>> sourceClearancePaths,
+            IReadOnlyList<TaggedToolpath> originalMedialPaths,IReadOnlyList<TaggedToolpath> smoothedMedialPaths,
+            IReadOnlyList<TaggedToolpath> upperMedialPaths,double maximumChordLength)
+        {
+            RegionIndex=regionIndex;Boundary=boundary;OriginalMedialGraph=originalMedialGraph;
+            _clearance=sourceClearancePaths;_original=originalMedialPaths;_smooth=smoothedMedialPaths;
+            _upper=upperMedialPaths;_maximumChordLength=maximumChordLength;
+        }
+        internal PreparedRegion(int regionIndex,IReadOnlyList<IReadOnlyList<PointD>> boundary,
+            IReadOnlyList<MedialSegment> originalMedialGraph,DeferredRegionDepths deferred)
+        {RegionIndex=regionIndex;Boundary=boundary;OriginalMedialGraph=originalMedialGraph;_deferred=deferred;}
+    }
 
     private VCarvePreparation(IReadOnlyList<MillingRegion> originals, ToolGeometry tool,
-        DepthSchedule depth, VCarveOptions options, IReadOnlyList<PreparedRegion> regions)
+        DepthSchedule depth, VCarveOptions options, IReadOnlyList<PreparedRegion> regions,OutlineState? outlineState=null)
     {
         OriginalRegions = originals; _tool = tool; _depth = depth; _options = options;
         Regions = regions; Fingerprint = ComputeFingerprint(originals, tool, depth, options);
         OriginalGeometryFingerprint = ComputeOriginalGeometryFingerprint(originals);
+        outlines=outlineState??new();
     }
 
     private VCarvePreparation(VCarvePreparation source)
@@ -286,7 +419,178 @@ public sealed partial class VCarvePreparation
         Regions = source.Regions;
         Fingerprint = source.Fingerprint;
         OriginalGeometryFingerprint = source.OriginalGeometryFingerprint;
+        outlines=source.outlines;
         // CompletedFinish remains null: it is owned by this compilation, never by the cache.
+    }
+
+    /// <summary>Overlaps stock-independent outline/rest-fill nominations with this compilation's
+    /// preceding pocket work. Dispose cancels and joins unfinished optional work;
+    /// caller cancellation remains observable. No actual stock/protection work runs here.</summary>
+    public IDisposable? PrefetchInitialOutline(CancellationToken token=default)=>PrefetchInitialOutline(token,4096);
+    internal OutlinePrefetchLease? PrefetchInitialOutline(CancellationToken token,int minimumBoundaryPoints)
+    {
+        token.ThrowIfCancellationRequested();
+        lock(outlines.Gate)if(outlines.Flight is not null)return null;
+        var region=Regions.Where(r=>r.Boundary.Sum(p=>(long)p.Count)>=minimumBoundaryPoints)
+            .OrderByDescending(r=>r.Boundary.Sum(p=>(long)p.Count)).FirstOrDefault();
+        if(region is null)return null;
+        double depth=Math.Min(_depth.Depth,_tool.VCarveProfile?.MaximumDepth??_tool.ConeLength??0);
+        var boundary=VCarveRampSurface.OutlineBoundary(region.Boundary,_options);
+        var request=VCarveRampSurface.PrepareInitialOutline(boundary,_options,VCarvePhysicalSweep.ProfileFor(_tool,depth),depth,token);
+        if(request.Construction is null)return null;
+        var (key,policy)=OutlineKey(request,token);
+        if(key is null||outlines.Cache.Find(key,token) is not null)return null;
+        var lifetime=CancellationTokenSource.CreateLinkedTokenSource(token);
+        OutlineFlight flight;
+        lock(outlines.Gate)
+        {
+            if(outlines.Flight is not null){lifetime.Dispose();return null;}
+            flight=new(key);outlines.Flight=flight;
+            flight.Work=Task.Run(()=>
+            {
+                try
+                {
+                    Log(_options,$"event=outline-prefetch state=started region={region.RegionIndex} keyHash={key.Hash:X16} stockRead=False prefetchTasks=1 geometryWorkers={GeometryParallelism.WorkerLimit} stockFitWorkers={GeometryParallelism.StockFitWorkerLimit} ambientWorkerControl={InitialOutlinePrefetchAmbientWorkers.Value is not false} ambientWorkerControlRaw={InitialOutlinePrefetchAmbientWorkers.Value?.ToString()??"default"} pureBuilderWorkers={(InitialOutlinePrefetchAmbientWorkers.Value is false?1:GeometryParallelism.WorkerLimit)}");
+                    ConstructInitialOutline(request,key,policy,lifetime.Token,prefetch:true);
+                }
+                catch(Exception error)
+                {
+                    Log(_options,$"event=outline-prefetch state={(lifetime.IsCancellationRequested?"canceled":"failed")} region={region.RegionIndex} keyHash={key.Hash:X16} detail='{error}' publishedPartial=False");
+                    throw;
+                }
+                finally{lock(outlines.Gate)if(ReferenceEquals(outlines.Flight,flight))outlines.Flight=null;}
+            },CancellationToken.None);
+        }
+        return new(lifetime,flight.Work,token,message=>Log(_options,message));
+    }
+    private sealed class PrefetchWorkerScope:IDisposable
+    {
+        private readonly VCarvePreparation owner;
+        private readonly string phase;
+        private readonly int ambientGeometry,ambientStock,effectiveGeometry,effectiveStock;
+        private readonly IDisposable? scope;
+        private int disposed;
+        internal PrefetchWorkerScope(VCarvePreparation owner,string phase)
+        {
+            this.owner=owner;this.phase=phase;
+            ambientGeometry=GeometryParallelism.WorkerLimit;ambientStock=GeometryParallelism.StockFitWorkerLimit;
+            scope=InitialOutlinePrefetchAmbientWorkers.Value is false?GeometryParallelism.EnterWorker():null;
+            effectiveGeometry=GeometryParallelism.WorkerLimit;effectiveStock=GeometryParallelism.StockFitWorkerLimit;
+            try{Log(owner._options,$"event=outline-prefetch-budget state=started phase={phase} ambientGeometryWorkers={ambientGeometry} ambientStockFitWorkers={ambientStock} effectiveGeometryWorkers={effectiveGeometry} effectiveStockFitWorkers={effectiveStock} sourceAndUnionOperands=unchanged");}
+            catch{scope?.Dispose();throw;}
+        }
+        public void Dispose()
+        {
+            if(Interlocked.Exchange(ref disposed,1)!=0)return;
+            scope?.Dispose();
+            int restoredGeometry=GeometryParallelism.WorkerLimit,restoredStock=GeometryParallelism.StockFitWorkerLimit;
+            lock(owner.outlines.Gate)owner.outlines.LastWorkerBudget=new(phase,ambientGeometry,ambientStock,
+                effectiveGeometry,effectiveStock,restoredGeometry,restoredStock);
+            Log(owner._options,$"event=outline-prefetch-budget state=restored phase={phase} effectiveGeometryWorkers={effectiveGeometry} effectiveStockFitWorkers={effectiveStock} restoredGeometryWorkers={restoredGeometry} restoredStockFitWorkers={restoredStock} keyPolicy=original-ambient workerScopeJoined=True");
+        }
+    }
+    internal sealed class OutlinePrefetchLease(CancellationTokenSource lifetime,Task work,CancellationToken callerToken,Action<string> log):IDisposable
+    {
+        private int disposed;
+        internal Task Completion=>work;
+        public void Dispose()
+        {
+            if(Interlocked.Exchange(ref disposed,1)!=0)return;
+            lifetime.Cancel();
+            try{work.GetAwaiter().GetResult();}
+            catch(OperationCanceledException)when(lifetime.IsCancellationRequested){}
+            catch(Exception error){log($"event=outline-prefetch state=joined-failure detail='{error}' actualConstructionStillRequired=True");}
+            finally{lifetime.Dispose();}
+            log($"event=outline-prefetch state=joined completed={work.IsCompletedSuccessfully} detachedWorker=False");
+            callerToken.ThrowIfCancellationRequested();
+        }
+    }
+    private static string OutlinePolicy(int plateauConstantOffsetLeafVertices)
+    {
+        // Generic offset construction has development-only runtime selectors.
+        // Capture their complete names/values, rather than loosen the key when
+        // a diagnostic process changes a selector between preparation and use.
+        var values=Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>()
+            .Where(e=>e.Key is string name&&name.StartsWith("RW_TOOLPATHS_",StringComparison.Ordinal))
+            .OrderBy(e=>(string)e.Key,StringComparer.Ordinal);
+        return $"geometryWorkers={GeometryParallelism.WorkerLimit}\0stockFitWorkers={GeometryParallelism.StockFitWorkerLimit}\0"
+            +string.Concat(values.Select(e=>$"{e.Key}\0{e.Value}\0"))
+            +(plateauConstantOffsetLeafVertices==SmoothRoughingPlateau.LegacyConstantOffsetLeafVertices?string.Empty
+                :$"plateauConstantOffsetLeafVertices={plateauConstantOffsetLeafVertices}\0");
+    }
+    private static (FilledFrontEvidenceCache.Key? Key,string Policy) OutlineKey(VCarveRampSurface.InitialOutline request,CancellationToken token)
+    {
+        string policy=OutlinePolicy(request.PlateauConstantOffsetLeafVertices);var construction=request.Construction!;
+        var policyWords=policy.Select(c=>new PointD(c,0)).ToArray();
+        var key=FilledFrontEvidenceCache.Key.Capture(request.Boundary.Append(policyWords),construction.FirstOffset,
+            construction.StepOver,construction.MaximumInset,construction.RingLimit,null,token);
+        return(key,policy);
+    }
+    internal List<OffsetRing> InitialOutlineRings(VCarveRampSurface.InitialOutline request,CancellationToken token,Action<string>? diagnostic)
+        =>InitialOutlineRings(request,token,diagnostic,out _);
+    internal List<OffsetRing> InitialOutlineRings(VCarveRampSurface.InitialOutline request,CancellationToken token,Action<string>? diagnostic,
+        out RestFillPrefetch? restFill)
+    {
+        restFill=null;
+        if(request.Construction is null){token.ThrowIfCancellationRequested();return VCarveRampSurface.BuildInitialOutline(request,token);}
+        token.ThrowIfCancellationRequested();var (key,policy)=OutlineKey(request,token);
+        var cached=outlines.Cache.Take(key,token);
+        if(cached is null&&key is not null)
+        {
+            Task? pending;
+            lock(outlines.Gate)pending=outlines.Flight is {} flight&&flight.Key.Same(key)?flight.Work:null;
+            if(pending is not null)
+            {
+                diagnostic?.Invoke($"stage=outline-prefetch event=waiting keyHash={key.Hash:X16} exactOrderedInputs=True stockRead=False");
+                try{pending.WaitAsync(token).GetAwaiter().GetResult();}
+                catch(Exception)when(!token.IsCancellationRequested){/* Optional work failed/canceled; the actual original builder remains authoritative. */}
+                token.ThrowIfCancellationRequested();
+            }
+            // Recheck also closes publication between the first lookup and
+            // acquisition of the single-flight owner.
+            cached=outlines.Cache.Take(key,token);
+        }
+        var state=outlines.Cache.Inspect();
+        diagnostic?.Invoke($"stage=outline-prefetch event={(cached is null?"miss":"hit")} keyHash={(key is null?"unavailable":key.Hash.ToString("X16",CultureInfo.InvariantCulture))} "
+            +$"exactOrderedInputs=True consumedOnce={cached is not null} entries={state.Entries} retainedBytes={state.Bytes} maximumBytes={MaximumOutlineBytes} stockRead=False");
+        restFill=cached?.RestFill;
+        return cached?.Rings??ConstructInitialOutline(request,key,policy,token);
+    }
+    private List<OffsetRing> ConstructInitialOutline(VCarveRampSurface.InitialOutline request,FilledFrontEvidenceCache.Key? key,string policy,CancellationToken token,bool prefetch=false)
+    {
+        long started=System.Diagnostics.Stopwatch.GetTimestamp();Interlocked.Increment(ref outlines.Constructions);
+        List<OffsetRing> result;
+        using(var worker=prefetch?new PrefetchWorkerScope(this,"outline"):null)
+            result=VCarveRampSurface.BuildInitialOutline(request,token);
+        token.ThrowIfCancellationRequested();
+        long bytes=256L+256L*result.Count+32L*result.Sum(r=>(long)r.Points.Count)+8L*result.Sum(r=>(long)r.Children.Count);
+        RestFillPrefetch? restFill=null;
+        if(prefetch&&key is not null&&key.Bytes+bytes+96<=MaximumOutlineBytes&&VCarveRampSurface.HasRestFillFront(result,request))
+        {
+            var restRequest=VCarveRampSurface.CaptureRestFillRequest(request.Boundary,_options,request.Depth,request.Band.Grade,token);
+            var restKey=RestFillKey.Capture(restRequest,token);
+            if(restKey is not null)
+            {
+                VCarveRampSurface.RestFillPreparation helper;
+                using(var worker=new PrefetchWorkerScope(this,"rest-fill"))
+                    helper=VCarveRampSurface.BuildRestFillPreparation(restRequest,token,null);
+                var candidate=new RestFillPrefetch(restKey,helper);
+                bool fits=key.Bytes+bytes+candidate.Bytes+96<=MaximumOutlineBytes;
+                if(fits){restFill=candidate;bytes+=candidate.Bytes;}
+                Log(_options,$"event=rest-fill-prefetch state={(fits?"prepared":"raw-only-budget")} keyHash={restKey.Hash:X16} "
+                    +$"retainedBytes={candidate.Bytes} plateauBuildMs={helper.PlateauMilliseconds:F3} discBuildMs={helper.DiscMilliseconds:F3} "
+                    +"exactOrderedInputs=True stockRead=False footprintCredit=False completedOnly=True");
+            }
+            else Log(_options,"event=rest-fill-prefetch state=raw-only-key-refusal exactOrderedInputs=True stockRead=False");
+        }
+        bool admitted=prefetch&&key is not null&&key.Bytes+bytes+96<=MaximumOutlineBytes&&policy==OutlinePolicy(request.PlateauConstantOffsetLeafVertices);
+        int ringCount=result.Count;long pointCount=result.Sum(r=>(long)r.Points.Count);
+        if(admitted)outlines.Cache.Publish(key,new OutlineSnapshot(result,restFill),bytes,token);
+        var state=outlines.Cache.Inspect();
+        Log(_options,$"event=outline-prefetch state={(admitted?"published":prefetch?"uncached":"literal")} keyHash={(key is null?"unavailable":key.Hash.ToString("X16",CultureInfo.InvariantCulture))} "
+            +$"rings={ringCount} points={pointCount} elapsedMs={System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
+            +$"entries={state.Entries} retainedBytes={state.Bytes} maximumBytes={MaximumOutlineBytes} exactOrderedInputs=True stockRead=False completedOnly=True");
+        return result;
     }
 
     private sealed class SourceRadiusMemo
@@ -297,11 +601,14 @@ public sealed partial class VCarvePreparation
 
     internal static VCarvePreparation Create(IReadOnlyList<MillingRegion> regions, ToolGeometry tool,
         DepthSchedule depth, VCarveOptions options, IMedialAxisProvider provider,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, bool deferBoundedFinishDepths=false)
     {
         ArgumentNullException.ThrowIfNull(regions); ArgumentNullException.ThrowIfNull(tool);
         ArgumentNullException.ThrowIfNull(depth); ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(provider);
+        // Retained preparation and its deferred consumers must use the policy
+        // captured before this request starts, even if the ambient trial changes.
+        options=options with{PlateauConstantOffsetLeafVertices=SmoothRoughingPlateau.CaptureConstantOffsetLeafVertices(options)};
         if (provider is NativeMedialAxisProvider)
             throw new InvalidOperationException("The approximate sampled medial provider cannot certify automatic roughing omission; keep ordinary roughing.");
         if (!options.SmoothVCarving || !double.IsFinite(options.SmoothRampAngleDegrees)
@@ -338,81 +645,14 @@ public sealed partial class VCarvePreparation
                     maximumGeometricError: GeometricErrorBound / 4, preserveNativeGrid: options.PreparationContactRadius > 0));
             }
             double medialMs=System.Diagnostics.Stopwatch.GetElapsedTime(regionStarted).TotalMilliseconds;
-            var paths = new TaggedToolpath[raw.Count];
-            var uppers = new TaggedToolpath[raw.Count];
-            var clearancePaths = new IReadOnlyList<MedialPoint>[raw.Count];
-            var chordLengths=new double[raw.Count];
-            var boundaryEdges = boundary.SelectMany(ring => Enumerable.Range(0, ring.Count)
-                .Select(index => (A: ring[index], B: ring[(index + 1) % ring.Count]))).ToList();
-            var boundaryDistance = new MedialAxisToolpaths.SpatialSegmentIndex(boundaryEdges,enableDiagnostics:true);
-            // Adjacent original graph chords share literal endpoints. Reuse
-            // only identical XY queries against this immutable source index.
-            const int radiusMemoLimit=65536;
-            long radiusQueries=0,radiusHits=0,radiusClears=0;
-            double SourceRadius(double x,double y,SourceRadiusMemo memo)
-            {
-                memo.Queries++;
-                if(memo.Values.TryGetValue((x,y),out double cached)){memo.Hits++;return cached;}
-                double value=boundaryDistance.QueryDistance(x,y);
-                if(memo.Values.Count==radiusMemoLimit){memo.Values.Clear();memo.Clears++;}
-                memo.Values.Add((x,y),value);return value;
-            }
-            void Sample(int ordinal,SourceRadiusMemo memo)
-            {
-                MedialSegment segment=raw[ordinal];
-                cancellationToken.ThrowIfCancellationRequested();
-                double length = Distance(segment.Point0, segment.Point1);
-                int steps = Math.Max(1, (int)Math.Ceiling(length / MaximumSampleSpacing));
-                if (steps > 1_000_000) throw new InvalidOperationException("Original V-carve graph segment is too long to certify.");
-                chordLengths[ordinal]=length/steps;
-                var points = new List<Point3D>(steps + 1);
-                var upper = new List<Point3D>(steps + 1);
-                var clearances = new List<MedialPoint>(steps + 1);
-                for (int sample = 0; sample <= steps; sample++)
-                {
-                    if((sample&1023)==0)cancellationToken.ThrowIfCancellationRequested();
-                    double fraction = (double)sample / steps;
-                    double x = segment.Point0.X + fraction * (segment.Point1.X - segment.Point0.X);
-                    double y = segment.Point0.Y + fraction * (segment.Point1.Y - segment.Point0.Y);
-                    // Point-point bisectors are straight but their radius is nonlinear, with
-                    // a possible interior neck. Endpoint radius interpolation hides that basin.
-                    // Keep source clearance separate and evaluate it on the preserved artwork.
-                    double radius = SourceRadius(x,y,memo);
-                    clearances.Add(new MedialPoint(x, y, radius));
-                    points.Add(new Point3D(x, y, -Math.Min(maximumDepth, physical.DepthAtRadius(radius))));
-                    upper.Add(new Point3D(x, y, -Math.Min(maximumDepth, physical.DepthAtRadius(radius + GeometricErrorBound))));
-                }
-                paths[ordinal]=new TaggedToolpath(points,Array.Empty<ToolpathSpan>(),regionIndex,"final-carve",null,detectCurves:false);
-                uppers[ordinal]=new TaggedToolpath(upper,Array.Empty<ToolpathSpan>(),regionIndex,"final-carve",null,detectCurves:false);
-                clearancePaths[ordinal]=clearances;
-            }
-            void Collect(SourceRadiusMemo memo)
-            {
-                Interlocked.Add(ref radiusQueries,memo.Queries);Interlocked.Add(ref radiusHits,memo.Hits);
-                Interlocked.Add(ref radiusClears,memo.Clears);
-            }
-            int sampleWorkers=options.ParallelOriginalSourceSampling&&raw.Count>=4096
-                ?Math.Min(4,GeometryParallelism.WorkerLimit):1;
-            if(sampleWorkers>1)
-                Parallel.For(0,raw.Count,new ParallelOptions{MaxDegreeOfParallelism=sampleWorkers,CancellationToken=cancellationToken},
-                    ()=>new SourceRadiusMemo(),(ordinal,_,memo)=>{Sample(ordinal,memo);return memo;},Collect);
-            else
-            {
-                var memo=new SourceRadiusMemo();
-                for(int ordinal=0;ordinal<raw.Count;ordinal++)Sample(ordinal,memo);
-                Collect(memo);
-            }
-            double maximumChord=chordLengths.Length==0?0:chordLengths.Max();
-            boundaryDistance.LogDiagnostics(message=>Log(options,$"region={regionIndex} {message}"));
-            double beforeGradeMs=System.Diagnostics.Stopwatch.GetElapsedTime(regionStarted).TotalMilliseconds;
-            var (smooth, upperSmooth) = VCarveRampSurface.FitMedial(paths, uppers,
-                boundary, options, physical, maximumDepth, cancellationToken);
-            prepared.Add(new PreparedRegion(regionIndex, boundary, raw, clearancePaths, paths, smooth, upperSmooth, maximumChord));
-            Log(options, $"event=prepared region={regionIndex} originalGraphEdges={raw.Count} physicalPoints={paths.Sum(path => path.Points.Count)} " +
-                $"originalPeak={Peak(paths):R} smoothedPeak={Peak(smooth):R} geometryError={GeometricErrorBound:R} " +
-                $"medialMs={medialMs:F1} sourceSampleMs={beforeGradeMs-medialMs:F1} gradeAndPublishMs={System.Diagnostics.Stopwatch.GetElapsedTime(regionStarted).TotalMilliseconds-beforeGradeMs:F1} " +
-                $"sourceRadiusQueries={radiusQueries} sourceRadiusMemoHits={radiusHits} sourceRadiusMemoClears={radiusClears} sourceRadiusMemoLimitPerWorker={radiusMemoLimit} sourceSamplingWorkers={sampleWorkers} sourceSamplePublication=original-graph-order sourceRadiusMemoKeys=exact-XY immutableSourceIndex=True " +
-                "clearanceRadiiPreserved=True routingAndCommandReservesApplied=False surfaceOwner=continuous-retained-crest medialConeAnchors=False depthFields=2");
+            int capturedRegion=regionIndex;
+            PreparedRegion Complete(CancellationToken token)=>PrepareRegionDepths(capturedRegion,boundary,raw,
+                options,physical,maximumDepth,medialMs,token);
+            if(deferBoundedFinishDepths&&raw.Count>=4096
+                &&TrySampledUpperWitness(regionIndex,boundary,raw,options,physical,maximumDepth,grade,cancellationToken,out double witness))
+                prepared.Add(new PreparedRegion(regionIndex,boundary,raw,
+                    new DeferredRegionDepths(Complete,witness,options,regionIndex)));
+            else prepared.Add(Complete(cancellationToken));
         }
         cancellationToken.ThrowIfCancellationRequested();
         return new VCarvePreparation(originals, tool, depth, options, prepared);
@@ -477,7 +717,7 @@ public sealed partial class VCarvePreparation
             + roughRadius + Math.Max(0, allowance) + 2 * GeometricErrorBound;
     }
 
-    private VCarveRoughingAnalysis AnalyzeSourcePlateaus(double floor, CancellationToken token)
+    private VCarveRoughingAnalysis AnalyzeSourcePlateaus(double floor, CancellationToken token,bool forceComplete=false)
     {
         if (!double.IsFinite(floor) || floor <= 0 || floor > _depth.Depth
             || floor > (_tool.VCarveProfile?.MaximumDepth ?? _tool.ConeLength ?? 0))
@@ -486,27 +726,35 @@ public sealed partial class VCarvePreparation
         var protection = new List<IReadOnlyList<PointD>>();
         var decisions = new List<VCarveBasinDecision>();
         var sources = new HashSet<int>(); var entire = new HashSet<int>();
-        foreach (var region in Regions)
+        bool usedWitness=false;
+        foreach (var pendingRegion in Regions)
         {
             token.ThrowIfCancellationRequested();
+            bool witnessed=!forceComplete&&pendingRegion.SampledUpperWitness is {} witness&&witness>=floor;
+            var region=witnessed?pendingRegion:pendingRegion.Complete(token);
             var boundary = VCarveToolpaths.BuildBoundary(OriginalRegions[region.RegionIndex], 0);
-            double peak = Peak(region.SmoothedMedialPaths);
-            double upper = Peak(region.UpperMedialPaths) + grade * (region.MaximumChordLength / 2 + 2 * GeometricErrorBound);
-            bool whole = region.OriginalMedialPaths.Count == 0 || upper < floor;
+            double peak = witnessed?double.NaN:Peak(region.SmoothedMedialPaths);
+            double upper = witnessed?double.NaN:Peak(region.UpperMedialPaths) + grade * (region.MaximumChordLength / 2 + 2 * GeometricErrorBound);
+            bool whole = !witnessed&&(region.OriginalMedialPaths.Count == 0 || upper < floor);
             var mask = whole ? boundary : VCarveRampSurface.Plateau(boundary, _options, floor, grade, token);
             mask = RestrictProtectionToTarget(mask);
             double area = Math.Abs(mask.Sum(ring => Clipper.Area(new PathD(ring))));
             if (area > 0) { protection.AddRange(mask); sources.Add(region.RegionIndex); }
             if (whole) entire.Add(region.RegionIndex);
-            decisions.Add(new VCarveBasinDecision(region.RegionIndex, 0, default, 0, Peak(region.OriginalMedialPaths),
+            decisions.Add(new VCarveBasinDecision(region.RegionIndex, 0, default, 0, witnessed?double.NaN:Peak(region.OriginalMedialPaths),
                 peak, upper, floor, upper - peak, whole, whole ? "complete-source-below-floor" : "continuous-full-depth-plateau", area, whole));
-            Log(_options, $"event=source-plateau region={region.RegionIndex} smoothPeak={peak:R} boundedPeak={upper:R} "
+            usedWitness|=witnessed;
+            if(witnessed)Log(_options,$"event=source-plateau region={region.RegionIndex} sampledUpperWitness={region.SampledUpperWitness:R} "
+                +$"floor={floor:R} entireSource=False protectedArea={area:R} originalPlateauMask=True "
+                +"wholeClassificationExact=True fullPeakStatistics=deferred-until-diagnostic-request originalGraphRetained=True");
+            else Log(_options, $"event=source-plateau region={region.RegionIndex} smoothPeak={peak:R} boundedPeak={upper:R} "
                 + $"floor={floor:R} entireSource={whole} protectedArea={area:R} watershedRequired=False "
                 + "sourceAggregateBoundEquivalent=True graphAndGradeReused=True");
         }
         var canonical = PathUtils.CanonicalizeRings(protection).Select(r => (IReadOnlyList<PointD>)r).ToList();
         return new VCarveRoughingAnalysis(this,
-            RestrictProtectionToTarget(canonical), decisions, sources, entire);
+            RestrictProtectionToTarget(canonical), decisions, sources, entire,
+            usedWitness?()=>AnalyzeSourcePlateaus(floor,default,forceComplete:true).Basins:null);
     }
 
     private VCarveRoughingAnalysis AnalyzeRoughingCore(double roughingFloor,
@@ -521,8 +769,9 @@ public sealed partial class VCarvePreparation
         double toolDepth = _tool.VCarveProfile?.MaximumDepth ?? _tool.ConeLength ?? 0;
         string? incompatible = _depth.Depth < roughingFloor ? "authored-depth-below-roughing-floor"
             : toolDepth < roughingFloor ? "physical-tool-too-short-for-roughing-floor" : null;
-        foreach (PreparedRegion region in Regions)
+        foreach (PreparedRegion pendingRegion in Regions)
         {
+            var region=pendingRegion.Complete(cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             Graph graph = BuildGraph(region, cancellationToken);
             if (graph.Nodes.Count == 0)
@@ -807,6 +1056,9 @@ public sealed partial class VCarvePreparation
         builder.Append(options.IncludeInteriorFill).Append('|').Append(options.SmoothVCarving).Append('|');
         builder.Append(options.RampOutsideEdges).Append('|');
         builder.Append(options.AccessTarget?.Signature).Append('|');
+        int plateauLeafVertices=SmoothRoughingPlateau.CaptureConstantOffsetLeafVertices(options);
+        if(plateauLeafVertices!=SmoothRoughingPlateau.LegacyConstantOffsetLeafVertices)
+            builder.Append("plateau-constant-offset-leaf-vertices-v1:").Append(plateauLeafVertices).Append('|');
         foreach (var region in regions)
         {
             builder.Append("region|");

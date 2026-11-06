@@ -11,6 +11,7 @@ public sealed class VCarveCutterProfile
 
     public IReadOnlyList<CarvingCutterSection> Sections { get; }
     public double MaximumDepth { get; }
+    internal double RepresentedHeight { get; }
     public double TipRadius { get; }
     public bool RoundedTip { get; }
     internal double FirstCylinderHeight { get; } = double.PositiveInfinity;
@@ -41,7 +42,11 @@ public sealed class VCarveCutterProfile
         ArgumentNullException.ThrowIfNull(sections);
         var snapshot = sections.ToArray();
         _physical = new CarvingCutterProfile(snapshot, maximumDepth);
-        if (maximumDepth > snapshot.Sum(section => section.Height))
+        // Retain this exact selector-Sum result. Native envelope queries use
+        // the same immutable complete profile height, without re-enumerating
+        // the public read-only wrapper or reassociating its floating sum.
+        RepresentedHeight = snapshot.Sum(section => section.Height);
+        if (maximumDepth > RepresentedHeight)
             throw new ArgumentException("V-carving depth exceeds the represented cutting profile.", nameof(maximumDepth));
 
         double height = 0, previousRadius = snapshot[0].BottomRadius;
@@ -91,7 +96,7 @@ public sealed class VCarveCutterProfile
         if (clearance >= _physical.MaximumRadius) return MaximumDepth;
 
         double height = 0;
-        foreach (var section in Sections)
+        foreach (var section in _physical.Sections)
         {
             if (height >= MaximumDepth) break;
             double activeHeight = Math.Min(section.Height, MaximumDepth - height);

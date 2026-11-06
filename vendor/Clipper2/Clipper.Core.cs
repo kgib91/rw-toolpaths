@@ -14,7 +14,7 @@ using System.Runtime.CompilerServices;
 
 namespace Clipper2Lib
 {
-  public struct Point64
+  public struct Point64 : IEquatable<Point64>
   {
     public long X;
     public long Y;
@@ -151,11 +151,14 @@ namespace Clipper2Lib
     }
 
 #endif
+    public readonly bool Equals(Point64 other)
+    {
+      return this == other;
+    }
+
     public readonly override bool Equals(object? obj)
     {
-      if (obj != null && obj is Point64 p)
-        return this == p;
-      return false;
+      return obj is Point64 p && Equals(p);
     }
 
     public readonly override int GetHashCode()

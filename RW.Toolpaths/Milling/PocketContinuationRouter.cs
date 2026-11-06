@@ -834,7 +834,7 @@ internal static class PocketContinuationRouter
         }
         AppendTail(tail, cut.EndIndex, points, spans);
         return new TaggedToolpath(points, spans, tail.RegionIndex, tail.Category,
-            tail.DepthPassIndex, visit, detectCurves: tail.DetectCurves);
+            tail.DepthPassIndex, visit, detectCurves: tail.DetectCurves){PreserveSourceTraversal=tail.PreserveSourceTraversal};
     }
 
     private static bool RebuildRingTail(TaggedToolpath path, ToolpathSpan firstCut,
@@ -930,7 +930,7 @@ internal static class PocketContinuationRouter
 
     private static TaggedToolpath Copy(TaggedToolpath source, List<Point3D> points, List<ToolpathSpan> spans)
         => new(points, spans, source.RegionIndex, source.Category, source.DepthPassIndex,
-            source.VisitIdentity, detectCurves: source.DetectCurves);
+            source.VisitIdentity, detectCurves: source.DetectCurves){PreserveSourceTraversal=source.PreserveSourceTraversal};
     private static int NextCut(TaggedToolpath path, int span)
     {
         for (int index = span + 1; index < path.Spans.Count; index++)
@@ -1555,13 +1555,18 @@ internal static class PocketContinuationRouter
             CropWorkBudgetFallbacks, CropWorkBudgetPriorBuilds, CropWorkBudgetPriorSubmittedVertices,
             CropWorkBudgetRefusedVertices, CoverageTileSnaps, CoverageTileReuses,
             CoverageTileSmallDomainSkips, CoverageTileRepeatedQualifications, CoverageTileRangeRefusals,
-            CoverageTileSubmittedVertices, LocalTileCacheHits,LocalTileCacheMisses,LocalTileCacheEvictions,LocalTileCachePeakEstimatedBytes;
+            CoverageTileSubmittedVertices, LocalTileCacheHits,LocalTileCacheMisses,LocalTileCacheEvictions,LocalTileCachePeakEstimatedBytes,
+            AdditionalNegativeSearches,AdditionalNegativeSites,AdditionalNegativeQueries,AdditionalNegativeSeedQueries,AdditionalNegativeWitnessRefusals,
+            AdditionalNegativeIntervalsPruned,AdditionalNegativeLimitFallbacks,
+            WholeFallbackAccepted,WholeFallbackRefused,WholeFallbackAfterWitnessLimit,
+            WholeFallbackAfterWitnessLimitAccepted,WholeFallbackAfterWitnessLimitRefused;
+        internal int MaximumNegativeWitnessSites;
         internal double FollowingSweepMilliseconds, LocalConstructionMilliseconds, NegativeWitnessMilliseconds,
             WholeConstructionMilliseconds, SpatialCheckMilliseconds, CapsuleCheckMilliseconds,
             FollowingCacheLookupMilliseconds, ValidationConstructionMilliseconds, ValidationCapsuleMilliseconds,
             CapturedUnionMilliseconds, CropMilliseconds, LocalBufferMilliseconds, LocalIndexMilliseconds,
             WholeBufferMilliseconds, WholeIndexMilliseconds, ContourBoundsBuildMilliseconds, ContourBoundsQueryMilliseconds,
-            CoverageTileBoundsMilliseconds, CoverageTileTightArea, CoverageTileCropArea;
+            CoverageTileBoundsMilliseconds, CoverageTileTightArea, CoverageTileCropArea,AdditionalNegativeMilliseconds;
         // Detailed buffer/index/bounds counters are children of these owners.
         // Cache lookup already subtracts following sweep construction. Route
         // preparation and repair may subtract this sum to expose exclusive work.
@@ -1570,8 +1575,15 @@ internal static class PocketContinuationRouter
             + FollowingCacheLookupMilliseconds + ValidationConstructionMilliseconds + ValidationCapsuleMilliseconds
             + CapturedUnionMilliseconds + NegativeWitnessMilliseconds;
         internal string Describe() => $"localCoverageProofs={LocalProofs} wholeCoverageFallbacks={WholeFallbacks} "
+            + $"wholeCoverageFallbackAccepted={WholeFallbackAccepted} wholeCoverageFallbackRefused={WholeFallbackRefused} "
+            + $"wholeCoverageAfterWitnessLimit={WholeFallbackAfterWitnessLimit} wholeCoverageAfterWitnessLimitAccepted={WholeFallbackAfterWitnessLimitAccepted} wholeCoverageAfterWitnessLimitRefused={WholeFallbackAfterWitnessLimitRefused} "
             + $"undilatedCapsuleProofs={UndilatedProofs} "
             + $"uncoveredWitnesses={NegativeWitnesses} uncoveredWitnessQueries={NegativeQueries} uncoveredWitnessMs={NegativeWitnessMilliseconds:F1} "
+            + $"additionalWitnessSearches={AdditionalNegativeSearches} additionalWitnessSites={AdditionalNegativeSites} "
+            + $"additionalWitnessQueries={AdditionalNegativeQueries} additionalWitnessRefusals={AdditionalNegativeWitnessRefusals} "
+            + $"additionalWitnessCachedSeedQueries={AdditionalNegativeSeedQueries} "
+            + $"additionalWitnessIntervalsPruned={AdditionalNegativeIntervalsPruned} additionalWitnessLimitFallbacks={AdditionalNegativeLimitFallbacks} "
+            + $"additionalWitnessMs={AdditionalNegativeMilliseconds:F1} additionalWitnessTimingParent=uncoveredWitnessMs maximumWitnessSites={MaximumNegativeWitnessSites} "
             + $"coverageBatchNodeVisits={BatchNodeVisits} coverageBatchCandidates={BatchCandidates} "
             + $"coverageBatchIndexBuilds={BatchIndexBuilds} localCoverageIndexBuilds={LocalIndexBuilds} "
             + $"localCoverageInputVertices={LocalInputVertices} localCoverageOutputVertices={LocalOutputVertices} "
@@ -1904,6 +1916,8 @@ internal static class PocketContinuationRouter
         private readonly bool _useCoverageTiles;
         private readonly bool _useLocalTileCache;
         private readonly bool _referenceDilation;
+        private readonly int _maximumAdditionalWitnessSites;
+        private bool _lastAdditionalBudgetExhausted;
         private sealed record LocalTile(CoverageBounds Bounds,PolygonOps.BoundarySegmentIndex Index,
             IReadOnlyList<List<PointD>> Source,long EstimatedBytes);
         private readonly List<LocalTile> _localTiles=new(8);
@@ -1928,8 +1942,11 @@ internal static class PocketContinuationRouter
             CoverageDiagnostics? diagnostics = null, bool useIndexedCoverage = true,
             FollowingSweepCache? followingCache = null, bool validateIndexedCoverage = false,
             bool limitCropWork = true, PocketPostedStepdownStock.Proof? priorStepdown = null,
-            bool useCoverageTiles = true,bool useLocalTileCache=true,bool referenceDilation=false)
+            bool useCoverageTiles = true,bool useLocalTileCache=true,bool referenceDilation=false,
+            int maximumAdditionalWitnessSites=29)
         {
+            if(maximumAdditionalWitnessSites<0||maximumAdditionalWitnessSites>125)
+                throw new ArgumentOutOfRangeException(nameof(maximumAdditionalWitnessSites));
             _spatial = spatial;
             _token = token;
             _diagnostics = diagnostics ?? new CoverageDiagnostics();
@@ -1940,6 +1957,8 @@ internal static class PocketContinuationRouter
                 && Environment.GetEnvironmentVariable("RW_TOOLPATHS_CROP_TILE_REFERENCE") != "1";
             _useLocalTileCache=useLocalTileCache;
             _referenceDilation=referenceDilation;
+            _maximumAdditionalWitnessSites=maximumAdditionalWitnessSites;
+            _diagnostics.MaximumNegativeWitnessSites=Math.Max(_diagnostics.MaximumNegativeWitnessSites,3+maximumAdditionalWitnessSites);
             _priorStepdown = priorStepdown;
             _floorZ = floor;
             _floor = stock.PrepareAtFloor(floor);
@@ -1978,14 +1997,9 @@ internal static class PocketContinuationRouter
                 if (_validateIndexedCoverage) ValidateLocal(from, to, start, end, radius);
                 return true;
             }
-            if (_useIndexedCoverage && HasUncoveredWitness(from,to,start,end,radius))
+            if (_useIndexedCoverage && HasUncoveredWitness(from,to,start,end,radius,includeAdditional:false))
             {
-                if(_validateIndexedCoverage)
-                {
-                    _validationAllowed ??= BuildWhole(validation:true);
-                    if(Contains(_validationAllowed,start,end,radius))
-                        throw new InvalidOperationException("Uncovered-stock witness disagrees with the complete reference morphology.");
-                }
+                ValidateUncoveredWitness(start,end,radius);
                 return false;
             }
             // If C(r-e) is inside the complete captured fill S, then
@@ -1999,9 +2013,30 @@ internal static class PocketContinuationRouter
                 _undilatedAllowed??=new PolygonOps.BoundarySegmentIndex(PathUtils.ToClipper(CapturedAllowed()));
                 if(TryUndilated(from,to,start,end,radius))return true;
             }
+            // Extra negative nominations are useful only after the established
+            // positive proofs fail. Successful undilated capsules never pay for
+            // this optional search; uncertain results retain the whole proof.
+            if(_useIndexedCoverage&&_maximumAdditionalWitnessSites>0
+                &&HasUncoveredWitness(from,to,start,end,radius,includeAdditional:true))
+            {
+                ValidateUncoveredWitness(start,end,radius);
+                return false;
+            }
             _diagnostics.WholeFallbacks++;
             PrepareWhole();
-            return Contains(_wholeAllowed!, start, end, radius);
+            bool wholeResult=Contains(_wholeAllowed!,start,end,radius);
+            if(wholeResult)_diagnostics.WholeFallbackAccepted++;else _diagnostics.WholeFallbackRefused++;
+            if(_lastAdditionalBudgetExhausted)
+            {
+                _diagnostics.WholeFallbackAfterWitnessLimit++;
+                if(wholeResult)_diagnostics.WholeFallbackAfterWitnessLimitAccepted++;
+                else _diagnostics.WholeFallbackAfterWitnessLimitRefused++;
+            }
+            if(_diagnostics.WholeFallbacks<=8||_lastAdditionalBudgetExhausted&&_diagnostics.WholeFallbackAfterWitnessLimit<=8)
+                Console.WriteLine($"[PocketContinuation.WholeFallback] floor={_floorZ:R} prefixBatches={_floor.PrefixBatches} "
+                    +$"from={from} to={to} radius={radius:R} result={wholeResult} additionalWitnessBudgetExhausted={_lastAdditionalBudgetExhausted} "
+                    +$"maximumWitnessSites={3+_maximumAdditionalWitnessSites} authority=unchanged-complete-reference-morphology");
+            return wholeResult;
         }
 
         private bool TryUndilated(Point3D from,Point3D to,Point64 start,Point64 end,double radius)
@@ -2013,8 +2048,17 @@ internal static class PocketContinuationRouter
             return true;
         }
 
-        private bool HasUncoveredWitness(Point3D from,Point3D to,Point64 start,Point64 end,double radius)
+        private void ValidateUncoveredWitness(Point64 start,Point64 end,double radius)
         {
+            if(!_validateIndexedCoverage)return;
+            _validationAllowed??=BuildWhole(validation:true);
+            if(Contains(_validationAllowed,start,end,radius))
+                throw new InvalidOperationException("Uncovered-stock witness disagrees with the complete reference morphology.");
+        }
+
+        private bool HasUncoveredWitness(Point3D from,Point3D to,Point64 start,Point64 end,double radius,bool includeAdditional)
+        {
+            if(includeAdditional)_lastAdditionalBudgetExhausted=false;
             // This is negative evidence only. The crop retains the complete signed
             // S/F fill inside its guarded rectangle, including enclosing holes.
             // A capsule point farther outside that fill than the complete upper
@@ -2030,22 +2074,80 @@ internal static class PocketContinuationRouter
                 double dx=(end.X-start.X)/PathUtils.Scale,dy=(end.Y-start.Y)/PathUtils.Scale;
                 double length=Math.Sqrt(dx*dx+dy*dy),nx=length>0?-dy/length:1,ny=length>0?dx/length:0;
                 double upper=ConstructionError+CropOffsetReserve+PreparedRegionDistance.Uncertainty+2/PathUtils.Scale;
-                foreach(double t in new[]{.5,0,1})
-                foreach(var offset in new[]{new PointD(0,0),new PointD(nx*radius,ny*radius),new PointD(-nx*radius,-ny*radius),
-                    new PointD(radius,0),new PointD(-radius,0),new PointD(0,radius),new PointD(0,-radius)})
+                var offsets=new[]{new PointD(0,0),new PointD(nx*radius,ny*radius),new PointD(-nx*radius,-ny*radius),
+                    new PointD(radius,0),new PointD(-radius,0),new PointD(0,radius),new PointD(0,-radius)};
+                var parameters=new double[3+(includeAdditional?_maximumAdditionalWitnessSites:0)];
+                var distances=new double[parameters.Length,offsets.Length];
+                // Preserve the original three sites and their radial-query
+                // order before considering any extra refusal-only witnesses.
+                if(Sample(0,.5,false)||Sample(1,0,false)||Sample(2,1,false))return true;
+                if(!includeAdditional||_maximumAdditionalWitnessSites==0||length==0)return false;
+                long additionalStarted=Stopwatch.GetTimestamp();
+                _diagnostics.AdditionalNegativeSearches++;
+                try
                 {
-                    _token.ThrowIfCancellationRequested();
-                    var witness=new PointD(ax+t*dx+offset.x,ay+t*dy+offset.y);
-                    _diagnostics.NegativeQueries++;
-                    double distance=_localSourceDistance.SignedDistance(witness);
-                    if(distance>=-upper) continue;
-                    if(++_diagnostics.NegativeWitnesses<=8)
-                        Console.WriteLine($"[PocketContinuation.UncoveredWitness] floor={_floorZ:R} from={from} to={to} "
-                            + $"witness=({witness.x:R},{witness.y:R}) signedDistance={distance:R} referenceUpperDilation={upper:R} "
-                            + $"radius={radius:R} prefixBatches={_floor.PrefixBatches} authority=complete-guarded-source-crop decision=refuse-only");
-                    return true;
+                    var intervals=new List<(int Left,int Right)>{(1,0),(0,2)};
+                    int sites=3;
+                    while(intervals.Count>0&&sites<parameters.Length)
+                    {
+                        _token.ThrowIfCancellationRequested();
+                        int selected=-1;double worst=double.PositiveInfinity;
+                        for(int i=intervals.Count-1;i>=0;i--)
+                        {
+                            var interval=intervals[i];
+                            double reach=length*(parameters[interval.Right]-parameters[interval.Left])/2;
+                            double lower=double.PositiveInfinity;
+                            for(int radial=0;radial<offsets.Length;radial++)
+                                lower=Math.Min(lower,Math.Min(distances[interval.Left,radial],distances[interval.Right,radial])
+                                    -reach-2*PreparedRegionDistance.Uncertainty);
+                            // Signed distance is 1-Lipschitz along each fixed
+                            // radial trace. This only skips optional nominations;
+                            // it never certifies a capsule or changes fallback.
+                            if(lower>=-upper)
+                            {
+                                intervals.RemoveAt(i);if(selected>i)selected--;
+                                _diagnostics.AdditionalNegativeIntervalsPruned++;continue;
+                            }
+                            if(lower<=worst){worst=lower;selected=i;}
+                        }
+                        if(selected<0)break;
+                        var next=intervals[selected];intervals.RemoveAt(selected);
+                        double middle=(parameters[next.Left]+parameters[next.Right])/2;
+                        int site=sites++;
+                        _diagnostics.AdditionalNegativeSites++;
+                        if(Sample(site,middle,true))return true;
+                        intervals.Add((next.Left,site));intervals.Add((site,next.Right));
+                    }
+                    if(intervals.Count>0&&sites==parameters.Length)
+                    {_diagnostics.AdditionalNegativeLimitFallbacks++;_lastAdditionalBudgetExhausted=true;}
+                    return false;
                 }
-                return false;
+                finally{_diagnostics.AdditionalNegativeMilliseconds+=Stopwatch.GetElapsedTime(additionalStarted).TotalMilliseconds;}
+
+                bool Sample(int site,double t,bool additional)
+                {
+                    parameters[site]=t;
+                    for(int radial=0;radial<offsets.Length;radial++)
+                    {
+                        _token.ThrowIfCancellationRequested();
+                        var offset=offsets[radial];
+                        var witness=new PointD(ax+t*dx+offset.x,ay+t*dy+offset.y);
+                        _diagnostics.NegativeQueries++;
+                        if(additional)_diagnostics.AdditionalNegativeQueries++;
+                        else if(includeAdditional)_diagnostics.AdditionalNegativeSeedQueries++;
+                        double distance=_localSourceDistance.SignedDistance(witness);
+                        distances[site,radial]=distance;
+                        if(distance>=-upper)continue;
+                        if(additional)_diagnostics.AdditionalNegativeWitnessRefusals++;
+                        if(++_diagnostics.NegativeWitnesses<=8)
+                            Console.WriteLine($"[PocketContinuation.UncoveredWitness] floor={_floorZ:R} from={from} to={to} "
+                                +$"witness=({witness.x:R},{witness.y:R}) signedDistance={distance:R} referenceUpperDilation={upper:R} "
+                                +$"radius={radius:R} prefixBatches={_floor.PrefixBatches} parameter={t:R} additionalSite={additional} "
+                                +$"authority=complete-guarded-source-crop decision=refuse-only");
+                        return true;
+                    }
+                    return false;
+                }
             }
             finally {_diagnostics.NegativeWitnessMilliseconds+=Stopwatch.GetElapsedTime(started).TotalMilliseconds;}
         }

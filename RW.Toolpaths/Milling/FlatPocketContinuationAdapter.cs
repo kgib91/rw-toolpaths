@@ -15,11 +15,15 @@ internal sealed class FlatPocketContinuationAdapter
     private PocketContinuationRouter.TemporalClearance? proof;
     private IReadOnlyList<Point3D>? proofPath;
     private double proofFloor;
+    private readonly int maximumAdditionalWitnessSites;
     internal bool Supported { get; }
     internal FlatPocketContinuationAdapter(ToolGeometry tool, DepthSchedule depth, ILinkClearance clearance,
         CancellationToken token,IReadOnlyList<IReadOnlyList<Clipper2Lib.PointD>>? knownEmpty=null,
-        double knownEmptyFloor=double.PositiveInfinity)
+        double knownEmptyFloor=double.PositiveInfinity,int maximumAdditionalWitnessSites=29)
     {
+        if(maximumAdditionalWitnessSites<0||maximumAdditionalWitnessSites>125)
+            throw new ArgumentOutOfRangeException(nameof(maximumAdditionalWitnessSites));
+        this.maximumAdditionalWitnessSites=maximumAdditionalWitnessSites;
         this.tool = tool; this.depth = depth; this.clearance = clearance;
         this.token = token;
         Supported = PocketContinuationRouter.TryFlatCylinderRadius(tool,
@@ -38,7 +42,8 @@ internal sealed class FlatPocketContinuationAdapter
             var following = PocketContinuationRouter.BelowFloor(path.Points.Skip(first.StartIndex)
                 .Take(first.PointCount).ToArray(),b.Z);
             proof = new(clearance,stock,b.Z,following,tool.Radius,token,
-                diagnostics:coverageDiagnostics,followingCache:followingCache,priorStepdown:posted.Capture());
+                diagnostics:coverageDiagnostics,followingCache:followingCache,priorStepdown:posted.Capture(),
+                maximumAdditionalWitnessSites:maximumAdditionalWitnessSites);
             proofPath = path.Points; proofFloor = b.Z;
         }
         return proof.IsTravelSafe(a,b,tool.Radius);

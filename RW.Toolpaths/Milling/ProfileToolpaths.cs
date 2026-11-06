@@ -29,6 +29,10 @@ public sealed record TabOptions
 /// <summary>Configuration for contour/profile milling.</summary>
 public sealed record ProfileOptions
 {
+    /// <summary>Nominate optional line/arc/cubic moves from the retained points.
+    /// Hosts emitting the literal point/span source can omit this metadata.</summary>
+    public bool DetectCurves { get; init; } = true;
+
     /// <summary>Common machine rates, transfer plane and optional earlier-stock proof.
     /// Null retains geometric routing when machine context is unavailable.</summary>
     public MillingMotionSettings? Motion { get; init; }
@@ -660,7 +664,8 @@ public static class ProfileToolpaths
                     source.RegionIndex,
                     source.Category,
                     source.DepthPassIndex,
-                    source.VisitIdentity));
+                    source.VisitIdentity,detectCurves:source.DetectCurves)
+                    {PreserveSourceTraversal=source.PreserveSourceTraversal});
             }
 
             points.Clear();

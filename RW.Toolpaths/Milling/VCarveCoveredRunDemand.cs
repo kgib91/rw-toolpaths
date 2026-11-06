@@ -8,13 +8,38 @@ namespace RW.Toolpaths.Milling;
 /// against the final keepers to prevent compounded allowances. No travel credit.</summary>
 internal static class VCarveCoveredRunDemand
 {
+    internal readonly record struct AuditChord(Point3D NativeA,Point3D NativeB,Point3D PostedA,Point3D PostedB);
+    private static bool Vertical(Point3D a,Point3D b)=>ToolpathCommandRounding.IsVerticalOnly(
+        (float)b.X-(float)a.X,(float)b.Z-(float)a.Z,(float)b.Y-(float)a.Y);
+    // Both the final literal inventory and ORIGINAL target audit use this same
+    // cursor reconstruction. A vertical command retains its current XY words;
+    // the first pose belongs to this exact source visit, not a preceding path.
+    internal static IEnumerable<AuditChord> ReconstructForAudit(TaggedToolpath path,double surface,double materialSurface)
+    {
+        double postedTop=(float)materialSurface-(float)surface;
+        Point3D N(Point3D p)=>new((float)p.X,(float)p.Y,(float)p.Z-(float)materialSurface);
+        Point3D Q(Point3D p)=>new(ToolpathCommandRounding.Round((float)p.X),ToolpathCommandRounding.Round((float)p.Y),
+            ToolpathCommandRounding.Round((float)p.Z-(float)surface)-postedTop);
+        var n=N(path.Points[0]);var q=Q(path.Points[0]);
+        for(int i=1;i<path.Points.Count;i++)
+        {
+            var a=path.Points[i-1];var b=path.Points[i];var nn=N(b);var qq=Q(b);
+            if(Vertical(a,b)){nn=new(n.X,n.Y,nn.Z);qq=new(q.X,q.Y,qq.Z);}
+            yield return new(n,nn,q,qq);n=nn;q=qq;
+        }
+    }
     internal static TaggedToolpath[] Apply(IReadOnlyList<TaggedToolpath> source,
         IReadOnlyList<TaggedToolpath> otherRequired,IReadOnlyList<TaggedToolpath> originalRings,
         VCarveCutterProfile profile,DepthSchedule depth,VCarveOptions options,
-        CancellationToken token,Action<string>? log)
+        CancellationToken token,Action<string>? log,bool reuseFinalLiteralChords=true)
     {
         long begun=Stopwatch.GetTimestamp();token.ThrowIfCancellationRequested();
-        TaggedToolpath[] Retain(string reason){log?.Invoke($"stage=ring-covered-run-demand accepted=False reason={reason} originalSourceRetained=True noTravelPermission=True");return source.ToArray();}
+        long phaseStarted=begun,verified=0,nativeLiteralHits=0,postedLiteralHits=0,nativeFullProofs=0,postedFullProofs=0,bothLiteral=0;
+        string phase="validation";double nominationMs=0,finalStockBuildMs=0,finalAuditMs=0;
+        TaggedToolpath[] Retain(string reason){log?.Invoke($"stage=ring-covered-run-demand accepted=False reason={reason} originalSourceRetained=True noTravelPermission=True "
+            +$"phase={phase} phaseElapsedMs={Stopwatch.GetElapsedTime(phaseStarted).TotalMilliseconds:F3} nominationMs={nominationMs:F3} finalStockBuildMs={finalStockBuildMs:F3} "
+            +$"originalTargetIntervalsVerified={verified} finalNativeLiteralHits={nativeLiteralHits} finalPostedLiteralHits={postedLiteralHits} "
+            +$"finalNativeFullProofs={nativeFullProofs} finalPostedFullProofs={postedFullProofs} literalFinalAuditEnabled={reuseFinalLiteralChords}");return source.ToArray();}
         if(source.Count==0)return source.ToArray();
         if(originalRings.Count==0)return Retain("missing-original-targets");
         if(depth.DepthPerPass>0&&depth.DepthPerPass<depth.Depth-1e-9
@@ -39,11 +64,11 @@ internal static class VCarveCoveredRunDemand
         Point3D Q(Point3D p)=>new(ToolpathCommandRounding.Round((float)p.X),ToolpathCommandRounding.Round((float)p.Y),
             ToolpathCommandRounding.Round((float)p.Z-(float)depth.SurfaceZ)-postedTop);
         bool Budget()=>Stopwatch.GetElapsedTime(begun).TotalSeconds<=30;
-        var native=new CutterSweepStock(profile,p=>p,materialSurface,token,mergeIncrementally:true);
-        var posted=new CutterSweepStock(profile,p=>p,materialSurface,token,mergeIncrementally:true);
+        phase="nomination";phaseStarted=Stopwatch.GetTimestamp();
+        var native=new CutterSweepStock(profile,p=>p,materialSurface,token,mergeIncrementally:true,radialMarginMemoEntries:4096);
+        var posted=new CutterSweepStock(profile,p=>p,materialSurface,token,mergeIncrementally:true,radialMarginMemoEntries:4096);
         var literalN=new HashSet<(Point3D,Point3D)>();var literalQ=new HashSet<(Point3D,Point3D)>();
         static bool Has(HashSet<(Point3D,Point3D)> set,Point3D a,Point3D b)=>set.Contains((a,b))||set.Contains((b,a));
-        bool Vertical(Point3D a,Point3D b)=>ToolpathCommandRounding.IsVerticalOnly((float)b.X-(float)a.X,(float)b.Z-(float)a.Z,(float)b.Y-(float)a.Y);
         void Record(Point3D a,Point3D b){
             var na=N(a);var nb=N(b);var qa=Q(a);var qb=Q(b);
             native.RecordExecuted(na,nb);posted.RecordExecuted(qa,qb);literalN.Add((na,nb));literalQ.Add((qa,qb));
@@ -96,29 +121,59 @@ internal static class VCarveCoveredRunDemand
                 omittedLength+=Length(p)-pieces.Sum(Length);isolatedSaving+=before-after;}
             for(int i=0;i<keep.Length;i++)if(keep[i]&&covered[i])Record(p[i],p[i+1]);
         }
+        nominationMs=Stopwatch.GetElapsedTime(phaseStarted).TotalMilliseconds;
+        log?.Invoke($"stage=ring-covered-run-radial-memo calls={native.RadialMarginCalls+posted.RadialMarginCalls} hits={native.RadialMarginMemoHits+posted.RadialMarginMemoHits} "
+            +$"misses={native.RadialMarginMemoMisses+posted.RadialMarginMemoMisses} evictions={native.RadialMarginMemoEvictions+posted.RadialMarginMemoEvictions} "
+            +$"entries={native.RadialMarginMemoEntries+posted.RadialMarginMemoEntries} maximumEntriesPerOwner=4096 exactIeeeArguments=True literalProfileMinimum=True stockEvidenceCached=False");
         if(changedSources==0)return Retain("no-cost-improvement");
         var result=selected.SelectMany(p=>p).ToArray();
         if(result.Length>source.Count+512)return Retain("fragment-growth-budget");
         // NEW proof stock from FINAL keepers only. Earlier omitted short/empty
         // targets are checked directly, not through an intermediate allowance.
+        phase="final-stock-build";phaseStarted=Stopwatch.GetTimestamp();
+        // Nomination donors may have disappeared. Reuse storage, never their
+        // evidence: only the FINAL keepers can supply exact literal identity.
+        literalN.Clear();literalQ.Clear();
         var finalN=new CutterSweepStock(profile,p=>p,materialSurface,token);var finalQ=new CutterSweepStock(profile,p=>p,materialSurface,token);
-        foreach(var path in result.Concat(otherRequired))for(int i=1;i<path.Points.Count;i++){
-            finalN.RecordExecuted(N(path.Points[i-1]),N(path.Points[i]));finalQ.RecordExecuted(Q(path.Points[i-1]),Q(path.Points[i]));}
-        finalN.Seal();finalQ.Seal();long verified=0;
-        foreach(var path in originalRings.Concat(otherRequired)){
-            var n=N(path.Points[0]);var q=Q(path.Points[0]);
+        long literalRecorded=0;
+        foreach(var path in result.Concat(otherRequired))
+        {
+            // The original stock construction remains unchanged for every
+            // unmatched full query. Exact identity uses actual modal chords.
             for(int i=1;i<path.Points.Count;i++){
-                if((verified++&255)==0){token.ThrowIfCancellationRequested();if(!Budget())return Retain("time-budget");}
-                var a=path.Points[i-1];var b=path.Points[i];var nn=N(b);var qq=Q(b);
-                if(Vertical(a,b)){nn=new(n.X,n.Y,nn.Z);qq=new(q.X,q.Y,qq.Z);}
-                if(!finalN.Contains(n,nn,allowance,-allowance)||!finalQ.Contains(q,qq,allowance,-allowance))return Retain("original-target-coverage-refused");
-                n=nn;q=qq;
+                finalN.RecordExecuted(N(path.Points[i-1]),N(path.Points[i]));finalQ.RecordExecuted(Q(path.Points[i-1]),Q(path.Points[i]));}
+            if(reuseFinalLiteralChords)
+            foreach(var chord in ReconstructForAudit(path,depth.SurfaceZ,materialSurface))
+            {
+                if((literalRecorded++&255)==0)token.ThrowIfCancellationRequested();
+                static bool Finite(Point3D p)=>double.IsFinite(p.X)&&double.IsFinite(p.Y)&&double.IsFinite(p.Z);
+                if(Finite(chord.NativeA)&&Finite(chord.NativeB))literalN.Add((chord.NativeA,chord.NativeB));
+                if(Finite(chord.PostedA)&&Finite(chord.PostedB))literalQ.Add((chord.PostedA,chord.PostedB));
             }
         }
+        finalN.Seal();finalQ.Seal();finalStockBuildMs=Stopwatch.GetElapsedTime(phaseStarted).TotalMilliseconds;
+        phase="final-target-audit";phaseStarted=Stopwatch.GetTimestamp();
+        foreach(var path in originalRings.Concat(otherRequired)){
+            foreach(var chord in ReconstructForAudit(path,depth.SurfaceZ,materialSurface)){
+                if((verified++&255)==0){token.ThrowIfCancellationRequested();if(!Budget())return Retain("time-budget");}
+                bool exactN=reuseFinalLiteralChords&&Has(literalN,chord.NativeA,chord.NativeB);
+                if(exactN)nativeLiteralHits++;
+                else{nativeFullProofs++;if(!finalN.Contains(chord.NativeA,chord.NativeB,allowance,-allowance))return Retain("original-target-coverage-refused");}
+                bool exactQ=reuseFinalLiteralChords&&Has(literalQ,chord.PostedA,chord.PostedB);
+                if(exactQ)postedLiteralHits++;
+                else{postedFullProofs++;if(!finalQ.Contains(chord.PostedA,chord.PostedB,allowance,-allowance))return Retain("original-target-coverage-refused");}
+                if(exactN&&exactQ)bothLiteral++;
+            }
+        }
+        finalAuditMs=Stopwatch.GetElapsedTime(phaseStarted).TotalMilliseconds;
         log?.Invoke($"stage=ring-covered-run-demand accepted=True sourcePaths={source.Count} retainedFragments={result.Length} changedSources={changedSources} wholePathsRemoved={removedPaths} "
             +$"coveredRunNominations={runCandidates} omittedLengthMm={omittedLength:R} isolatedSafeEntrySavingSeconds={isolatedSaving:R} originalTargetIntervalsVerified={verified} "
             +$"finishToleranceMm={options.PathToleranceMm:R} nominalAndActualF3=True permanentRetainedDonors=True compoundedAllowance=False singleDepthPassOnly=True "
             +$"nominationAxialAndRadialAllowanceMm={nominationAllowance:R} donorOutputChordReserveMm={options.OutputChordToleranceMm:R} "
+            +$"nominationMs={nominationMs:F3} finalStockBuildMs={finalStockBuildMs:F3} finalTargetAuditMs={finalAuditMs:F3} "
+            +$"finalNativeLiteralHits={nativeLiteralHits} finalPostedLiteralHits={postedLiteralHits} finalBothLiteralIntervals={bothLiteral} "
+            +$"finalNativeFullProofs={nativeFullProofs} finalPostedFullProofs={postedFullProofs} finalNativeLiteralChords={literalN.Count} finalPostedLiteralChords={literalQ.Count} "
+            +$"literalFinalAuditEnabled={reuseFinalLiteralChords} literalAuthority=identical-final-modal-physical-sweep immutableOriginalTarget=True "
             +$"originalConcentricAncestryPreserved=True fragmentOwnersIndependent=True noTravelPermission=True elapsedMs={Stopwatch.GetElapsedTime(begun).TotalMilliseconds:F1}");
         return result;
     }

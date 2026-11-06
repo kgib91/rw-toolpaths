@@ -24,11 +24,24 @@ internal sealed class ToolpathMotionCost
     private readonly MillingMotionSettings settings;
     private readonly float top;
     private readonly MillingFeedPolicy limits;
+    private readonly record struct ChordKey(int AX,int AY,int AZ,int BX,int BY,int BZ);
+    private readonly record struct ChordGeometry(double Distance,double Limit,bool Travel);
+    private const int MaximumChordGeometryEntries=131072;
+    private readonly int chordGeometryCacheLimit;
+    private readonly Dictionary<ChordKey,ChordGeometry> chordGeometry=new();
+    private readonly Queue<ChordKey> chordGeometryOrder=new();
+    internal long ChordGeometryHits{get;private set;}
+    internal long ChordGeometryMisses{get;private set;}
+    internal long ChordGeometryEvictions{get;private set;}
+    internal int ChordGeometryEntries=>chordGeometry.Count;
     internal bool LocalTransferEstimatesEnabled { get; set; }
     private long localEstimateAttempts,localEstimateAccepted,localEstimateRefused,globalTransferPrices;
     private double sampledAlternativePriceDifference;
-    internal ToolpathMotionCost(MillingMotionSettings settings, double surface)
+    internal ToolpathMotionCost(MillingMotionSettings settings, double surface,int chordGeometryCacheLimit=0)
     {
+        if(chordGeometryCacheLimit<0||chordGeometryCacheLimit>MaximumChordGeometryEntries)
+            throw new ArgumentOutOfRangeException(nameof(chordGeometryCacheLimit));
+        this.chordGeometryCacheLimit=chordGeometryCacheLimit;
         double stockTop = double.IsFinite(settings.MaterialSurfaceZ) ? settings.MaterialSurfaceZ : surface;
         if (!double.IsFinite(settings.SafeZ) || settings.SafeZ < stockTop)
             throw new ArgumentOutOfRangeException(nameof(settings), "The transfer plane must be at or above the material surface.");
@@ -119,6 +132,8 @@ internal sealed class ToolpathMotionCost
         +$"enabled={AirTransferEstimateOverride.Value!=false} ownRegionEnabled={LocalTransferEstimatesEnabled} knownBoardContext={settings.AirTransferContext is not null} "
         +$"localAttempts={localEstimateAttempts} localAccepted={localEstimateAccepted} localRefused={localEstimateRefused} globalPrices={globalTransferPrices} "
         +$"sampledAlternativePriceDifferenceSec={sampledAlternativePriceDifference:R} "
+        +$"chordGeometryHits={ChordGeometryHits} chordGeometryMisses={ChordGeometryMisses} chordGeometryEvictions={ChordGeometryEvictions} chordGeometryEntries={ChordGeometryEntries} "
+        +"memoScope=exact-float-endpoints-and-this-cost-owner modalFeedReplayed=True originalSummationOrder=True "
         +"sampledDifferenceIsNotRouteSaving=True origin=rounded-native-estimate actualModalAuthority=False initialAndCrossRegionGlobal=True "
         +"belowPlaneApproachRetained=True sourceMotionAndFeedsUnchanged=True finalEmitterProofRequired=True");
 
@@ -140,19 +155,63 @@ internal sealed class ToolpathMotionCost
 
     private double Chord(Point3D a, Point3D b, ToolpathSpanKind kind, MillingFeedPolicy? feed)
     {
+        // One-shot pricing owners keep the original arithmetic path and do not
+        // pay key construction, lookup or FIFO costs. Ring routing opts in.
+        if(chordGeometryCacheLimit==0)return LiteralChord(a,b,kind,feed);
         float ax = (float)a.X, ay = (float)a.Y, az = (float)a.Z;
         float bx = (float)b.X, by = (float)b.Y, bz = (float)b.Z;
+        var key=new ChordKey(BitConverter.SingleToInt32Bits(ax),BitConverter.SingleToInt32Bits(ay),BitConverter.SingleToInt32Bits(az),
+            BitConverter.SingleToInt32Bits(bx),BitConverter.SingleToInt32Bits(by),BitConverter.SingleToInt32Bits(bz));
+        ChordGeometry geometry;
+        // Candidate visits repeatedly contain the same immutable ring body.
+        // Cache only its scalar geometry, never a modal feed or a visit total:
+        // the preceding chord can change the one-mm/min feed hold decision.
+        if(chordGeometryCacheLimit>0&&chordGeometry.TryGetValue(key,out geometry))ChordGeometryHits++;
+        else
+        {
+            ChordGeometryMisses++;
+            geometry=PrepareChord(ax,ay,az,bx,by,bz);
+            if(chordGeometryCacheLimit>0)
+            {
+                if(chordGeometry.Count>=chordGeometryCacheLimit)
+                {chordGeometry.Remove(chordGeometryOrder.Dequeue());ChordGeometryEvictions++;}
+                chordGeometry.Add(key,geometry);chordGeometryOrder.Enqueue(key);
+            }
+        }
+        double cutting=feed?.Command(geometry.Limit,kind==ToolpathSpanKind.ClearedTravel)??Math.Floor(geometry.Limit);
+        double rate=kind==ToolpathSpanKind.ClearedTravel?Math.Max(settings.FeedRate,settings.TravelRate)
+            :kind!=ToolpathSpanKind.TabLift&&geometry.Travel?settings.TravelRate:cutting;
+        return geometry.Distance*60/rate;
+    }
+
+    private double LiteralChord(Point3D a,Point3D b,ToolpathSpanKind kind,MillingFeedPolicy? feed)
+    {
+        float ax=(float)a.X,ay=(float)a.Y,az=(float)a.Z;
+        float bx=(float)b.X,by=(float)b.Y,bz=(float)b.Z;
+        double dx=bx-ax,dy=by-ay,dz=bz-az;
+        double distance=Math.Sqrt(Math.Pow((double)bx-ax,2)+Math.Pow((double)by-ay,2)+Math.Pow((double)bz-az,2));
+        bool vertical=ToolpathCommandRounding.IsVerticalOnly((float)dx,(float)dz,(float)dy);
+        static double Q(float value)=>ToolpathCommandRounding.Round(value);
+        double limit=Math.Min(limits.Limit(dx,dz,dy),limits.Limit(
+            vertical?0:Q(bx)-Q(ax),Q(bz-top)-Q(az-top),vertical?0:Q(by)-Q(ay)));
+        double cutting=feed?.Command(limit,kind==ToolpathSpanKind.ClearedTravel)??Math.Floor(limit);
+        double rate=kind==ToolpathSpanKind.ClearedTravel?Math.Max(settings.FeedRate,settings.TravelRate)
+            :kind!=ToolpathSpanKind.TabLift&&(vertical&&(dz>0||bz>=top)
+                ||!vertical&&Math.Sqrt(dx*dx+dy*dy)>.001&&Math.Min(az,bz)>=top)
+                ?settings.TravelRate:cutting;
+        return distance*60/rate;
+    }
+
+    private ChordGeometry PrepareChord(float ax,float ay,float az,float bx,float by,float bz)
+    {
         double dx = bx - ax, dy = by - ay, dz = bz - az;
         double distance = Math.Sqrt(Math.Pow((double)bx - ax, 2) + Math.Pow((double)by - ay, 2) + Math.Pow((double)bz - az, 2));
         bool vertical = ToolpathCommandRounding.IsVerticalOnly((float)dx, (float)dz, (float)dy);
         static double Q(float v) => ToolpathCommandRounding.Round(v);
         double limit = Math.Min(limits.Limit(dx, dz, dy), limits.Limit(
             vertical ? 0 : Q(bx) - Q(ax), Q(bz - top) - Q(az - top), vertical ? 0 : Q(by) - Q(ay)));
-        double cutting = feed?.Command(limit, kind == ToolpathSpanKind.ClearedTravel) ?? Math.Floor(limit);
-        double rate = kind == ToolpathSpanKind.ClearedTravel ? Math.Max(settings.FeedRate, settings.TravelRate)
-            : kind != ToolpathSpanKind.TabLift && (vertical && (dz > 0 || bz >= top)
-                || !vertical && Math.Sqrt(dx * dx + dy * dy) > .001 && Math.Min(az, bz) >= top)
-                ? settings.TravelRate : cutting;
-        return distance * 60 / rate;
+        bool travel = vertical && (dz > 0 || bz >= top)
+                || !vertical && Math.Sqrt(dx * dx + dy * dy) > .001 && Math.Min(az, bz) >= top;
+        return new(distance,limit,travel);
     }
 }

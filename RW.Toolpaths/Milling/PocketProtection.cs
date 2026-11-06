@@ -109,7 +109,8 @@ internal static class PocketProtection
     }
 
     internal static IReadOnlyList<MillingRegion> Subtract(IReadOnlyList<MillingRegion> regions,
-        PocketOptions options, CancellationToken cancellationToken, bool physicalConcentric = false)
+        PocketOptions options, CancellationToken cancellationToken, bool physicalConcentric = false,
+        bool preparedScanlineDifference = false)
     {
         if (options.ProtectedBoundary is not { Count: > 0 } protection) return regions;
         cancellationToken.ThrowIfCancellationRequested();
@@ -140,6 +141,7 @@ internal static class PocketProtection
             + Math.Max(0, options.Tolerances.SimplifyTolerance);
         const double maskSimplification = .001;
         const double maskArcError = .001;
+        long maskStarted=Stopwatch.GetTimestamp();
         double reserve = CommandReserve + geometryReserve + Math.Max(0, -options.StockToLeave)
             + maskSimplification + maskArcError;
         // This mask is an exclusion, not an emitted cutter-centre contour. Its
@@ -153,7 +155,18 @@ internal static class PocketProtection
         var expandedPaths = new Paths64();
         offsetter.Execute(reserve * PathUtils.Scale, expandedPaths);
         var expanded = PathUtils.FromClipper(expandedPaths);
-        var retained = SubtractDomain(regions, expanded, cancellationToken);
+        double maskMilliseconds=Stopwatch.GetElapsedTime(maskStarted).TotalMilliseconds;
+        long differenceStarted=Stopwatch.GetTimestamp();
+        // Same mask, conversion, NonZero arithmetic and literal PolyTree
+        // collection. Only repeated immutable clip input preparation is shared.
+        var retained = preparedScanlineDifference
+            ?SubtractPreparedDomain(regions,expanded,cancellationToken,"scanline")
+            :SubtractDomain(regions, expanded, cancellationToken);
+        double differenceMilliseconds=Stopwatch.GetElapsedTime(differenceStarted).TotalMilliseconds;
+        Console.WriteLine($"[Pocket.Protection] stage=scanline-mask-work preparedDifference={preparedScanlineDifference} "
+            +$"maskPreparationMs={maskMilliseconds:F3} componentDifferenceMs={differenceMilliseconds:F3} "
+            +$"expandedContours={expanded.Count} expandedVertices={expanded.Sum(p=>(long)p.Count)} "
+            +"maskRecipe=original-simplification-and-offset originalRegionOrder=True literalPolyTreeOrder=True");
         Console.WriteLine($"[Pocket.Protection] stage=source-subtraction originalRegions={regions.Count} "
             + $"retainedRegions={retained.Count} protectedContours={protection.Count} "
             + $"protectedArea={Math.Abs(Clipper.Area(new PathsD(protection.Select(ring => new PathD(ring))))):R} "
@@ -179,7 +192,7 @@ internal static class PocketProtection
     }
 
     private static IReadOnlyList<MillingRegion> SubtractPreparedDomain(IReadOnlyList<MillingRegion> regions,
-        IReadOnlyList<List<PointD>> expanded, CancellationToken cancellationToken)
+        IReadOnlyList<List<PointD>> expanded, CancellationToken cancellationToken,string consumer="concentric")
     {
         long started = Stopwatch.GetTimestamp();
         long allocated = GC.GetAllocatedBytesForCurrentThread();
@@ -225,7 +238,7 @@ internal static class PocketProtection
         finally
         {
             static double Milliseconds(long ticks) => ticks * 1000d / Stopwatch.Frequency;
-            Console.WriteLine($"[Pocket.Protection] stage=prepared-components completed={completed} "
+            Console.WriteLine($"[Pocket.Protection] stage=prepared-components completed={completed} consumer={consumer} "
                 + $"originalRegions={regions.Count} retainedRegions={retainedCount} "
                 + $"sourceContours={sourceContours} sourceVertices={sourceVertices} "
                 + $"maskContours={prepared?.OriginalContours ?? 0} maskVertices={prepared?.OriginalVertices ?? 0} "
@@ -250,28 +263,87 @@ internal static class PocketProtection
     }
 
     internal static void Verify(IReadOnlyList<TaggedToolpath> paths, double radius, double surfaceZ,
-        IReadOnlyList<IReadOnlyList<PointD>>? protection, CancellationToken cancellationToken)
+        IReadOnlyList<IReadOnlyList<PointD>>? protection, CancellationToken cancellationToken,
+        bool batchWholeFootprints = true)
     {
         if (protection is not { Count: > 0 }) return;
         var proof = new PreparedSweepExclusion(protection);
-        int chords = 0;
+        int chords = 0, blockProofs = 0, blockAccepted = 0, individuallyProved = 0;
+        long started = Stopwatch.GetTimestamp();
         for (int pathIndex = 0; pathIndex < paths.Count; pathIndex++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var path = paths[pathIndex];
-            for (int index = 1; index < path.Points.Count; index++)
+            for (int first = 1; first < path.Points.Count;)
             {
-                var a = path.Points[index - 1];
-                var b = path.Points[index];
-                if (Math.Min(a.Z, b.Z) >= surfaceZ) continue;
-                chords++;
-                if (proof.IsClear(new PointD(a.X, a.Y), new PointD(b.X, b.Y), radius)) continue;
-                string evidence = $"path={pathIndex} chord={index - 1} radius={radius:R} "
-                    + $"from=({a.X:R},{a.Y:R},{a.Z:R}) to=({b.X:R},{b.Y:R},{b.Z:R})";
-                Console.WriteLine($"[Pocket.Protection] stage=emitted-footprint result=rejected {evidence}");
-                throw new InvalidOperationException("Roughing cutter footprint intersects protected smooth V-carving material: " + evidence);
+                cancellationToken.ThrowIfCancellationRequested();
+                int last = Math.Min(path.Points.Count - 1, first + 31);
+                bool covered = false;
+                if (batchWholeFootprints && last > first
+                    && TryEnclosingCapsule(path.Points, first - 1, last, radius, out double enclosingRadius))
+                {
+                    blockProofs++;
+                    var a = path.Points[first - 1]; var b = path.Points[last];
+                    covered = proof.IsClear(new(a.X, a.Y), new(b.X, b.Y), enclosingRadius);
+                    if (covered) blockAccepted++;
+                }
+                for (int index = first; index <= last; index++)
+                {
+                    var a = path.Points[index - 1]; var b = path.Points[index];
+                    if (Math.Min(a.Z, b.Z) >= surfaceZ) continue;
+                    chords++;
+                    if (covered) continue;
+                    individuallyProved++;
+                    if (proof.IsClear(new PointD(a.X, a.Y), new PointD(b.X, b.Y), radius)) continue;
+                    string evidence = $"path={pathIndex} chord={index - 1} radius={radius:R} "
+                        + $"from=({a.X:R},{a.Y:R},{a.Z:R}) to=({b.X:R},{b.Y:R},{b.Z:R})";
+                    Console.WriteLine($"[Pocket.Protection] stage=emitted-footprint result=rejected {evidence}");
+                    throw new InvalidOperationException("Roughing cutter footprint intersects protected smooth V-carving material: " + evidence);
+                }
+                first = last + 1;
             }
         }
-        Console.WriteLine($"[Pocket.Protection] stage=emitted-footprint result=verified chords={chords} radius={radius:R}");
+        Console.WriteLine($"[Pocket.Protection] stage=emitted-footprint result=verified chords={chords} radius={radius:R} "
+            + $"blockProofs={blockProofs} acceptedBlocks={blockAccepted} individualProofs={individuallyProved} "
+            + $"batchWholeFootprints={batchWholeFootprints} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F3} "
+            + "authority=whole-enclosing-capsule uncertaintyFallback=original-per-chord");
+    }
+
+    // Every quantized source vertex lies within this larger capsule. Convexity
+    // includes every intervening chord, and adding the cutter disk includes all
+    // original cutter footprints. A refused enclosure retains every old query.
+    private static bool TryEnclosingCapsule(IReadOnlyList<Point3D> points, int first, int last,
+        double radius, out double enclosingRadius)
+    {
+        enclosingRadius = 0;
+        if (!double.IsFinite(radius) || radius < 0 || radius > 1000) return false;
+        Point64 Quantize(Point3D p) => new((long)Math.Round(p.X * PathUtils.Scale), (long)Math.Round(p.Y * PathUtils.Scale));
+        for (int i = first; i <= last; i++)
+            if (!double.IsFinite(points[i].X) || !double.IsFinite(points[i].Y)
+                || Math.Abs(points[i].X) > 10_000 || Math.Abs(points[i].Y) > 10_000) return false;
+        var a = Quantize(points[first]); var b = Quantize(points[last]);
+        long dx = b.X - a.X, dy = b.Y - a.Y;
+        Int128 lengthSquared = (Int128)dx * dx + (Int128)dy * dy;
+        double maximum = 0;
+        for (int i = first + 1; i < last; i++)
+        {
+            var p = Quantize(points[i]); long x = p.X - a.X, y = p.Y - a.Y;
+            Int128 dot = (Int128)x * dx + (Int128)y * dy;
+            double distance;
+            if (lengthSquared == 0 || dot <= 0)
+                distance = Math.Sqrt((double)((Int128)x * x + (Int128)y * y));
+            else if (dot >= lengthSquared)
+            {
+                x = p.X - b.X; y = p.Y - b.Y;
+                distance = Math.Sqrt((double)((Int128)x * x + (Int128)y * y));
+            }
+            else distance = Math.Abs((double)((Int128)x * dy - (Int128)y * dx)) / Math.Sqrt((double)lengthSquared);
+            maximum = Math.Max(maximum, distance);
+        }
+        // In this bounded integer domain the conversions/division/sqrt errors
+        // are below one tick. Four additional ticks also dominate radius
+        // addition roundoff; IsClear retains its original four-tick reserve.
+        enclosingRadius = Math.BitIncrement(radius + (maximum + 4) / PathUtils.Scale);
+        return double.IsFinite(enclosingRadius);
     }
 }

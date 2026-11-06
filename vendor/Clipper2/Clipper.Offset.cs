@@ -74,6 +74,11 @@ namespace Clipper2Lib
     private readonly PathD _normals = new PathD();
     private Paths64 _solution = new Paths64();
     private PolyTree64? _solutionTree;
+    // Capacity only; literal controls use reflection without adding a public
+    // geometry setting. No rounding, point or callback decision depends on it.
+    private bool _roundCapacityHints = true;
+    private const int MaximumRoundCapacityHint = 1_000_000;
+    private int _roundCapacityHintResizes;
 
     private double _groupDelta; //*0.5 for open paths; *-1.0 for negative areas
     private double _delta;
@@ -497,6 +502,7 @@ namespace Clipper2Lib
       pathOut.Add(new Point64(pt.X + offsetVec.x, pt.Y + offsetVec.y));
 #endif
       int steps = (int) Math.Ceiling(_stepsPerRad * Math.Abs(angle));
+      ReserveRoundCapacity(Math.Max(1, steps));
       for (int i = 1; i < steps; i++) // ie 1 less than steps
       {
         offsetVec = new PointD(offsetVec.x * _stepCos - _stepSin * offsetVec.y,
@@ -508,6 +514,20 @@ namespace Clipper2Lib
 #endif
       }
       pathOut.Add(GetPerpendic(pt, _normals[j]));
+    }
+
+    private void ReserveRoundCapacity(int remaining)
+    {
+      if (!_roundCapacityHints) return;
+      // The first round point was already added. The unchanged loop plus its
+      // final perpendicular point emits exactly max(1,steps) more points.
+      // Reserve geometrically once, rather than growing inside that loop.
+      long required = (long)pathOut.Count + remaining;
+      if (remaining < 1 || required > MaximumRoundCapacityHint || required <= pathOut.Capacity) return;
+      long capacity = Math.Max(required, Math.Max(4L, (long)pathOut.Capacity * 2));
+      if (capacity > MaximumRoundCapacityHint) capacity = MaximumRoundCapacityHint;
+      pathOut.Capacity = (int)capacity;
+      _roundCapacityHintResizes++;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

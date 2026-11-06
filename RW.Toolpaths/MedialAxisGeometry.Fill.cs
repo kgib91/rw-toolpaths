@@ -53,17 +53,20 @@ public static partial class MedialAxisGeometry
         // candidate distance is capped before testing for a vanished child.
         // A surviving child at that cap never requests a terminal interior path.
         bool retainCollapses = preserveTerminalPaths && options.OffsetSign < 0 && sweepRadius > 0;
-        var sourceGraphs = new Dictionary<int, PreparedTerminalMedial>();
+        // Exactly one collector worker owns each source and its mutable query
+        // history. The exact-first pass reads these owners only after the join.
+        var sourceGraphs = new PreparedTerminalMedial?[regions.Count];
         var collapsedComponents = new Dictionary<(int Region, int Level, double CurrentOffset, double Radius, IReadOnlyList<PointD> Outer),
-            IReadOnlyList<IReadOnlyList<PointD>>>();
+            IReadOnlyList<IReadOnlyList<PointD>>>?[regions.Count];
         int terminalCacheHits = 0;
         PreparedTerminalMedial SourceGraph(int regionIndex)
         {
-            if (!sourceGraphs.TryGetValue(regionIndex, out var graph))
-                sourceGraphs.Add(regionIndex, graph = new PreparedTerminalMedial(
+            var graph=sourceGraphs[regionIndex];
+            if (graph is null)
+                sourceGraphs[regionIndex]=graph = new PreparedTerminalMedial(
                     regions[regionIndex], cancellationToken, lazy: true,
                     boundOriginalSource: options.BoundOriginalSourceMedial,
-                    preserveNativeGrid: options.PreserveSourceNativeGrid));
+                    preserveNativeGrid: options.PreserveSourceNativeGrid);
             return graph;
         }
         IReadOnlyList<IReadOnlyList<PointD>> CollapsedPaths(CollapsedOffsetComponent collapse, CancellationToken token)
@@ -81,9 +84,10 @@ public static partial class MedialAxisGeometry
             bool reuse = options.CacheCollapsedTerminals
                 && Environment.GetEnvironmentVariable("RW_TOOLPATHS_COHERENCE_REFERENCE") != "1"
                 && Environment.GetEnvironmentVariable("RW_TOOLPATHS_TERMINAL_CACHE_REFERENCE") != "1";
-            if (reuse && collapsedComponents.TryGetValue(key, out var paths))
+            var cache=collapsedComponents[collapse.RegionIndex]??=new();
+            if (reuse && cache.TryGetValue(key, out var paths))
             {
-                terminalCacheHits++;
+                Interlocked.Increment(ref terminalCacheHits);
                 Console.WriteLine($"[Offset.Terminal.Cache] region={collapse.RegionIndex} level={collapse.ParentLevel} "
                     + $"currentInset={collapse.CurrentOffsetDistance:R} candidateInset={collapse.CandidateOffsetDistance:R} "
                     + $"paths={paths.Count} completeComponentIdentity=True candidateInsetEffect=diagnostic-only");
@@ -91,7 +95,7 @@ public static partial class MedialAxisGeometry
             }
             var computed = OffsetTerminalPaths.BuildCollapsedComponent(collapse, () => SourceGraph(collapse.RegionIndex),
                 options.FirstOffset, clipBoundary, token);
-            if (reuse) collapsedComponents.Add(key, computed);
+            if (reuse) cache.Add(key, computed);
             return computed;
         }
         if (retainCollapses)
@@ -100,6 +104,7 @@ public static partial class MedialAxisGeometry
                 PhysicalSweepRadius = sweepRadius,
                 PhysicalClipBoundary = clipBoundary,
                 TerminalPaths = CollapsedPaths,
+                RegionTerminalCallbacksOwned = true,
                 SourceConstructionTolerance = .001,
             };
 
@@ -160,8 +165,8 @@ public static partial class MedialAxisGeometry
         Console.WriteLine($"[MedialAxisGeometry.Fill] regions={regions.Count} closed={paths.Count(p => p.IsClosed)} "
             + $"open={paths.Count(p => !p.IsClosed)} firstInset={options.FirstOffset:R} "
             + $"pitch={options.StepOver:R} sweepRadius={sweepRadius:R} maxInset={options.MaximumInset:R} "
-            + $"terminalPolicy={preserveTerminalPaths} medialSources={sourceGraphs.Count} "
-            + $"collapsedComponents={collapsedComponents.Count} terminalCacheHits={terminalCacheHits}");
+            + $"terminalPolicy={preserveTerminalPaths} medialSources={sourceGraphs.Count(graph=>graph is not null)} "
+            + $"collapsedComponents={collapsedComponents.Sum(cache=>cache?.Count??0)} terminalCacheHits={terminalCacheHits}");
         return paths;
     }
 }

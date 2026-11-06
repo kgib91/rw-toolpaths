@@ -19,26 +19,32 @@ internal static class VCarveNativeGeometryRejection
 
     internal static bool Excluded(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance)
     {
-        Point3D[] controls=[move.Start,move.Control1,move.Control2,move.End];
-        double scale=controls.Max(p=>Math.Max(Math.Abs(p.X),Math.Max(Math.Abs(p.Y),Math.Abs(p.Z))));
+        static double Scale(Point3D p)=>Math.Max(Math.Abs(p.X),Math.Max(Math.Abs(p.Y),Math.Abs(p.Z)));
+        // Enumerable.Max's double overload ignores NaN when another value is
+        // present. Retain that input behavior as well as the finite arithmetic.
+        static double Max(double a,double b)=>double.IsNaN(a)||b>a?b:a;
+        double scale=Max(Max(Scale(move.Start),Scale(move.Control1)),Max(Scale(move.Control2),Scale(move.End)));
         if(!double.IsFinite(scale)||!double.IsFinite(allowance)||allowance<0)return false;
         // Outward padding is deliberately much larger than the rounding error
         // of four midpoint splits; it can only retain extra candidates.
         double padding=1e-9*Math.Max(1,scale),squared=Math.Pow(allowance+padding,2);
-        var boxes=new List<Box>(16);
-        void Cover(Point3D a,Point3D b,Point3D c,Point3D d,int level)
+        // A fixed four-level enclosure always has sixteen boxes. Candidate
+        // searches repeat it hundreds of times per span; keep that scratch on
+        // the stack rather than allocate controls, a list and its closure.
+        Span<Box> boxes=stackalloc Box[16];int count=0;
+        static void Cover(Point3D a,Point3D b,Point3D c,Point3D d,int level,Span<Box> boxes,ref int count)
         {
             if(level==4)
             {
-                boxes.Add(new(new(Math.Min(Math.Min(a.X,b.X),Math.Min(c.X,d.X)),Math.Min(Math.Min(a.Y,b.Y),Math.Min(c.Y,d.Y)),Math.Min(Math.Min(a.Z,b.Z),Math.Min(c.Z,d.Z))),
-                    new(Math.Max(Math.Max(a.X,b.X),Math.Max(c.X,d.X)),Math.Max(Math.Max(a.Y,b.Y),Math.Max(c.Y,d.Y)),Math.Max(Math.Max(a.Z,b.Z),Math.Max(c.Z,d.Z)))));
+                boxes[count++]=new(new(Math.Min(Math.Min(a.X,b.X),Math.Min(c.X,d.X)),Math.Min(Math.Min(a.Y,b.Y),Math.Min(c.Y,d.Y)),Math.Min(Math.Min(a.Z,b.Z),Math.Min(c.Z,d.Z))),
+                    new(Math.Max(Math.Max(a.X,b.X),Math.Max(c.X,d.X)),Math.Max(Math.Max(a.Y,b.Y),Math.Max(c.Y,d.Y)),Math.Max(Math.Max(a.Z,b.Z),Math.Max(c.Z,d.Z))));
                 return;
             }
             var ab=VCarveNativeCurveMath.Lerp(a,b,.5);var bc=VCarveNativeCurveMath.Lerp(b,c,.5);var cd=VCarveNativeCurveMath.Lerp(c,d,.5);
             var abc=VCarveNativeCurveMath.Lerp(ab,bc,.5);var bcd=VCarveNativeCurveMath.Lerp(bc,cd,.5);var mid=VCarveNativeCurveMath.Lerp(abc,bcd,.5);
-            Cover(a,ab,abc,mid,level+1);Cover(mid,bcd,cd,d,level+1);
+            Cover(a,ab,abc,mid,level+1,boxes,ref count);Cover(mid,bcd,cd,d,level+1,boxes,ref count);
         }
-        Cover(controls[0],controls[1],controls[2],controls[3],0);
+        Cover(move.Start,move.Control1,move.Control2,move.End,0,boxes,ref count);
         for(int i=first;i<=last;i++)
         {
             bool possible=false;

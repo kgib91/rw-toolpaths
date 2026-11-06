@@ -14,7 +14,7 @@ internal static class ToolpathCollinearCompactor
     {
         cancellationToken.ThrowIfCancellationRequested();
         var source = path.Points;
-        if (source.Count < 3 || path.DetectCurves) return path;
+        if (source.Count < 3 || path.RequiresSourcePreservation) return path;
         if (path.Spans.Any(span => span.StartIndex < 0 || span.EndIndex < span.StartIndex
             || span.EndIndex >= source.Count || span.Kind is ToolpathSpanKind.TabLift or ToolpathSpanKind.Retract)) return path;
 
@@ -77,7 +77,7 @@ internal static class ToolpathCollinearCompactor
             throw new InvalidOperationException("Collinear compaction lost a toolpath span boundary.");
         return new TaggedToolpath(points, spans, path.RegionIndex, path.Category,
             path.DepthPassIndex, path.VisitIdentity, detectCurves: false)
-            {ContinuationComponentIndex=path.ContinuationComponentIndex,ContinuationPlan=path.ContinuationPlan,
+            {PreserveSourceTraversal=path.PreserveSourceTraversal,ContinuationComponentIndex=path.ContinuationComponentIndex,ContinuationPlan=path.ContinuationPlan,
                 ContinuationSourceOrdinal=path.ContinuationSourceOrdinal,ConcentricSource=path.ConcentricSource};
     }
 

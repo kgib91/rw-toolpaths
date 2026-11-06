@@ -13,6 +13,14 @@ namespace RW.Toolpaths.Milling;
 /// </summary>
 internal static class VCarvePhysicalSweep
 {
+    // Retained diagnostic selector only. The native experiment was withdrawn
+    // after full-workload geometry and timing controls failed; true must refuse.
+    internal static readonly AsyncLocal<bool?> NativeLeafBackendEnabled=new();
+    // Retired diagnostic selector. Explicit true refuses before any dispatch.
+    internal static readonly AsyncLocal<bool?> UseInputVertexPool=new();
+    // Explicit diagnostic geometry scheduling only. Null/false retain caller
+    // hull construction; true still requires the owned upper/ordered queue.
+    internal static readonly AsyncLocal<bool?> DeferredHullPreparationEnabled=new();
     private const double GridReserve = 4 / PathUtils.Scale;
     private const double PostUnionReserve = 6 / PathUtils.Scale;
     private const double PostUnionArcTolerance = .25 / PathUtils.Scale;
@@ -119,6 +127,18 @@ internal static class VCarvePhysicalSweep
         ArgumentNullException.ThrowIfNull(profile);
         if (!double.IsFinite(outputSurfaceZ)) throw new ArgumentOutOfRangeException(nameof(outputSurfaceZ));
         double tolerance = EffectiveTolerance(spatialTolerance);
+        bool nativeLeafRequested=NativeLeafBackendEnabled.Value is true;
+        if(nativeLeafRequested)throw new NotSupportedException(
+            "The experimental native physical-leaf backend was withdrawn after full-workload geometry and timing controls failed. Use the managed backend.");
+        bool inputVertexPoolRequested=UseInputVertexPool.Value is true;
+        if(inputVertexPoolRequested)throw new NotSupportedException(
+            "The experimental physical input-vertex pool was withdrawn and is not a validated production backend. Use the literal managed backend.");
+        using var sweepCapture=VCarvePhysicalSweepTrace.IsEnabled?VCarvePhysicalSweepTrace.Begin(paths,profile,new VCarvePhysicalSweepTrace.Parameters(
+            outputSurfaceZ,spatialTolerance,tolerance,upperBound,accelerateConstantDepthRuns,orderedDiscHulls,
+            consolidateHemisphereChords,enableTaperedRadiusRuns,enableParallelLeafUnions,GeometryParallelism.WorkerLimit,
+            nativeLeafRequested,UnionBatchSize,FlatRunChunkChords,MaximumUnionHierarchyDepth,ParallelUnionMinimumSourceChords,
+            GridReserve,PostUnionReserve,PostUnionArcTolerance)
+            {DeferredHullPreparationRequested=DeferredHullPreparationEnabled.Value},cancellationToken,nominationUnion is not null):null;
         double interpolationBudget = tolerance / 4, circleBudget = tolerance / 4;
         var sectionStarts = new List<double> { 0 };
         foreach (var section in profile.Sections) sectionStarts.Add(sectionStarts[^1] + section.Height);
@@ -144,6 +164,7 @@ internal static class VCarvePhysicalSweep
         bool mayConsolidate = false;
         long started = Stopwatch.GetTimestamp(), reported = started;
         double offsetMilliseconds = 0, unionMilliseconds = 0;
+        long parallelOffsetTicks = 0, parallelOffsetChunks = 0;
         long sourceChords = paths.Sum(path => (long)Math.Max(0, path.Points.Count - 1));
         string bound = nominationUnion is not null ? "untrusted-lower-nomination" : upperBound ? "upper" : "lower";
         MillingGeometryTrace.Capture("physical-sweep-" + bound, 0, paths);
@@ -164,15 +185,38 @@ internal static class VCarvePhysicalSweep
 
         Paths64 Union(Paths64 source) => nominationUnion is null
             ? Clipper.Union(source, FillRule.NonZero) : nominationUnion(source);
-
         // Execute the same leaf operands and ordered hierarchy concurrently.
         // The source and Boolean construction are identical to the serial oracle;
         // this also covers upper channels, independently of nomination policies.
         bool automaticParallelUnions = sourceChords >= ParallelUnionMinimumSourceChords;
+        bool deferHullPreparation=DeferredHullPreparationEnabled.Value==true&&upperBound&&orderedDiscHulls
+            &&nominationUnion is null&&(enableParallelLeafUnions||automaticParallelUnions)&&GeometryParallelism.WorkerLimit>1;
         using var parallelUnions = (enableParallelLeafUnions || automaticParallelUnions) && nominationUnion is null
             && GeometryParallelism.WorkerLimit > 1
-            ? new VCarveOrderedUnionQueue(cancellationToken, GeometryParallelism.WorkerLimit) : null;
+            ? new VCarveOrderedUnionQueue(cancellationToken, GeometryParallelism.WorkerLimit,
+                enablePreparedHulls:deferHullPreparation) : null;
         var orderedUnionSlots = parallelUnions is null ? null : new List<VCarveOrderedUnionQueue.Slot>();
+        var pendingRecipes=deferHullPreparation?new List<VCarvePhysicalHullRecipe>(UnionBatchSize):null;
+        var recipeCircles=deferHullPreparation?new Dictionary<int,VCarvePhysicalHullRecipe.Circle>():null;
+        long deferredHullPieces=0,callerHullFallbackPieces=0,materializedCarryPieces=0;
+        long maximumDeferredCarryBytes=0;
+        long pendingRecipeCharge=0;
+        int PendingHullCount()=>pending.Count+(pendingRecipes?.Count??0);
+
+        void MaterializePendingRecipes()
+        {
+            if(pendingRecipes is null||pendingRecipes.Count==0)return;
+            using var permit=parallelUnions!.EnterProducerGeometry();
+            foreach(var recipe in pendingRecipes)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var hull=recipe.Materialize(orderedHulls!);
+                if(hull.Count<3)throw new InvalidOperationException("Certified pending hull became degenerate.");
+                pending.Add(hull);materializedCarryPieces++;
+            }
+            pendingRecipes.Clear();
+            pendingRecipeCharge=0;
+        }
 
         void Progress(string stage, bool force = false)
         {
@@ -187,8 +231,18 @@ internal static class VCarvePhysicalSweep
 
         void Flush()
         {
-            if (pending.Count == 0) return;
+            if (PendingHullCount() == 0) return;
             cancellationToken.ThrowIfCancellationRequested();
+            if(pending.Count==0&&pendingRecipes is {Count:>0})
+            {
+                var batch=new VCarvePhysicalHullBatch(pendingRecipes);
+                maximumDeferredCarryBytes=Math.Max(maximumDeferredCarryBytes,batch.EstimatedBytes);
+                orderedUnionSlots!.Add(parallelUnions!.Submit(batch));
+                pendingRecipes.Clear();pendingRecipeCharge=0;Progress("hull-batch");return;
+            }
+            // A rare uncertified/degenerate recipe is resolved in place. Never
+            // publish a partial batch or move it ahead of interleaved offsets.
+            MaterializePendingRecipes();
             if (parallelUnions is not null)
             {
                 orderedUnionSlots!.Add(parallelUnions.Submit(pending));
@@ -227,6 +281,17 @@ internal static class VCarvePhysicalSweep
             int chunkLength = closed ? Math.Min(FlatRunChunkChords, Math.Max(1, chordCount / 2)) : FlatRunChunkChords;
             flatRuns++;
             flatChords += chordCount;
+            Paths64 OffsetChunk(Paths64 input)
+            {
+                long offsetStarted = Stopwatch.GetTimestamp();
+                var offset = new ClipperOffset(miterLimit: 2, arcTolerance: arcTolerance * PathUtils.Scale,
+                    preserveCollinear: false, reverseSolution: false);
+                offset.AddPaths(input, JoinType.Round, EndType.Round);
+                var band = new Paths64();
+                offset.Execute(offsetRadius * PathUtils.Scale, band);
+                Interlocked.Add(ref parallelOffsetTicks, Stopwatch.GetTimestamp() - offsetStarted);
+                return band;
+            }
             for (int start = first; start < last; start += chunkLength)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -245,22 +310,26 @@ internal static class VCarvePhysicalSweep
                     Emit(points[start], points[finish], radius, radius, 0);
                     continue;
                 }
-                var offset = new ClipperOffset(miterLimit: 2, arcTolerance: arcTolerance * PathUtils.Scale,
-                    preserveCollinear: false, reverseSolution: false);
-                offset.AddPath(centerline, JoinType.Round, EndType.Round);
-                var band = new Paths64();
-                long offsetStarted = Stopwatch.GetTimestamp();
-                if (parallelUnions is null) offset.Execute(offsetRadius * PathUtils.Scale, band);
+                if (parallelUnions is null)
+                {
+                    var offset = new ClipperOffset(miterLimit: 2, arcTolerance: arcTolerance * PathUtils.Scale,
+                        preserveCollinear: false, reverseSolution: false);
+                    offset.AddPath(centerline, JoinType.Round, EndType.Round);
+                    var band = new Paths64();
+                    long offsetStarted = Stopwatch.GetTimestamp();
+                    offset.Execute(offsetRadius * PathUtils.Scale, band);
+                    offsetMilliseconds += Stopwatch.GetElapsedTime(offsetStarted).TotalMilliseconds;
+                    batches.AddRange(band);
+                    unionGroups.Add(band);
+                }
                 else
                 {
-                    using var producerGeometry = parallelUnions.EnterProducerGeometry();
-                    offsetStarted = Stopwatch.GetTimestamp();
-                    offset.Execute(offsetRadius * PathUtils.Scale, band);
+                    // Preserve this exact chunk's integer vertices, round caps,
+                    // radius and position among the original union groups. Only
+                    // its private ClipperOffset execution moves off the producer.
+                    orderedUnionSlots!.Add(parallelUnions.Submit(new Paths64 { centerline }, OffsetChunk));
+                    parallelOffsetChunks++;
                 }
-                offsetMilliseconds += Stopwatch.GetElapsedTime(offsetStarted).TotalMilliseconds;
-                batches.AddRange(band);
-                if (parallelUnions is null) unionGroups.Add(band);
-                else orderedUnionSlots!.Add(VCarveOrderedUnionQueue.Slot.Completed(band));
                 flatChunks++;
                 Progress("constant-depth-offset");
             }
@@ -316,7 +385,14 @@ internal static class VCarvePhysicalSweep
                 count *= 2;
             var unitCircle = Circle(count);
             var vertices = orderedHulls is null ? new List<Point64>(2 * count) : null;
-            orderedHulls?.BeginCircle(unitCircle);
+            bool preparePiece=deferHullPreparation&&convexWitnesses is null;
+            VCarvePhysicalHullRecipe.Row firstRow=default,secondRow=default;int recipeRows=0;
+            if(!preparePiece)orderedHulls?.BeginCircle(unitCircle);
+            void CaptureRow(VCarvePhysicalHullRecipe.Row row)
+            {
+                if(recipeRows>=2)throw new InvalidOperationException("A chord hull has at most two endpoint rows.");
+                if(recipeRows++==0)firstRow=row;else secondRow=row;
+            }
             void Disc(Point3D center, double physicalRadius)
             {
                 double radius = Math.Max(0, physicalRadius + reserve);
@@ -329,10 +405,14 @@ internal static class VCarvePhysicalSweep
                     // Exact zero-radius endpoints still define a tapered sweep's
                     // tip. Sub-grid discs without a contained lattice point vanish.
                     if (dx * dx + dy * dy <= physicalRadius * physicalRadius)
-                    { if (orderedHulls is null) vertices!.Add(point); else orderedHulls.AddPoint(point); }
+                    {
+                        if(preparePiece)CaptureRow(VCarvePhysicalHullRecipe.Row.Vertex(point));
+                        else if (orderedHulls is null) vertices!.Add(point); else orderedHulls.AddPoint(point);
+                    }
                     return;
                 }
-                if (orderedHulls is not null) orderedHulls.AddDisc(center, radius);
+                if(preparePiece)CaptureRow(VCarvePhysicalHullRecipe.Row.Disc(center,radius));
+                else if (orderedHulls is not null) orderedHulls.AddDisc(center, radius);
                 else foreach (var unit in unitCircle)
                     vertices!.Add(new Point64(
                         (long)Math.Round((center.X + radius * unit.X) * PathUtils.Scale),
@@ -347,6 +427,28 @@ internal static class VCarvePhysicalSweep
                 if (ra >= rb) Disc(a, ra); else Disc(b, rb);
             }
             else { Disc(a, ra); Disc(b, rb); }
+            if(preparePiece)
+            {
+                if(!recipeCircles!.TryGetValue(count,out var circle))
+                {circle=new VCarvePhysicalHullRecipe.Circle(unitCircle);recipeCircles.Add(count,circle);}
+                var recipe=new VCarvePhysicalHullRecipe(circle,firstRow,secondRow,recipeRows);
+                if(recipe.CertifiedNondegenerate)
+                {
+                    pendingRecipes!.Add(recipe);deferredHullPieces++;
+                    pendingRecipeCharge=checked(pendingRecipeCharge+200+recipe.ExpandedBytes);
+                    maximumDeferredCarryBytes=Math.Max(maximumDeferredCarryBytes,
+                        VCarvePhysicalHullRecipe.MaximumWorkerScratchBytes+64+pendingRecipeCharge);
+                }
+                else
+                {
+                    MaterializePendingRecipes();
+                    using var permit=parallelUnions!.EnterProducerGeometry();
+                    var literal=recipe.Materialize(orderedHulls!);callerHullFallbackPieces++;
+                    if(literal.Count>=3)pending.Add(literal);
+                }
+                if(PendingHullCount()>=UnionBatchSize)Flush();
+                return;
+            }
             var hull = orderedHulls is null ? ConvexHull(vertices!) : orderedHulls.FinishHull();
             if (hull.Count >= 3)
             {
@@ -504,9 +606,18 @@ internal static class VCarvePhysicalSweep
         if (parallelUnions is not null)
         {
             parallelUnions.Complete();
+            if(deferHullPreparation)parallelUnions.MergePreparedHullMetrics(orderedHulls!);
             foreach (var slot in orderedUnionSlots!) unionGroups.Add(parallelUnions.Read(slot));
         }
+        offsetMilliseconds += Interlocked.Read(ref parallelOffsetTicks) * 1000d / Stopwatch.Frequency;
         cancellationToken.ThrowIfCancellationRequested();
+        Console.WriteLine($"[VCarve.PhysicalDeferredHulls] requested={DeferredHullPreparationEnabled.Value?.ToString()??"auto"} enabled={deferHullPreparation} "
+            +$"deferredPieces={deferredHullPieces} callerFallbackPieces={callerHullFallbackPieces} materializedCarryPieces={materializedCarryPieces} "
+            +$"preparedBatches={parallelUnions?.PreparedHullBatches??0} preparedRecipes={parallelUnions?.PreparedHullRecipes??0} "
+            +$"workerHullMs={parallelUnions?.PreparedHullMilliseconds??0:F3} maximumCarryChargedBytes={maximumDeferredCarryBytes} "
+            +$"maximumWorkerScratchBytes={parallelUnions?.MaximumPreparedHullScratchBytes??0} maximumCirclePoints={VCarvePhysicalHullRecipe.MaximumCirclePoints} "
+            +$"workersJoined={parallelUnions?.OwnedWorkersJoined??true} polygonBatchSize={UnionBatchSize} sourceDecisions=original-caller "
+            +$"opaqueUnion={nominationUnion is not null} integerNoncollinearityCertificate=True originalOffsetInterleaving=True outputPublication=after-join");
         Progress("union-start", true);
         double serialLeafUnionMilliseconds = unionMilliseconds;
         long finalUnionStarted = Stopwatch.GetTimestamp();
@@ -559,9 +670,21 @@ internal static class VCarvePhysicalSweep
         var combined = Union(batches);
         cancellationToken.ThrowIfCancellationRequested();
         long postUnionStarted = Stopwatch.GetTimestamp();
-        var result = PathUtils.FromClipper(BoundBooleanResult(combined, upperBound));
+        var completedInteger=BoundBooleanResult(combined,upperBound);
+        var result = PathUtils.FromClipper(completedInteger);
         double postUnionMilliseconds = Stopwatch.GetElapsedTime(postUnionStarted).TotalMilliseconds;
         cancellationToken.ThrowIfCancellationRequested();
+        sweepCapture?.Complete(completedInteger,cancellationToken,new VCarvePhysicalSweepTrace.BackendWork(0,0,0,0,0,0)
+        {
+            InputVertices=new(0,0,0,0,0,0,0,0,0,true),
+            DeferredHulls=new(deferHullPreparation,deferredHullPieces,callerHullFallbackPieces,materializedCarryPieces,
+                parallelUnions?.PreparedHullBatches??0,parallelUnions?.PreparedHullRecipes??0,parallelUnions?.OwnedWorkersJoined??true)
+            {
+                MaximumCarryChargedBytes=maximumDeferredCarryBytes,
+                MaximumWorkerScratchBytes=parallelUnions?.MaximumPreparedHullScratchBytes??0,
+                WorkerHullMilliseconds=parallelUnions?.PreparedHullMilliseconds??0
+            }
+        });
         unionMilliseconds += Stopwatch.GetElapsedTime(finalUnionStarted).TotalMilliseconds;
         // Includes hull-vertex and all Boolean rounding, plus offset-vertex,
         // offset-internal-union and final set-operation rounding. At the minimum
@@ -569,6 +692,14 @@ internal static class VCarvePhysicalSweep
         double uncertaintyBound = interpolationBudget + circleBudget + GridReserve
             + (hierarchyDepth + 3) * Math.Sqrt(.5) / PathUtils.Scale
             + PostUnionReserve + PostUnionArcTolerance + 3 * Math.Sqrt(.5) / PathUtils.Scale;
+        Console.WriteLine($"[VCarve.PhysicalLeafBackend] requested={nativeLeafRequested} enabled=False managedRoundOffsetConstruction=True "
+            +"unionAttempts=0 unionCompleted=0 unionFallbacks=0 unionTryMs=0 offsetCleanupAttempts=0 offsetCleanupCompleted=0 offsetCleanupFallbacks=0 offsetCleanupTryMs=0 "
+            +$"allLeafWorkersJoined={parallelUnions?.OwnedWorkersJoined??true} defaultEnabled=False genericNomination={nominationUnion is not null} "
+            +"scope=managed-original-leaves hierarchyAndFinalManaged=True originalLeafOrder=True nativeExperimentWithdrawn=True");
+        Console.WriteLine($"[VCarve.PhysicalInputVertices] requested={inputVertexPoolRequested} enabled=False "
+            +"owners=0 executions=0 rented=0 reused=0 allocated=0 overflow=0 retained=0 peakUsedSum=0 capacity=0 "
+            +$"allWorkersJoined={parallelUnions?.OwnedWorkersJoined??true} experimentWithdrawn=True explicitEnabledRequestsRefused=True "
+            +"scope=literal-managed-leaves originalManagedGeometry=True");
         Console.WriteLine($"[VCarve.PhysicalSweep] bound={bound} paths={paths.Count} " +
             $"chords={chords} pieces={pieces} subdivisions={subdivisions} ignored={ignored} contours={result.Count} " +
             $"requestedTolerance={spatialTolerance:R} effectiveTolerance={tolerance:R} radialError={maximumRadialError:R} " +
@@ -580,6 +711,7 @@ internal static class VCarvePhysicalSweep
             $"surfaceZ={outputSurfaceZ:R} physicalProfile=True coordinates=provided retracts=False " +
             $"coverageAuthority={nominationUnion is null} wholeTargetCertificateRequired={nominationUnion is not null} " +
             $"flatRuns={flatRuns} flatChords={flatChords} flatChunks={flatChunks} offsetMs={offsetMilliseconds:F1} " +
+            $"parallelOffsetChunks={parallelOffsetChunks} offsetMsScope=caller-plus-sum-worker originalOffsetLeavesAndOrder=True " +
             $"taperedRuns={taperedRuns} taperedChords={taperedChords} taperedFitMs={taperedFitMilliseconds:F3} " +
             $"taperedRequests={taperedWorkspace?.Metrics.Requests ?? 0} taperedSourcePoints={taperedWorkspace?.Metrics.SourcePoints ?? 0} " +
             $"taperedFitPoints={taperedWorkspace?.Metrics.FitPoints ?? 0} taperedCandidateFits={taperedWorkspace?.Metrics.CandidateFits ?? 0} " +
@@ -596,6 +728,7 @@ internal static class VCarvePhysicalSweep
             $"parallelLeafUnionsAutomatic={automaticParallelUnions} parallelLeafUnionMinimumSourceChords={ParallelUnionMinimumSourceChords} " +
             $"parallelLeafUnionBatches={parallelUnions?.Submitted ?? 0} parallelLeafUnionLiteralFallbacks={parallelUnions?.LiteralFallbacks ?? 0} " +
             $"parallelLeafUnionComputeMs={parallelUnions?.ComputeMilliseconds ?? 0:F3} parallelLeafUnionWaitMs={parallelUnions?.WaitMilliseconds ?? 0:F3} " +
+            $"parallelLeafUnionComputeIncludesOffsets={parallelOffsetChunks > 0} " +
             $"parallelLeafUnionPeakInFlight={parallelUnions?.PeakInFlight ?? 0} parallelLeafUnionPeakInputBytes={parallelUnions?.PeakRetainedInputBytes ?? 0} " +
             $"parallelLeafUnionMaximumInputBytes={VCarveOrderedUnionQueue.MaximumRetainedInputBytes} unionMsScope=serial-union-only parallelComputeScope=sum-worker-inclusive " +
             $"hemisphereConsolidation={consolidateHemisphereChords && !upperBound} " +
@@ -611,7 +744,15 @@ internal static class VCarvePhysicalSweep
             $"orderedHullTieGroups={orderedHulls?.TieGroups ?? 0} orderedHullTiePairs={orderedHulls?.TiePairs ?? 0} " +
             $"orderedHullPairSwaps={orderedHulls?.PairSwaps ?? 0} orderedHullMaxTieGroup={orderedHulls?.MaximumTieGroup ?? 0} " +
             $"orderedHullSortFallbacks={orderedHulls?.SortFallbacks ?? 0} orderedHullDuplicates={orderedHulls?.DuplicatesSkipped ?? 0} " +
-            $"orderedHullCircleOrderBuilds={orderedHulls?.CircleOrderBuilds ?? 0} elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}");
+            $"orderedHullFinalRowValidationComparisons={orderedHulls?.FinalRowValidationComparisons ?? 0} orderedHullFinalRowValidationComparisonsAvoided={orderedHulls?.FinalRowValidationComparisonsAvoided ?? 0} " +
+            $"orderedHullCircleOrderBuilds={orderedHulls?.CircleOrderBuilds ?? 0} " +
+            $"orderedHullDiscRowHits={orderedHulls?.DiscRowCacheHits ?? 0} orderedHullDiscRowMisses={orderedHulls?.DiscRowCacheMisses ?? 0} " +
+            $"orderedHullDiscRowRefusals={orderedHulls?.DiscRowCacheRefusals ?? 0} orderedHullDiscRowBufferSwaps={orderedHulls?.DiscRowBufferSwaps ?? 0} " +
+            $"orderedHullDiscVerticesAvoided={orderedHulls?.DiscVerticesAvoided ?? 0} orderedHullDiscRowMemo=two-owned-exact-immutable-circle-rows " +
+            $"orderedHullMaximumRetainedRows={orderedHulls?.MaximumRetainedRows ?? 0} orderedHullExtendedRowHits={orderedHulls?.ExtendedRowHits ?? 0} orderedHullExtendedRowMisses={orderedHulls?.ExtendedRowMisses ?? 0} " +
+            $"orderedHullExtendedRowEvictions={orderedHulls?.ExtendedRowEvictions ?? 0} orderedHullExtendedRowBudgetRefusals={orderedHulls?.ExtendedRowBudgetRefusals ?? 0} orderedHullExtendedRowBufferReuses={orderedHulls?.ExtendedRowBufferReuses ?? 0} " +
+            $"orderedHullExtendedRowEntries={orderedHulls?.ExtendedRowEntries ?? 0} orderedHullExtendedRowBytes={orderedHulls?.ExtendedRowBytes ?? 0} orderedHullExtendedRowPeakBytes={orderedHulls?.ExtendedRowPeakBytes ?? 0} orderedHullExtendedRowMaximumBytes={VCarveOrderedDiscHull.MaximumExtendedRowBytes} " +
+            $"elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}");
         return result;
     }
 

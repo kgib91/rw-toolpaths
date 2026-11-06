@@ -13,30 +13,42 @@ namespace RW.Toolpaths.Milling;
 // This is not a stock model or a general 3D certificate engine.
 internal sealed class VCarveNativeContainment
 {
-    private readonly MedialAxisToolpaths.SpatialSegmentIndex edgeIndex;
-    private readonly PreparedRegionDistance region;
+    private readonly MedialAxisToolpaths.SpatialSegmentIndex? edgeIndex;
+    private readonly PreparedRegionDistance? region;
     private readonly VCarveCutterProfile profile;
     internal CancellationToken Token {get;}
     private readonly Func<Point3D,Point3D,bool>? stockChord;
     private readonly Func<ToolMove,bool>? stockCurve;
+    internal long PreparedChordQueries {get;private set;}
+    internal long PreparedEdgePartitions {get;private set;}
+    internal long LiteralEdgePartitions {get;private set;}
     internal bool StockAware=>stockCurve is not null;
     internal bool CertifyStockCurve(ToolMove move)=>stockCurve?.Invoke(move)==true;
     internal VCarveNativeContainment(IReadOnlyList<IReadOnlyList<PointD>> boundary, VCarveCutterProfile profile,CancellationToken token=default,Func<Point3D,Point3D,bool>? stockChord=null,Func<ToolMove,bool>? stockCurve=null)
     {
         if((stockChord is null)!=(stockCurve is null))throw new ArgumentException("Native stock context needs both chord and continuous curve authorities.");
         this.stockChord=stockChord;this.stockCurve=stockCurve;Token=token;
-        edgeIndex = new(boundary.SelectMany(r => Enumerable.Range(0, r.Count).Select(i => (r[i], r[(i + 1) % r.Count]))).ToArray());
-        region = new(boundary); this.profile = profile;
+        // Stock callbacks are the complete authority in this mode. Every query
+        // delegates to them before reaching the solid-extrusion predicates, so
+        // their otherwise unused solid boundary indexes need not be rebuilt.
+        if(stockChord is null)
+        {
+            edgeIndex = new(boundary.SelectMany(r => Enumerable.Range(0, r.Count).Select(i => (r[i], r[(i + 1) % r.Count]))).ToArray());
+            region = new(boundary);
+        }
+        this.profile = profile;
     }
     internal bool Legal(Point3D a, Point3D b) => MinimumSquaredSeparation(a, b) >= -1e-10;
-    internal double MinimumSquaredSeparation(Point3D a, Point3D b)
+    internal double MinimumSquaredSeparation(Point3D a, Point3D b) => MinimumSquaredSeparationCore(a,b,true);
+    internal double MinimumSquaredSeparationLiteral(Point3D a, Point3D b) => MinimumSquaredSeparationCore(a,b,false);
+    private double MinimumSquaredSeparationCore(Point3D a, Point3D b,bool prepareCuts)
     {
         // Stock-aware boolean proofs grant no fictitious clearance margin.
         // Continuous curves use their dedicated stock enclosure proof below;
         // zero here can only rank/reject poses, never inflate a flat certificate.
         if(stockChord is not null)return stockChord(a,b)?0:double.NegativeInfinity;
         if (Math.Min(a.Z, b.Z) >= 0) return double.PositiveInfinity;
-        if ((a.Z < 0 && region.SignedDistance(new(a.X, a.Y)) < 0) || (b.Z < 0 && region.SignedDistance(new(b.X, b.Y)) < 0)) return double.NegativeInfinity;
+        if ((a.Z < 0 && region!.SignedDistance(new(a.X, a.Y)) < 0) || (b.Z < 0 && region!.SignedDistance(new(b.X, b.Y)) < 0)) return double.NegativeInfinity;
         double da = -a.Z, db = a.Z - b.Z, vx = b.X - a.X, vy = b.Y - a.Y;
         double radius = profile.PhysicalRadiusAtDepth(Math.Max(da, da + db));
         double left = Math.Min(a.X, b.X) - radius, right = Math.Max(a.X, b.X) + radius,
@@ -45,8 +57,20 @@ internal sealed class VCarveNativeContainment
         if (db != 0)
         {
             depthCuts.Add(-da / db);
-            foreach (var s in profile.Sections) { sectionHeight += s.Height; depthCuts.Add((sectionHeight - da) / db); }
+            if(prepareCuts)
+            {
+                for(int s=0;s<profile.Sections.Count;s++)
+                {sectionHeight+=profile.Sections[s].Height;depthCuts.Add((sectionHeight-da)/db);}
+            }
+            else foreach (var s in profile.Sections) { sectionHeight += s.Height; depthCuts.Add((sectionHeight - da) / db); }
         }
+        // The cutter-depth partition is identical for every queried edge.
+        // Keep the original filter, stable ordering and equality once per chord;
+        // only the two edge-projection cuts vary. Large profiles use the literal
+        // path rather than unbounded stack storage.
+        var preparedCuts=prepareCuts&&depthCuts.Count<=62
+            ?depthCuts.Where(t=>t>=0&&t<=1).Order().Distinct().ToArray():null;
+        if(preparedCuts is not null)PreparedChordQueries++;
         double EvaluateEdge((PointD A,PointD B) edge)
         {
             double minimum = double.PositiveInfinity;
@@ -65,9 +89,26 @@ internal sealed class VCarveNativeContainment
             if (l2 == 0) return double.PositiveInfinity;
             double ux = a.X - edge.A.x, uy = a.Y - edge.A.y;
             double projection = (ux * ex + uy * ey) / l2, projectionDelta = (vx * ex + vy * ey) / l2;
-            var cuts = new List<double>(depthCuts);
-            if (projectionDelta != 0) { cuts.Add(-projection / projectionDelta); cuts.Add((1 - projection) / projectionDelta); }
-            var ordered = cuts.Where(t => t >= 0 && t <= 1).Order().Distinct().ToArray();
+            Span<double> scratch=stackalloc double[64];
+            scoped ReadOnlySpan<double> ordered;
+            if(preparedCuts is not null)
+            {
+                PreparedEdgePartitions++;
+                preparedCuts.AsSpan().CopyTo(scratch);int count=preparedCuts.Length;
+                if(projectionDelta!=0)
+                {
+                    count=InsertCut(scratch,count,-projection/projectionDelta);
+                    count=InsertCut(scratch,count,(1-projection)/projectionDelta);
+                }
+                ordered=scratch[..count];
+            }
+            else
+            {
+                LiteralEdgePartitions++;
+                var cuts = new List<double>(depthCuts);
+                if (projectionDelta != 0) { cuts.Add(-projection / projectionDelta); cuts.Add((1 - projection) / projectionDelta); }
+                ordered=cuts.Where(t => t >= 0 && t <= 1).Order().Distinct().ToArray();
+            }
             for (int i = 1; i < ordered.Length; i++)
             {
                 double lo = ordered[i - 1], hi = ordered[i], mid = (lo + hi) / 2;
@@ -76,7 +117,12 @@ internal sealed class VCarveNativeContainment
                 if (u >= 1) { dx -= ex; dy -= ey; }
                 else if (u > 0) { dx -= ex * projection; dy -= ey * projection; wx -= ex * projectionDelta; wy -= ey * projectionDelta; }
                 double height = 0; CarvingCutterSection section = profile.Sections[^1];
-                foreach (var s in profile.Sections) { section = s; if (da + db * mid <= height + s.Height) break; height += s.Height; }
+                if(prepareCuts)
+                {
+                    for(int s=0;s<profile.Sections.Count;s++)
+                    { section=profile.Sections[s];if(da+db*mid<=height+section.Height)break;height+=section.Height; }
+                }
+                else foreach (var s in profile.Sections) { section = s; if (da + db * mid <= height + s.Height) break; height += s.Height; }
                 double qa, qb, qc;
                 if (section.Kind == CarvingCutterSectionKind.Hemisphere)
                 {
@@ -95,6 +141,16 @@ internal sealed class VCarveNativeContainment
             }
             return minimum;
         }
-        return edgeIndex.QueryCutterSeparation(a,b,radius,EvaluateEdge);
+        return edgeIndex!.QueryCutterSeparation(a,b,radius,EvaluateEdge);
+    }
+    private static int InsertCut(Span<double> cuts,int count,double value)
+    {
+        if(!(value>=0&&value<=1))return count;
+        int at=0;while(at<count&&cuts[at]<value)at++;
+        // Existing depth cuts precede projection cuts in the literal stable
+        // sort, including the original +0 endpoint when a cut is -0.
+        if(at<count&&cuts[at]==value)return count;
+        cuts.Slice(at,count-at).CopyTo(cuts[(at+1)..]);cuts[at]=value;
+        return count+1;
     }
 }

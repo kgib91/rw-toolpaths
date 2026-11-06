@@ -96,6 +96,10 @@ public readonly record struct TaggedToolpath
 
     private readonly IReadOnlyList<ToolpathSpan>? _spans;
     internal bool DetectCurves { get; }
+    // A point-emitting owner can omit optional move fitting without granting
+    // source-detour or reduction eligibility formerly blocked by DetectCurves.
+    internal bool PreserveSourceTraversal { get; init; } = false;
+    internal bool RequiresSourcePreservation=>DetectCurves||PreserveSourceTraversal;
     /// <summary>Transient execution component, proved before depth scheduling.
     /// Source region, cut category and visit identity retain their own meanings.</summary>
     internal int? ContinuationComponentIndex { get; init; } = null;

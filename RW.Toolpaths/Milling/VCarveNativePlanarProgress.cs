@@ -6,6 +6,37 @@ namespace RW.Toolpaths.Milling;
 // a genuine source turn does not acquire a new monotonicity requirement.
 internal static class VCarveNativePlanarProgress
 {
+    // Fits are cached in a canonical direction and can later be consumed in
+    // either source direction. Near-constant projections retain their literal
+    // source origin in the final audit, so both occurrences must be admitted.
+    internal sealed class AdmissionContract
+    {
+        private readonly Contract forward,reverse;
+        internal AdmissionContract(Contract forward,Contract reverse){this.forward=forward;this.reverse=reverse;}
+        internal bool TrySelectHandles(Point3D start,Point3D end,Point3D u,Point3D v,ref double alpha,ref double beta)
+        {
+            if(!forward.TrySelectHandles(start,end,u,v,ref alpha,ref beta))return false;
+            return reverse.TrySelectHandles(end,start,VCarveNativeCurveMath.Mul(v,-1),VCarveNativeCurveMath.Mul(u,-1),ref beta,ref alpha);
+        }
+        internal bool Preserved(ToolMove move,out string reason)
+        {
+            if(!forward.Preserved(move,out reason))return false;
+            if(reverse.Preserved(VCarveNativeCurveMath.Reverse(move),out reason))return true;
+            reason="reversed-occurrence:"+reason;return false;
+        }
+    }
+
+    private sealed class ReversedRange(IReadOnlyList<Point3D> source,int first,int last):IReadOnlyList<Point3D>
+    {
+        public int Count=>last-first+1;
+        public Point3D this[int index]=>source[last-index];
+        public IEnumerator<Point3D> GetEnumerator(){for(int i=last;i>=first;i--)yield return source[i];}
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator()=>GetEnumerator();
+    }
+
+    internal static AdmissionContract CreateAdmission(IReadOnlyList<Point3D> source,int first,int last)
+        =>new(Create(source,first,last),Create(new ReversedRange(source,first,last),0,last-first));
+
     internal readonly record struct Projection(string Name,Point3D Direction,bool Constant,double Sign);
     internal sealed class Contract
     {

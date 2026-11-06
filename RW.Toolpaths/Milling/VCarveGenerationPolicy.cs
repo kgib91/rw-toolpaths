@@ -43,6 +43,10 @@ public sealed class VCarveGenerationPolicy
     public bool ArtworkFringeGoal { get; }
     public bool MaterialLayerGoal { get; }
     public bool ConditionedReferenceOpening { get; }
+    /// <summary>Captured plateau leaf grouping only; original integer strokes and physical reserves remain unchanged.</summary>
+    public int PlateauConstantOffsetLeafVertices { get; }
+    public string PlateauConstantOffsetCacheSignature => PlateauConstantOffsetLeafVertices==SmoothRoughingPlateau.LegacyConstantOffsetLeafVertices
+        ?string.Empty:$"|plateau-constant-offset-leaf-vertices-v1:{PlateauConstantOffsetLeafVertices}";
     internal int ExplicitInitialMask { get; }
     internal bool OriginalInitialRequested { get; }
     internal bool InvalidInitialRequest { get; }
@@ -54,6 +58,7 @@ public sealed class VCarveGenerationPolicy
 
     private VCarveGenerationPolicy()
     {
+        PlateauConstantOffsetLeafVertices=SmoothRoughingPlateau.CaptureConstantOffsetLeafVertices();
         foreach (var mode in GpuModes)
             if (Enabled(mode.Name)) GpuMask |= mode.Bit;
         FloorAwareRamps = Enabled("RW_TOOLPATHS_VCARVE_FLOOR_AWARE_RAMPS");
@@ -77,6 +82,13 @@ public sealed class VCarveGenerationPolicy
 
     public static VCarveGenerationPolicy Capture() => new();
 
+    /// <summary>Transfers this captured offset partition to a retained preparation request.</summary>
+    public VCarveOptions ApplyPlateauPolicy(VCarveOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return options with{PlateauConstantOffsetLeafVertices=PlateauConstantOffsetLeafVertices};
+    }
+
     /// <summary>Preserves existing active-policy signature bytes and ordering.</summary>
     public string CacheSignature(VCarveInitialStrategy? initialStrategy = null)
     {
@@ -98,6 +110,7 @@ public sealed class VCarveGenerationPolicy
         Append(initialStrategy?.SupplementalInitialBand ?? SupplementalInitialBand, "fullDepthSupplementalReach-v10");
         Append(TaperedSweeps, "taperedLowerSurfaceSweeps-v1");
         Append(BoxNeighborhoods, "componentBoxCorrectionNomination-v3");
+        signature.Append(PlateauConstantOffsetCacheSignature);
         return signature.ToString();
 
         void Append(bool enabled, string marker)

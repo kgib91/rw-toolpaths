@@ -5,11 +5,13 @@ namespace RW.Toolpaths.Milling;
 
 public sealed partial class VCarvePreparation
 {
+    internal static readonly AsyncLocal<bool?> RampWallProofOnlyEnabled=new();
     private VCarvePreparation RelimitOutsidePolicy(double angle, bool ramps, CancellationToken token)
     {
         var profile = VCarvePhysicalSweep.ProfileFor(_tool, _depth.Depth);
         var options = _options with { SmoothRampAngleDegrees = angle, RampOutsideEdges = ramps };
-        var regions = Regions.Select(region => {
+        var regions = Regions.Select(pending => {
+            var region=pending.Complete(token);
             var upper = region.OriginalMedialPaths.Select((path, index) => CopyDepths(path,
                 path.Points.Select((p, i) => p with { Z = -Math.Min(_depth.Depth,
                     profile.DepthAtRadius(region.SourceClearancePaths[index][i].Radius + GeometricErrorBound)) }).ToArray())).ToArray();
@@ -17,7 +19,7 @@ public sealed partial class VCarvePreparation
                 region.Boundary, options, profile, _depth.Depth, token);
             return region with { SmoothedMedialPaths = pair.Limited, UpperMedialPaths = pair.Upper };
         }).ToArray();
-        return new(OriginalRegions, _tool, _depth, options, regions);
+        return new(OriginalRegions, _tool, _depth, options, regions,outlines);
     }
 
     // This changes the analytical grade field only. The cached finishing
@@ -30,21 +32,34 @@ public sealed partial class VCarvePreparation
         var physical = VCarvePhysicalSweep.ProfileFor(_tool, _depth.Depth);
         double grade = Math.Tan(angle * Math.PI / 180);
         var updated = new List<PreparedRegion>(Regions.Count);
-        long lifted = 0, retainedEdges = 0,wallQueries=0,wallCacheHits=0,wallCacheResets=0,reusedRegions=0;
-        foreach (var region in Regions)
+        long lifted = 0, retainedEdges = 0,wallQueries=0,wallCacheHits=0,wallCacheResets=0,reusedRegions=0,
+            proofOnlyQueries=0,proofOnlyReuses=0,openClipOperations=0,reusedOriginalWalls=0;
+        foreach (var pending in Regions)
         {
             token.ThrowIfCancellationRequested();
-            var edges = access.RetainedRampEdges(VCarveToolpaths.BuildBoundary(OriginalRegions[region.RegionIndex], 0), token,out bool allRetained);
-            retainedEdges += edges.Count;
-            if(allRetained && _options.StockToLeave==0 && !_options.RampOutsideEdges
-                && angle==_options.SmoothRampAngleDegrees)
+            var boundary=VCarveToolpaths.BuildBoundary(OriginalRegions[pending.RegionIndex],0);
+            bool reusePolicy=_options.StockToLeave==0&&!_options.RampOutsideEdges&&angle==_options.SmoothRampAngleDegrees;
+            IReadOnlyList<(PointD A,PointD B)> edges;
+            if(reusePolicy&&RampWallProofOnlyEnabled.Value is not false)
             {
-                // Exact open clipping proved that this policy removes no
-                // original wall segment. Its source distances and grade field
-                // are already prepared; no million-point re-query is needed.
-                // The new scope below still owns its own access and witnesses.
-                updated.Add(region);reusedRegions++;continue;
+                proofOnlyQueries++;openClipOperations++;
+                if(access.RampWallsPreserved(boundary,token))
+                {
+                    updated.Add(pending);reusedRegions++;proofOnlyReuses++;
+                    reusedOriginalWalls+=boundary.Sum(r=>(long)r.Count);continue;
+                }
+                // A negative requires the original retained edges, but never
+                // repeats the complementary proof just computed above.
+                edges=access.RetainedRampEdges(boundary,token);openClipOperations++;
             }
+            else
+            {
+                edges=access.RetainedRampEdges(boundary,token,out bool allRetained);openClipOperations+=2;
+                if(allRetained&&reusePolicy)
+                {retainedEdges+=edges.Count;updated.Add(pending);reusedRegions++;continue;}
+            }
+            retainedEdges += edges.Count;
+            var region=pending.Complete(token);
             var distance = edges.Count == 0 ? null : new MedialAxisToolpaths.SpatialSegmentIndex(edges.ToList());
             double unbounded = physical.PhysicalRadiusAtDepth(_depth.Depth) + _depth.Depth / grade + 1;
             var wallDistances=new Dictionary<(double X,double Y),double>();
@@ -83,11 +98,12 @@ public sealed partial class VCarvePreparation
                 SmoothedMedialPaths = limited.Limited, UpperMedialPaths = limited.Upper });
         }
         var options = _options with { AccessTarget = access, RampOutsideEdges = false, SmoothRampAngleDegrees = angle };
-        Log(options, $"event=outside-ramp-anchors enabled=False liftedSourcePoints={lifted} retainedWallSegments={retainedEdges} "
+        Log(options, $"event=outside-ramp-anchors enabled=False liftedSourcePoints={lifted} materializedRetainedWallSegments={retainedEdges} reusedOriginalWallSegments={reusedOriginalWalls} "
             +$"wallQueries={wallQueries} wallCacheHits={wallCacheHits} wallCacheResets={wallCacheResets} wallCacheLimit=65536 exactXYKeys=True "
             +$"unchangedWallRegionsReused={reusedRegions} unchangedWallProof=exact-open-clipping "
+            +$"proofOnlyQueries={proofOnlyQueries} retainedClipOperationsSkipped={proofOnlyReuses} openClipOperations={openClipOperations} "
             + "originalGraphXYUnchanged=True finishingPermissionUnchanged=True physicalGuardsUnchanged=True");
-        return new(OriginalRegions, _tool, _depth, options, updated);
+        return new(OriginalRegions, _tool, _depth, options, updated,outlines);
     }
 
     internal static IReadOnlyList<TaggedToolpath> RampSources(IReadOnlyList<TaggedToolpath> source,

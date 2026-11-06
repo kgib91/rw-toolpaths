@@ -11,7 +11,11 @@ public sealed record VCarveClearedStock(
     IReadOnlyList<VCarveRoughingChord> Chords,
     IReadOnlyList<double> FloorDepths,
     IReadOnlyList<PointD> PartBoundary,
-    IReadOnlyList<VCarveClearedSweep>? ProfileSweeps = null);
+    IReadOnlyList<VCarveClearedSweep>? ProfileSweeps = null)
+{
+    [System.Text.Json.Serialization.JsonIgnore]
+    public VCarveFlatLayerPrefetch? FlatLayerPrefetch {get;init;}
+}
 
 /// <summary>Actual earlier posted motion of a complete monotone physical cutter,
 /// including rounded V-carvers that cannot supply a full tip-radius column.</summary>
@@ -32,6 +36,11 @@ internal sealed partial class VCarveMaterialSurface
     private readonly CancellationToken token;
     private readonly Action<string>? diagnostic;
     private readonly bool parallelMedialFits;
+    private readonly object nativeQueryDomain=new();
+    private long nativeQueryWorkersCreated;
+    internal const int NativeWorkerWarmEntries=65536;
+    internal sealed record NativeQueryStartup(long SweepProofs,long PoseProofs,long LayerPoses,long StockCellFacts,long StockCellBytes,long EstimatedBytes,
+        double Milliseconds,string Domain);
     private long sourcePoints, outputPoints, loweredPoints, chordChecks, subdivisions, retreats, refusedSources, shortRefusals, fittedRetreats;
     private double largestDescent;
     private long verticalSweepsReduced;
@@ -45,6 +54,33 @@ internal sealed partial class VCarveMaterialSurface
     private readonly Dictionary<Point3D, bool> layerPoseProofs = new();
     private readonly Queue<Point3D> layerPoseOrder = new();
     private long layerPoseCacheHits, layerPoseCacheMisses, layerPoseCacheEvictions;
+    internal static readonly AsyncLocal<int?> LayerChordCacheEntriesOverride=new();
+    private const int DefaultLayerChordCacheEntries=0;
+    private const int MaximumLayerChordCacheEntries=32768;
+    private readonly int layerChordCacheEntries;
+    private readonly Dictionary<LayerChordKey,bool>? layerChordProofs;
+    private readonly Queue<LayerChordKey>? layerChordOrder;
+    private long layerChordQueries,layerChordPositiveHits,layerChordNegativeHits,layerChordCoreRuns,
+        layerChordPositivePublications,layerChordNegativePublications,layerChordEvictions,layerChordUncacheable;
+    private long layerChordCoreElapsedTicks;
+    private readonly LayerChordSnapshot? sourceLayerChordSnapshot;
+    private readonly record struct LayerChordKey(long AX,long AY,long AZ,long BX,long BY,long BZ)
+    {
+        internal static LayerChordKey Capture(Point3D a,Point3D b)=>new(BitConverter.DoubleToInt64Bits(a.X),
+            BitConverter.DoubleToInt64Bits(a.Y),BitConverter.DoubleToInt64Bits(a.Z),BitConverter.DoubleToInt64Bits(b.X),
+            BitConverter.DoubleToInt64Bits(b.Y),BitConverter.DoubleToInt64Bits(b.Z));
+    }
+    private readonly record struct LayerChordSnapshot(long Queries,long PositiveHits,long NegativeHits,long CoreRuns,
+        long PositivePublications,long NegativePublications,long Evictions,long Uncacheable,long CoreElapsedTicks,int Entries,int Limit)
+    {
+        internal string Describe(string p)=>$"{p}Queries={Queries} {p}PositiveHits={PositiveHits} {p}NegativeHits={NegativeHits} {p}CoreRuns={CoreRuns} "
+            +$"{p}PositivePublications={PositivePublications} {p}NegativePublications={NegativePublications} {p}Evictions={Evictions} {p}Uncacheable={Uncacheable} "
+            +$"{p}Entries={Entries} {p}MaximumEntries={Limit} {p}MaximumEstimatedBytes={(Limit==0?0:1024L+256L*Limit)} "
+            +$"{p}CoreElapsedMs={CoreElapsedTicks*1000d/Stopwatch.Frequency:F3} {p}CoreElapsedScope=summed-invocation-elapsed-not-CPU-or-wall";
+    }
+    private LayerChordSnapshot CaptureLayerChordSnapshot()=>new(layerChordQueries,layerChordPositiveHits,layerChordNegativeHits,
+        layerChordCoreRuns,layerChordPositivePublications,layerChordNegativePublications,layerChordEvictions,layerChordUncacheable,
+        layerChordCoreElapsedTicks,layerChordProofs?.Count??0,layerChordCacheEntries);
     private const int LegalPoseCacheLimit=131072;
     private readonly Dictionary<(double X,double Y),double> deepestLegalPoses=new();
     private readonly Queue<(double X,double Y)> legalPoseOrder=new();
@@ -60,67 +96,54 @@ internal sealed partial class VCarveMaterialSurface
         double surface, CancellationToken token, Action<string>? diagnostic,
         bool parallelMedialFits = true)
     {
+        layerChordCacheEntries=LayerChordCacheEntriesOverride.Value??DefaultLayerChordCacheEntries;
+        if(layerChordCacheEntries<0||layerChordCacheEntries>MaximumLayerChordCacheEntries)
+            throw new ArgumentOutOfRangeException(nameof(LayerChordCacheEntriesOverride));
+        if(layerChordCacheEntries>0){layerChordProofs=new();layerChordOrder=new();}
         this.parallelMedialFits = parallelMedialFits;
         this.profile = profile; this.maximumDepth = maximumDepth; this.surface = surface;
         this.token = token; this.diagnostic = diagnostic;
         long started = Stopwatch.GetTimestamp();
+        long constructionStageStarted=started;
+        void ConstructionStage(string stage,int layer=-1)
+        {
+            diagnostic?.Invoke($"stage=material-surface event=construction-stage work={stage} layer={layer} elapsedMs={Stopwatch.GetElapsedTime(constructionStageStarted).TotalMilliseconds:F3} exclusive=True");
+            constructionStageStarted=Stopwatch.GetTimestamp();
+        }
         var original = Clipper.Union(PathUtils.ToClipper(target), FillRule.NonZero);
         originalTarget = new PreparedRegionDistance(PathUtils.FromClipper(original));
+        ConstructionStage("target-union-and-index");
         VCarveNativeStockTrace.Observer.Value?.Invoke(new(PathUtils.FromClipper(original),stock,profile,maximumDepth,surface));
         if (stock.PartBoundary.Count < 3 || stock.PartBoundary.Any(p => !double.IsFinite(p.x + p.y)))
             throw new ArgumentException("Cleared V-carve stock requires a finite physical Part boundary.", nameof(stock));
         var part = PathUtils.ToClipper(new[] { stock.PartBoundary });
-        bool Posted(Point3D p) => double.IsFinite(p.X + p.Y + p.Z)
-            && Math.Abs(p.X) <= 10000 && Math.Abs(p.Y) <= 10000 && Math.Abs(p.Z) <= 100
-            && p.X == Math.Round(p.X * 1000) / 1000d && p.Y == Math.Round(p.Y * 1000) / 1000d
-            && p.Z == Math.Round(p.Z * 1000) / 1000d;
-        var executed = stock.Chords.Where(c => Posted(c.A) && Posted(c.B)
-            && c.ClearedColumnRadius > 0 && double.IsFinite(c.ClearedColumnRadius)).ToArray();
+        var executed = AdmittedPostedColumns(stock.Chords);
+        ConstructionStage("part-and-posted-column-admission");
         projectedStock = new(executed, PathUtils.FromClipper(original), stock.PartBoundary,
             profile, maximumDepth, token, stock.ProfileSweeps,diagnostic);
+        ConstructionStage("projected-stock-index");
         diagnostic?.Invoke($"stage=material-surface event=continuous-index flatChords={executed.Length} "
             +$"profileChords={projectedStock.ProfileChords} indexedChords={projectedStock.IndexedChords} "
             +"compaction=literal-F3-directed-collinearity-and-same-trace-depth-dominance unionGeometryPreserved=True");
         // Coalescing shallow slices into a deeper one is conservative: fewer
         // executed columns qualify. Keep work bounded for long operation lists.
-        double[] floors = stock.FloorDepths.Where(double.IsFinite)
-            .Select(d => Math.Min(maximumDepth, Math.Floor(d * 1000 + 1e-7) / 1000))
-            .Where(d => d > 0).Append(maximumDepth).Distinct().Order().TakeLast(8).ToArray();
-        double top = 0;
-        foreach (double floor in floors)
+        double[] floors = FlatFloorSchedule(stock.FloorDepths,maximumDepth);
+        ConstructionStage("floor-schedule");
+        var preparedFlatLayers=stock.FlatLayerPrefetch?.Take(executed,original,stock.PartBoundary,stock.FloorDepths,maximumDepth,token);
+        ConstructionStage("flat-layer-prefetch-selection");
+        foreach (var geometry in (IEnumerable<FlatLayerGeometry>?)preparedFlatLayers??BuildFlatLayerGeometry(original,part,executed,floors,token,ConstructionStage))
         {
             token.ThrowIfCancellationRequested();
-            var swept = new Paths64();
-            int credited = 0;
-            foreach (var group in executed.Where(c => Math.Max(c.A.Z, c.B.Z) <= -floor + 1e-9)
-                .GroupBy(c => c.ClearedColumnRadius))
-            {
-                var columns = group.ToArray();
-                credited += columns.Length;
-                var segments = columns.Select(c => new PocketPostedChordChains.Segment(
-                    new((long)Math.Round(c.A.X * 1000), (long)Math.Round(c.A.Y * 1000)),
-                    new((long)Math.Round(c.B.X * 1000), (long)Math.Round(c.B.Y * 1000)))).ToArray();
-                var chains = PocketPostedChordChains.Build(segments, token);
-                var paths = new Paths64(chains.Paths.Select(path => new Path64(path.Select(p =>
-                    new Point64((long)Math.Round(p.X / 1000d * PathUtils.Scale),
-                        (long)Math.Round(p.Y / 1000d * PathUtils.Scale))))));
-                paths.AddRange(columns.Where(c => c.A.X == c.B.X && c.A.Y == c.B.Y)
-                    .Select(c => new Path64 { new((long)Math.Round(c.A.X * PathUtils.Scale),
-                        (long)Math.Round(c.A.Y * PathUtils.Scale)) }));
-                if (paths.Count > 0)
-                    swept.AddRange(PostedSweepInnerRegion.BuildPaths(paths, group.Key, token));
-            }
-            swept = Clipper.Intersect(Clipper.Union(swept, FillRule.NonZero), part, FillRule.NonZero);
-            var free = Clipper.Intersect(Clipper.Union(new Paths64(original.Concat(swept)), FillRule.NonZero), part, FillRule.NonZero);
+            var swept=geometry.Swept;var free=geometry.Free;double top=geometry.Top,floor=geometry.Floor;int credited=geometry.Credited;
             var rings = PathUtils.FromClipper(free).Select(r => (IReadOnlyList<PointD>)r).ToList();
             var edges = rings.SelectMany(ring => Enumerable.Range(0, ring.Count)
                 .Select(i => (ring[i], ring[(i + 1) % ring.Count]))).ToList();
             layers.Add(new(top, new PreparedRegionDistance(rings), new PreparedRegionDistance(PathUtils.FromClipper(swept)),
                 new MedialAxisToolpaths.SpatialSegmentIndex(edges), rings));
+            ConstructionStage("layer-query-indices",layers.Count-1);
             diagnostic?.Invoke($"stage=material-surface layerTopDepth={top:R} layerBottomDepth={floor:R} "
                 + $"postedColumnChords={credited} boundaryEdges={edges.Count} "
                 + "targetBranchesUnchanged=True credit=entire-executed-column platformClipped=True");
-            top = floor;
         }
         diagnostic?.Invoke($"stage=material-surface event=prepared layers={layers.Count} "
             + $"elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
@@ -130,6 +153,11 @@ internal sealed partial class VCarveMaterialSurface
 
     private VCarveMaterialSurface(VCarveMaterialSurface source)
     {
+        layerChordCacheEntries=source.layerChordCacheEntries;
+        if(layerChordCacheEntries>0){layerChordProofs=new();layerChordOrder=new();}
+        // Startup snapshot only: never retain/query the source's mutable owner.
+        // Private workers start with empty helper caches and share no refusals.
+        sourceLayerChordSnapshot=source.CaptureLayerChordSnapshot();
         layers = source.layers.Select(layer => layer with {
             Distance = layer.Distance.CreateQueryWorker(),
             ClearedDistance = layer.ClearedDistance.CreateQueryWorker() }).ToList();
@@ -141,14 +169,72 @@ internal sealed partial class VCarveMaterialSurface
         // Apply publishes/qualifies sources after every fitting worker has joined.
         // This dictionary is read-only for the complete parallel query interval.
         qualifiedSources = source.qualifiedSources;
+        nativeQueryDomain=source.nativeQueryDomain;
         diagnostic = null; parallelMedialFits=false;
+    }
+
+    // This must run on the caller, before any worker queries begin. Only exact
+    // same-domain positive certificates and fixed-grid actual-stock facts are
+    // copied. Query stacks, depth hints and refusals remain private and empty.
+    internal VCarveMaterialSurface CreateNativeQueryWorker(out NativeQueryStartup startup)
+    {
+        token.ThrowIfCancellationRequested();long started=Stopwatch.GetTimestamp();
+        var worker=new VCarveMaterialSurface(this);
+        long stockFacts=worker.projectedStock.ImportStockCellFacts(projectedStock);
+        long sweeps=worker.projectedStock.ImportPositiveProofs(projectedStock,NativeWorkerWarmEntries),poses=0,layerPoses=0;
+        foreach(var (key,z) in deepestLegalPoses.Take(NativeWorkerWarmEntries))
+        {
+            token.ThrowIfCancellationRequested();worker.deepestLegalPoses.Add(key,z);worker.legalPoseOrder.Enqueue(key);poses++;
+        }
+        foreach(var (pose,proved) in layerPoseProofs.Take(NativeWorkerWarmEntries))
+        {
+            token.ThrowIfCancellationRequested();if(!proved)continue;
+            worker.layerPoseProofs.Add(pose,true);worker.layerPoseOrder.Enqueue(pose);layerPoses++;
+        }
+        long stockBytes=stockFacts*96; // Includes Dictionary/FIFO capacity and entry overhead.
+        long bytes=256+sweeps*160+poses*80+layerPoses*64+stockBytes;
+        string domain=$"stock-surface-{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(nativeQueryDomain):X8}";
+        startup=new(sweeps,poses,layerPoses,stockFacts,stockBytes,bytes,Stopwatch.GetElapsedTime(started).TotalMilliseconds,domain);
+        diagnostic?.Invoke($"stage=material-surface event=native-query-worker-created worker={++nativeQueryWorkersCreated} "
+            +$"domain={domain} importedPositiveSweepProofs={sweeps} importedPositivePoseProofs={poses} importedPositiveLayerPoses={layerPoses} "
+            +$"importedStockCellFacts={stockFacts} sourceStockCellFacts={projectedStock.CachedStockCellFacts} estimatedImportedStockCellBytes={stockBytes} "
+            +$"estimatedImportedProofBytes={bytes} warmEntriesPerCache={NativeWorkerWarmEntries} startupMs={startup.Milliseconds:F3} "
+            +"sourceOwnerQuiescentRequired=True immutableIndexAndQualifiedSourcesShared=True privateQueryHints=True "
+            +"importedRefusals=0 importedDepthHints=0 importedQueryStackCells=0 stockCellValuesAndNaNsCopiedExactly=True genericCurveBooleanCache=False fullPhysicalProofsUnchanged=True");
+        token.ThrowIfCancellationRequested();return worker;
     }
 
     internal double AllowedDepth(double x, double y)
         => AllowedDepth(x, y, clearedOnly: false);
 
+    // Read only by the existing native-worker receipt after worker queries and
+    // ordered final-visit audits finish. Snapshot scalar lifetime work, including
+    // worker zero's serial final audits; never query or expose mutable caches.
+    internal string ProfileDepthDiagnostics=>projectedStock.ProfileDepthDiagnostics+NativeContainmentDiagnostics()
+        +$" stockCachedSweepQueries={projectedStock.Queries} stockCachedSweepQueryScope=cached-path-only stockCachedSweepQueriesExcludeNativeEnvelope=True"
+        +$" stockProofCells={projectedStock.Cells} stockProofRefusals={projectedStock.Refusals} stockSweepCacheHits={projectedStock.CacheHits} stockSweepCacheEvictions={projectedStock.SweepProofCacheEvictions}"
+        +$" stockColumnQueries={projectedStock.ColumnQueries} stockColumnTests={projectedStock.ColumnTests} stockColumnNodeVisits={projectedStock.ColumnNodeVisits}"
+        +$" stockProfileCandidatesPruned={projectedStock.ProfileCandidatesPruned} stockProfileNodesPruned={projectedStock.ProfileNodesPruned}"
+        +$" stockCellCacheHits={projectedStock.StockCellCacheHits} stockCellCacheMisses={projectedStock.StockCellCacheMisses} stockCellCacheEvictions={projectedStock.StockCellCacheEvictions}"
+        +$" cellGeometryCacheHits={projectedStock.CellGeometryCacheHits} cellGeometryCacheMisses={projectedStock.CellGeometryCacheMisses} {projectedStock.CellFactStoreDiagnostics}"
+        +$" refusalWitnessTrials={projectedStock.RefusalWitnessTrials} refusalWitnessHits={projectedStock.RefusalWitnessHits} refusalWitnessPublications={projectedStock.RefusalWitnessPublications}"
+        +$" stockPriorPoseSeedTrials={projectedStock.PriorPoseSeedTrials} stockPriorPoseSeedPositive={projectedStock.PriorPoseSeedPositive} stockSeededCellTrials={projectedStock.SeededCellTrials} stockSeededCellProofs={projectedStock.SeededCellProofs}"
+        +$" raisedPoseProofHits={raisedPoseProofHits} raisedSourceProofs={raisedSourceProofs} layerPoseCacheHits={layerPoseCacheHits} layerPoseCacheMisses={layerPoseCacheMisses} layerPoseCacheEvictions={layerPoseCacheEvictions}"
+        +$" {CaptureLayerChordSnapshot().Describe("layerChord")} layerChordScope=owner-local-pure-helper falseHitStillRunsOriginalStockFallback=True"
+        +(sourceLayerChordSnapshot is {} source?$" {source.Describe("sourceLayerChord")} sourceLayerChordScope=quiescent-startup-snapshot-repeated-per-worker-not-additive":"")
+        +" stockCounterScope=private-owner-lifetime-through-completed-final-audits scalarSnapshotOnly=True stockQueryOrCacheMutation=False";
+
+    private long allowedDepthRefinedMemoHits,allowedDepthLayerQueriesSaved;
+
     private double AllowedDepth(double x, double y, bool clearedOnly)
     {
+        token.ThrowIfCancellationRequested();
+        // These layers/profile are immutable. RefineDepth only caches a low
+        // initialized to this exact point's layer bound and subsequently raised.
+        // Its old cache-hit return is therefore this same cached low, without
+        // any stock query or hint update. Skip only the redundant pure geometry.
+        if(projectedStock.TryGetRefinedDepth(x,y,clearedOnly,out double cached))
+        {allowedDepthRefinedMemoHits++;allowedDepthLayerQueriesSaved+=layers.Count;return cached;}
         double result = maximumDepth, unreserved = maximumDepth;
         PreparedRegionDistance? limiting = null;
         double limitingClearance = 0;
@@ -223,6 +309,18 @@ internal sealed partial class VCarveMaterialSurface
         if(!Legal(a,b,postingReserve)){nativeChordRefusals++;return false;}
         return true;
     }
+
+    internal void ReportClearanceAttachment(Action<string>? report,bool reusedAuthority)
+        =>report?.Invoke($"stage=material-surface event=clearance-attached reusedAuthority={reusedAuthority} "
+            +$"{projectedStock.ProfileDepthDiagnostics} "
+            +$"allowedDepthRefinedMemoHits={allowedDepthRefinedMemoHits} allowedDepthLayerQueriesSaved={allowedDepthLayerQueriesSaved} "
+            +$"layers={layers.Count} previousChordChecks={chordChecks} cachedLegalPoses={deepestLegalPoses.Count} "
+            +$"cachedLayerPoses={layerPoseProofs.Count} cachedSweepProofs={projectedStock.CachedSweepProofs} "
+            +$"previousStockProofQueries={projectedStock.Queries} previousStockProofCells={projectedStock.Cells} "
+            +$"stockColumnQueries={projectedStock.ColumnQueries} stockColumnTests={projectedStock.ColumnTests} stockColumnNodeVisits={projectedStock.ColumnNodeVisits} "
+            +$"stockSpatialDepthTieTrials={projectedStock.SpatialDepthTieTrials} stockSpatialDepthTieReorders={projectedStock.SpatialDepthTieReorders} "
+            +$"{projectedStock.CellFactStoreDiagnostics} "
+            +"immutableStockAndTarget=True fullNativeAndPostedGuards=True");
 
     private bool Legal(Point3D a, Point3D b, bool postingReserve = true)
     {
@@ -310,7 +408,33 @@ internal sealed partial class VCarveMaterialSurface
 
     private bool LayerLegal(Point3D a, Point3D b)
     {
-        if (a != b) return LayerLegalCore(a, b);
+        if (a != b)
+        {
+            layerChordQueries++;
+            bool finite=double.IsFinite(a.X)&&double.IsFinite(a.Y)&&double.IsFinite(a.Z)
+                &&double.IsFinite(b.X)&&double.IsFinite(b.Y)&&double.IsFinite(b.Z);
+            if(layerChordCacheEntries==0||!finite)
+            {layerChordUncacheable++;return RunLayerChordCore(a,b);}
+            token.ThrowIfCancellationRequested();var key=LayerChordKey.Capture(a,b);
+            if(layerChordProofs!.TryGetValue(key,out bool chordCached))
+            {
+                if(chordCached)layerChordPositiveHits++;else layerChordNegativeHits++;
+                return chordCached;
+            }
+            bool chordResult=RunLayerChordCore(a,b);
+            token.ThrowIfCancellationRequested();
+            // A short violation owns the original witness counter/diagnostic
+            // callback. Keep every such negative call literal. Other misses
+            // depend only on fixed geometry/profile and local finite arithmetic;
+            // no stock grid, refinement hint or query budget participates here.
+            if(!chordResult&&Math.Pow(a.X-b.X,2)+Math.Pow(a.Y-b.Y,2)<1e-8)
+            {layerChordUncacheable++;return false;}
+            if(layerChordProofs.Count==layerChordCacheEntries)
+            {layerChordProofs.Remove(layerChordOrder!.Dequeue());layerChordEvictions++;}
+            layerChordProofs.Add(key,chordResult);layerChordOrder!.Enqueue(key);
+            if(chordResult)layerChordPositivePublications++;else layerChordNegativePublications++;
+            return chordResult;
+        }
         if (layerPoseProofs.TryGetValue(a, out bool cached))
         {
             layerPoseCacheHits++;
@@ -326,6 +450,13 @@ internal sealed partial class VCarveMaterialSurface
         layerPoseProofs.Add(a, result);
         layerPoseOrder.Enqueue(a);
         return result;
+    }
+
+    private bool RunLayerChordCore(Point3D a,Point3D b)
+    {
+        layerChordCoreRuns++;long started=Stopwatch.GetTimestamp();
+        try{return LayerLegalCore(a,b);}
+        finally{layerChordCoreElapsedTicks+=Stopwatch.GetTimestamp()-started;}
     }
 
     private bool LayerLegalCore(Point3D a, Point3D b)

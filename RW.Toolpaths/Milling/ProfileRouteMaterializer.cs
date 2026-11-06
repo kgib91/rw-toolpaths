@@ -51,6 +51,7 @@ internal static class ProfileRouteMaterializer
         int emittedPointCount = 0;
         int linkLifts = 0;
         int plunges = 0, linearRamps = 0, helicals = 0;
+        long curveNominationTicks=0;int curveNominationCalls=0;
         var depthFirst = new DepthFirstState
         {
             TravelClearance = options.LinkClearance ?? BuildLinkClearance(rings, options.Side),
@@ -105,13 +106,16 @@ internal static class ProfileRouteMaterializer
                     cutLength += CutLength(path.Points, path.Spans);
                     emittedPointCount += path.Points.Count;
                     int visitIdentity = checked(visit * rings.Count + path.RingIndex);
+                    long nominationStarted=options.DetectCurves?System.Diagnostics.Stopwatch.GetTimestamp():0;
                     toolpaths.Add(new TaggedToolpath(
                         path.Points,
                         path.Spans,
                         rings[path.RingIndex].RegionIndex,
                         ProfileToolpaths.Category,
                         path.PassIndex,
-                        visitIdentity));
+                        visitIdentity,detectCurves:options.DetectCurves){PreserveSourceTraversal=true});
+                    if(options.DetectCurves)
+                    {curveNominationTicks+=System.Diagnostics.Stopwatch.GetTimestamp()-nominationStarted;curveNominationCalls++;}
                 }
             }
         }
@@ -196,6 +200,9 @@ internal static class ProfileRouteMaterializer
             $"linkRejectedClearance={depthFirst.LinksRejectedByClearance} " +
             $"linkDistanceRange={FormatDistanceRange(depthFirst)} " +
             $"cut={cutLength:F3} linkXY={linkLength:F3}");
+        Console.WriteLine($"[ProfileToolpaths.CurveNomination] enabled={options.DetectCurves} calls={curveNominationCalls} "
+            +$"paths={toolpaths.Count} sourcePoints={emittedPointCount} elapsedMs={1000d*curveNominationTicks/System.Diagnostics.Stopwatch.Frequency:F3} "
+            +"scope=tagged-path-move-nomination originalPointsSpansAndRouting=True pointEmissionSource=retained-points");
         return new ToolpathPlan(toolpaths, sweptArea, diagnostics);
     }
 

@@ -3,6 +3,13 @@ namespace RW.Toolpaths.Milling;
 internal sealed partial class VCarveMaterialSurface
 {
     private VCarveNativeContainment[]? nativeLayerGuards;
+    private string NativeContainmentDiagnostics()
+    {
+        long chords=0,edges=0,literal=0;
+        if(nativeLayerGuards is not null)foreach(var guard in nativeLayerGuards)
+        {chords+=guard.PreparedChordQueries;edges+=guard.PreparedEdgePartitions;literal+=guard.LiteralEdgePartitions;}
+        return $" containmentPreparedChords={chords} containmentPreparedEdgePartitions={edges} containmentLiteralEdgePartitions={literal} containmentMaximumScratchCuts=64";
+    }
     private bool LayerCurveLegal(ToolMove move)
     {
         // Each immutable FreeRegion is already an inner proof of prior posted

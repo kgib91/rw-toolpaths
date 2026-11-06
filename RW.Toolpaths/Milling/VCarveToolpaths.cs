@@ -116,6 +116,27 @@ public sealed record VCarveOptions
     /// <summary>Actual preceding flat-tip sweeps for physical stock queries.
     /// They bound optional rest-fill exclusion without splitting source rings.</summary>
     public IReadOnlyList<VCarveRoughingChord> RoughingRestChords { get; init; } = Array.Empty<VCarveRoughingChord>();
+    private IReadOnlyList<VCarveRoughingChord>? ownedRouteRoughingWrapper;
+    private VCarveRoughingChord[]? ownedRouteRoughingValues;
+    internal VCarveRoughingChord[]? OwnedRouteRoughingValues=>ownedRouteRoughingWrapper is not null
+        &&ReferenceEquals(ownedRouteRoughingWrapper,RoughingRestChords)?ownedRouteRoughingValues:null;
+
+    /// <summary>Explicitly captures immutable earlier-cut values for bounded
+    /// request-local continuation preparation. Call only after the owner's
+    /// prior-stock inventory is final. Generic options retain literal behavior.
+    /// Replacing RoughingRestChords on a record copy invalidates this capability.</summary>
+    public VCarveOptions WithOwnedRoughingPreparation(CancellationToken token=default)
+    {
+        token.ThrowIfCancellationRequested();
+        if(OwnedRouteRoughingValues is not null)return this;
+        if(VCarveContinuationAdapter.RoughingPreparation.EstimateRetainedBytes(RoughingRestChords.Count)
+            >VCarveContinuationAdapter.RoughingPreparation.MaximumBytes)return this;
+        var values=new VCarveRoughingChord[RoughingRestChords.Count];
+        for(int i=0;i<values.Length;i++)
+        {if((i&1023)==0)token.ThrowIfCancellationRequested();values[i]=RoughingRestChords[i];}
+        token.ThrowIfCancellationRequested();var wrapper=Array.AsReadOnly(values);
+        return this with{RoughingRestChords=wrapper,ownedRouteRoughingWrapper=wrapper,ownedRouteRoughingValues=values};
+    }
     /// <summary>Height-dependent actual prior material removal for ordinary finishing.
     /// StartingDepth remains an entry/pass floor; it is not a global geometry shift.</summary>
     public VCarveClearedStock? ClearedStock { get; init; }
@@ -154,6 +175,15 @@ public sealed record VCarveOptions
     /// One retains geometric distance ordering when machine rates are unknown.</summary>
     public double ClearedTravelCostRatio {get;init;}=1;
 
+    /// <summary>Transient host budget for closest contour seam alternatives.
+    /// Every retained candidate still requires the original physical and cost proofs.</summary>
+    public int MaximumContourSeamCandidates {get;init;}=48;
+
+    /// <summary>Transient total budget for normal completed-contour return nominations
+    /// per ready visit. Zero retains independent entry; every accepted return still
+    /// requires the original physical and cost proofs.</summary>
+    public int MaximumContourReturnCandidates {get;init;}=int.MaxValue;
+
     /// <summary>
     /// Experimental opt-in for avoiding optional terminal rays dominated by a
     /// protected mandatory visit. Final stock equivalence remains unverified:
@@ -175,6 +205,8 @@ public sealed record VCarveOptions
 
     /// <summary>Transient captured initial-generation policy; no document setting or physical proof authority.</summary>
     public VCarveInitialStrategy? InitialStrategy { get; init; }
+    // Preserve a preparation's captured diagnostic grouping across derived scopes.
+    internal int? PlateauConstantOffsetLeafVertices { get; init; }
 
     /// <summary>Fresh-stock areas deliberately preserved by a coordinated preceding rougher.</summary>
     public VCarveRoughingAnalysis? RoughingAnalysis { get; init; }
@@ -304,6 +336,10 @@ public static class VCarveToolpaths
         if (!double.IsFinite(options.RoughingRestWidth) || options.RoughingRestWidth < 0
             || options.RoughingRestWidth > 0 && !options.SmoothVCarving)
             throw new ArgumentOutOfRangeException(nameof(options), "Roughing rest reach requires smooth V-carving and a finite nonnegative width.");
+        if(options.MaximumContourSeamCandidates is <1 or >48)
+            throw new ArgumentOutOfRangeException(nameof(options),"Contour seam candidate budget must be between 1 and 48.");
+        if(options.MaximumContourReturnCandidates<0)
+            throw new ArgumentOutOfRangeException(nameof(options),"Contour return candidate budget must be nonnegative.");
         if (!double.IsFinite(options.ProtectedClearingMargin) || options.ProtectedClearingMargin < 0)
             throw new ArgumentOutOfRangeException(nameof(options), "Protected clearing margin must be finite and nonnegative.");
         if (options.Preparation is { } preparation && !preparation.Matches(regions, tool, depth, options))
@@ -340,6 +376,8 @@ public static class VCarveToolpaths
             $"startingDepth={depth.StartDepth:R} startingFloorZ={depth.SurfaceZ - depth.StartDepth:R} " +
             $"skipDepthPasses={depth.SkipDepthPasses} rampAngle={options.Ramp.AngleRadians:R} " +
             $"tolerance={options.Tolerance:R} stepOver={options.StepOver:R} " +
+            $"maximumContourSeamCandidates={options.MaximumContourSeamCandidates} " +
+            $"maximumContourReturnCandidates={options.MaximumContourReturnCandidates} " +
             $"physicalProfile={tool.VCarveProfile is not null} roundedTip={tool.VCarveProfile?.RoundedTip} " +
             $"noseDiameter={tool.VCarveProfile?.ClearingDiameter:R}");
 
@@ -602,6 +640,8 @@ public static class VCarveToolpaths
                 }
 
                 Func<Point3D, Point3D, bool>? continuationGuard = null;
+                Func<VCarveSmoothing.ContinuationProofWorker?>? continuationWorkerFactory=null;
+                Func<Point3D,Point3D,bool>? continuationWorkerPrefix=null;
                 Func<IReadOnlyList<TaggedToolpath>,List<TaggedToolpath>>? clippedPathProtection=null;
                 if (materialSurface is not null)
                 {
@@ -620,7 +660,8 @@ public static class VCarveToolpaths
                             .5 + .45 * fraction, description, indeterminate), preparedRegion,
                         captureContinuationGuard: guard => continuationGuard = guard,
                         captureClippedPathProtection: protect=>clippedPathProtection=protect,
-                        sourceRegionIndex: regionIndex);
+                        sourceRegionIndex: regionIndex,
+                        captureContinuationWorkerFactory:factory=>continuationWorkerFactory=factory);
 
                 if(options.AccessTarget is { } centreAccess)
                 {
@@ -630,8 +671,8 @@ public static class VCarveToolpaths
                     if(options.SmoothVCarving)
                     {
                         var inserted=new List<int>();
-                        generated=centreAccess.Trim(generated,VCarvePhysicalSweep.ProfileFor(tool,maximumDepth).PhysicalRadiusAtDepth,
-                            cancellationToken,retainContactingChords:clippedPathProtection is not null,interpolatedFragments:inserted);
+                        generated=centreAccess.TrimOwnedPhysicalProfile(generated,VCarvePhysicalSweep.ProfileFor(tool,maximumDepth),
+                            cancellationToken,retainContactingChords:clippedPathProtection is not null,interpolatedFragments:inserted,diagnostic:Trace);
                         if(inserted.Count>0&&clippedPathProtection is not null)
                         {
                             var before=inserted.Select(i=>generated[i]).ToArray();
@@ -645,7 +686,10 @@ public static class VCarveToolpaths
                         }
                     }
                     if(continuationGuard is { } physicalContinuation)
+                    {
                         continuationGuard=(a,b)=>centreAccess.CentreChord(a,b) && physicalContinuation(a,b);
+                        continuationWorkerPrefix=centreAccess.CentreChord;
+                    }
                 }
 
                 if (options.SmoothVCarving || freshStock)
@@ -664,27 +708,12 @@ public static class VCarveToolpaths
                         // duplication can exhaust the fixed vertex inventory.
                         // Every replacement passes the SAME native/F3 floor,
                         // artwork/channel and grade proof used by connectors.
-                        long compactStarted=Stopwatch.GetTimestamp();
-                        long beforePoints=generated.Sum(p=>(long)p.Points.Count),proposals=0,refusals=0;
-                        bool AcceptSurfaceChord(Point3D a,Point3D b)
-                        {
-                            proposals++;
-                            bool accepted=continuationGuard(a,b);
-                            if(!accepted)refusals++;
-                            return accepted;
-                        }
                         // A small tip displacement at shallow rounded engagement
                         // can erase a much wider contact disc. Keep the original
                         // medial trace; floor/wall legality alone does not prove
                         // that its removal survives an approximation.
-                        generated=generated.Select(path=>path.Category == "final-carve" ? path
-                            : SurfaceToolpathSimplifier.Simplify(path,
-                                options.OutputChordToleranceMm,cancellationToken,AcceptSurfaceChord)).ToList();
-                        Trace($"stage=surface-simplification event=protected-sources paths={generated.Count} "
-                            +$"sourcePoints={beforePoints} retainedPoints={generated.Sum(p=>(long)p.Points.Count)} "
-                            +$"chordBoundMm={options.OutputChordToleranceMm:R} proposals={proposals} refusedChords={refusals} medialTracePreserved=True "
-                            +$"elapsedMs={Stopwatch.GetElapsedTime(compactStarted).TotalMilliseconds:F1} "
-                            +"sameNativeAndPostedFloorWallGradeRequired=True sourceTopologyRetained=True motionKindsPreserved=True");
+                        generated=SimplifySurfacePaths(generated,options.OutputChordToleranceMm,cancellationToken,
+                            continuationGuard,continuationWorkerFactory,Trace,privateWorkerPrefix:continuationWorkerPrefix);
                         MillingGeometryTrace.Capture("stock-selected",0,generated);
                         generated=ToolpathSourceTraversal.Detours(generated,cancellationToken,Trace,continuationGuard,
                             Math.Tan(options.SmoothRampAngleDegrees*Math.PI/180));
@@ -696,7 +725,8 @@ public static class VCarveToolpaths
                         IReadOnlyList<ToolpathContinuationComponents.Edge>? ringPortals=null;
                         if(radial>0&&continuationGuard is not null)
                             generated=ToolpathSourceTraversal.RingPortals(generated,radial,p=>p with{Z=Math.Max(p.Z,-firstStep)},
-                                continuationGuard,cancellationToken,Trace,options.SmoothVCarving?portals=>ringPortals=portals:null);
+                                continuationGuard,cancellationToken,Trace,options.SmoothVCarving?portals=>ringPortals=portals:null,
+                                continuationWorkerFactory,continuationWorkerPrefix);
                         if(radial>0 && continuationGuard is not null)
                             generated=ToolpathSourceTraversal.Components(generated,p=>p with{Z=Math.Max(p.Z,-firstStep)},
                                 continuationGuard,Math.Sqrt(radial*radial+firstStep*firstStep),cancellationToken,Trace,
@@ -1203,6 +1233,78 @@ public static class VCarveToolpaths
         double errorZ = middle.Z - closestZ;
         double tolerance = 1e-8 * Math.Max(1.0, Math.Sqrt(lengthSquared));
         return errorX * errorX + errorY * errorY + errorZ * errorZ <= tolerance * tolerance;
+    }
+
+    internal static List<TaggedToolpath> SimplifySurfacePaths(IReadOnlyList<TaggedToolpath> paths,double tolerance,
+        CancellationToken token,Func<Point3D,Point3D,bool> accept,
+        Func<VCarveSmoothing.ContinuationProofWorker?>? workerFactory,Action<string>? diagnostic=null,
+        int? maximumWorkers=null,Func<Point3D,Point3D,bool>? privateWorkerPrefix=null)
+    {
+        token.ThrowIfCancellationRequested();long started=Stopwatch.GetTimestamp();
+        long before=paths.Sum(p=>(long)p.Points.Count),proposals=0,refusals=0;
+        int count=maximumWorkers is {} requested?Math.Clamp(requested,1,6):Math.Min(6,GeometryParallelism.WorkerLimit);
+        bool canParallel=workerFactory is not null&&count>1&&paths.Count>=4&&(maximumWorkers.HasValue||before>=8192);
+        VCarveSmoothing.ContinuationProofWorker[]? workers=null;double startupMs=0,mergeMs=0;
+        if(canParallel)
+        {
+            long startup=Stopwatch.GetTimestamp();workers=new VCarveSmoothing.ContinuationProofWorker[count];
+            for(int i=0;i<count;i++)
+            {
+                token.ThrowIfCancellationRequested();var worker=workerFactory!();
+                if(worker is null){workers=null;canParallel=false;break;}
+                workers[i]=worker;
+            }
+            startupMs=Stopwatch.GetElapsedTime(startup).TotalMilliseconds;
+        }
+        List<TaggedToolpath> result;
+        if(!canParallel)
+        {
+            bool Accept(Point3D a,Point3D b){proposals++;bool legal=accept(a,b);if(!legal)refusals++;return legal;}
+            result=paths.Select(path=>path.Category=="final-carve"?path:SurfaceToolpathSimplifier.Simplify(path,tolerance,token,Accept)).ToList();
+            count=1;
+        }
+        else
+        {
+            var output=new TaggedToolpath[paths.Count];
+            var errors=new System.Runtime.ExceptionServices.ExceptionDispatchInfo?[paths.Count];
+            var workerProposals=new long[count];var workerRefusals=new long[count];
+            int next=-1,failed=0;
+            Parallel.For(0,count,new ParallelOptions{MaxDegreeOfParallelism=count},worker=>{
+                using var owned=GeometryParallelism.EnterWorker();
+                while(!token.IsCancellationRequested&&Volatile.Read(ref failed)==0)
+                {
+                    int index=Interlocked.Increment(ref next);if(index>=paths.Count)break;
+                    try
+                    {
+                        token.ThrowIfCancellationRequested();var path=paths[index];
+                        bool Accept(Point3D a,Point3D b)
+                        {
+                            workerProposals[worker]++;
+                            bool legal=(privateWorkerPrefix is null||privateWorkerPrefix(a,b))&&workers![worker].Prove(a,b);
+                            if(!legal)workerRefusals[worker]++;return legal;
+                        }
+                        output[index]=path.Category=="final-carve"?path:SurfaceToolpathSimplifier.Simplify(path,tolerance,token,Accept);
+                    }
+                    catch(Exception error)
+                    {errors[index]=System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error);Interlocked.Exchange(ref failed,1);}
+                }
+            });
+            // Every worker has joined before any original owner, callback or
+            // caller-visible path is touched. Failures never publish a prefix.
+            token.ThrowIfCancellationRequested();foreach(var error in errors)error?.Throw();
+            long merge=Stopwatch.GetTimestamp();
+            foreach(var worker in workers!)worker.Complete(diagnostic);
+            mergeMs=Stopwatch.GetElapsedTime(merge).TotalMilliseconds;
+            proposals=workerProposals.Sum();refusals=workerRefusals.Sum();result=output.ToList();
+        }
+        token.ThrowIfCancellationRequested();
+        diagnostic?.Invoke($"stage=surface-simplification event=protected-sources paths={result.Count} "
+            +$"sourcePoints={before} retainedPoints={result.Sum(p=>(long)p.Points.Count)} chordBoundMm={tolerance:R} "
+            +$"proposals={proposals} refusedChords={refusals} medialTracePreserved=True workers={count} workerStartupMs={startupMs:F3} workerMergeMs={mergeMs:F3} "
+            +$"elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1} "
+            +"sameNativeAndPostedFloorWallGradeRequired=True sourceTopologyRetained=True motionKindsPreserved=True "
+            +$"privateQueryOwners={canParallel} preparedWallIndicesShared={canParallel} channelUnionRebuilt=False originalPathOrder=True allWorkersJoined=True booleanPointCharges=0");
+        token.ThrowIfCancellationRequested();return result;
     }
 
     private static double PathLength(IReadOnlyList<Point3D> points)

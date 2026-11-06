@@ -9,14 +9,105 @@ internal static class VCarveNativeGeometricProof
 {
  internal const double ArithmeticReserve=1e-9;
  private const int MaximumSubdivisions=4096,MaximumDepth=14;
+ internal static readonly AsyncLocal<bool?> CheapProjectionsFirstOverride=new();
+ internal static readonly AsyncLocal<bool?> ScopedCheapProjectionsFirst=new();
+ // Diagnostic eager control; omitted uses lazy exact parent storage only.
+ internal static readonly AsyncLocal<bool?> EagerMinimaxParentsOverride=new();
+ internal static readonly AsyncLocal<bool?> MinimaxDistanceElisionOverride=new();
+ // Only private, frozen interval snapshots may carry this capability. The
+ // public/generic proof entrypoints never infer ownership from an array type.
+ internal sealed class OwnedMinimaxSource
+ {
+  private readonly Point3D[] points;
+  private OwnedMinimaxSource(Point3D[] points)=>this.points=points;
+  internal static OwnedMinimaxSource? CapturePrivateSnapshot(Point3D[] points)
+   =>points.All(BoundedFinite)?new(points):null;
+  internal bool Matches(IReadOnlyList<Point3D> source)=>ReferenceEquals(points,source);
+ }
+ private static bool BoundedFinite(Point3D p)=>double.IsFinite(p.X)&&double.IsFinite(p.Y)&&double.IsFinite(p.Z)
+  &&Math.Abs(p.X)<=1_000_000&&Math.Abs(p.Y)<=1_000_000&&Math.Abs(p.Z)<=1_000_000;
+ internal static bool TryMinimaxSquaredThreshold(double allowance,out double upper)
+ {
+  upper=double.NaN;if(!double.IsFinite(allowance)||allowance<0)return false;
+  double next=Math.BitIncrement(allowance);upper=Math.BitIncrement(next*next);
+  return double.IsFinite(upper);
+ }
+ private static bool CheapFirstSelected=>CheapProjectionsFirstOverride.Value??ScopedCheapProjectionsFirst.Value??false;
+ private static readonly AsyncLocal<WorkCapture?> CapturedWork=new();
+ internal sealed class WorkCounter
+ {
+  internal long Proofs,CheapFirstProofs,ProjectionAttempts,CheapProjectionWins,CheapWinsBeforePriorAlternatives,ClosestCalls,MinimaxCalls,MinimaxRowsRequested,MinimaxRowsVisited,MinimaxParentCells,MinimaxParentSlabs,MinimaxParentRowsRetained,MinimaxEagerParentCellsRequested,MinimaxParentLohAllocationsAvoided;
+  internal long MinimaxDistanceCells,MinimaxDistanceSquareRootsElided,MinimaxDistanceElisionCalls;
+ }
+ internal sealed record WorkSnapshot(long Proofs,long CheapFirstProofs,long ProjectionAttempts,long CheapProjectionWins,
+  long CheapWinsBeforePriorAlternatives,long ClosestCalls,long MinimaxCalls,long MinimaxRowsRequested,long MinimaxRowsVisited,long MinimaxParentCells,long MinimaxParentSlabs,long MinimaxParentRowsRetained,long MinimaxEagerParentCellsRequested,long MinimaxParentLohAllocationsAvoided,
+  long MinimaxDistanceCells,long MinimaxDistanceSquareRootsElided,long MinimaxDistanceElisionCalls)
+ {
+  internal string Describe()=>$"proofCalls={Proofs} cheapFirstProofs={CheapFirstProofs} projectionAttempts={ProjectionAttempts} cheapProjectionWins={CheapProjectionWins} "
+   +$"cheapWinsBeforePriorAlternatives={CheapWinsBeforePriorAlternatives} closestCalls={ClosestCalls} minimaxCalls={MinimaxCalls} "
+   +$"minimaxRowsRequested={MinimaxRowsRequested} minimaxRowsVisited={MinimaxRowsVisited} minimaxParentCellsAllocated={MinimaxParentCells} "
+   +$"minimaxParentSlabs={MinimaxParentSlabs} minimaxParentRowsRetained={MinimaxParentRowsRetained} minimaxEagerParentCellsRequested={MinimaxEagerParentCellsRequested} minimaxParentLohAllocationsAvoided={MinimaxParentLohAllocationsAvoided} "
+   +$"minimaxDistanceCells={MinimaxDistanceCells} minimaxDistanceSquareRootsElided={MinimaxDistanceSquareRootsElided} minimaxDistanceElisionCalls={MinimaxDistanceElisionCalls} distanceElisionScope=owned-finite-snapshots "
+   +"counterOwnership=thread-private aggregateAfterJoin=True avoidedDPRequiresOldOrderComparison=True";
+ }
+ internal sealed class WorkCapture:IDisposable
+ {
+  private readonly WorkCapture? previous=CapturedWork.Value;
+  private readonly ThreadLocal<WorkCounter> counters=new(()=>new(),true);
+  private volatile bool disposed;
+  internal WorkCapture()=>CapturedWork.Value=this;
+  internal WorkCounter? Counter
+  {
+   get{if(disposed)return null;try{return counters.Value;}catch(ObjectDisposedException){return null;}}
+  }
+  internal WorkSnapshot Snapshot()
+  {
+   long calls=0,cheap=0,attempts=0,wins=0,bypassed=0,closest=0,minimax=0,requested=0,visited=0,cells=0,slabs=0,retained=0,eagerCells=0,lohAvoided=0,distanceCells=0,elided=0,elisionCalls=0;
+   foreach(var c in counters.Values)
+   {calls+=c.Proofs;cheap+=c.CheapFirstProofs;attempts+=c.ProjectionAttempts;wins+=c.CheapProjectionWins;bypassed+=c.CheapWinsBeforePriorAlternatives;
+    closest+=c.ClosestCalls;minimax+=c.MinimaxCalls;requested+=c.MinimaxRowsRequested;visited+=c.MinimaxRowsVisited;cells+=c.MinimaxParentCells;slabs+=c.MinimaxParentSlabs;retained+=c.MinimaxParentRowsRetained;
+    eagerCells+=c.MinimaxEagerParentCellsRequested;lohAvoided+=c.MinimaxParentLohAllocationsAvoided;
+    distanceCells+=c.MinimaxDistanceCells;elided+=c.MinimaxDistanceSquareRootsElided;elisionCalls+=c.MinimaxDistanceElisionCalls;}
+   return new(calls,cheap,attempts,wins,bypassed,closest,minimax,requested,visited,cells,slabs,retained,eagerCells,lohAvoided,distanceCells,elided,elisionCalls);
+  }
+  public void Dispose(){if(disposed)return;disposed=true;CapturedWork.Value=previous;counters.Dispose();}
+ }
+ internal static WorkCapture BeginWorkCapture()=>new();
  internal static VCarveNativeGeometryCertificate Prove(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,IReadOnlyList<VCarveNativeInteriorPose>? interiorPoses=null)
-  =>ProveCore(move,source,first,last,allowance,interiorPoses,true);
+  =>ProveCore(move,source,first,last,allowance,interiorPoses,true,true,CheapFirstSelected);
+ internal static VCarveNativeGeometryCertificate ProveOwned(ToolMove move,Point3D[] source,int first,int last,double allowance,
+  OwnedMinimaxSource? ownership,bool freeJoin=false)
+  =>ProveCore(move,source,first,last,allowance,null,!freeJoin,true,CheapFirstSelected,ownership);
+ // Independent literal-array control for exact certificate/allocation oracles.
+ // Production uses the same ordered proof with value-owned cubic scratch.
+ internal static VCarveNativeGeometryCertificate ProveLiteral(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,IReadOnlyList<VCarveNativeInteriorPose>? interiorPoses=null)
+  =>ProveCore(move,source,first,last,allowance,interiorPoses,true,false,CheapFirstSelected);
+ internal static VCarveNativeGeometryCertificate ProveCheapFirst(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,IReadOnlyList<VCarveNativeInteriorPose>? interiorPoses=null)
+  =>ProveCore(move,source,first,last,allowance,interiorPoses,true,true,true);
+ internal static VCarveNativeGeometryCertificate ProveOriginalOrder(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,IReadOnlyList<VCarveNativeInteriorPose>? interiorPoses=null)
+  =>ProveCore(move,source,first,last,allowance,interiorPoses,true,true,false);
  // Only a free fit join may move. The continuous difference enclosure includes
  // both displaced endpoints; outer topology/visit endpoints remain caller-owned.
  internal static VCarveNativeGeometryCertificate ProveFreeJoin(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance)
-  =>ProveCore(move,source,first,last,allowance,null,false);
- private static VCarveNativeGeometryCertificate ProveCore(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,IReadOnlyList<VCarveNativeInteriorPose>? interiorPoses,bool exactEndpoints)
+  =>ProveCore(move,source,first,last,allowance,null,false,true,CheapFirstSelected);
+ internal static VCarveNativeGeometryCertificate ProveFreeJoinLiteral(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance)
+  =>ProveCore(move,source,first,last,allowance,null,false,false,CheapFirstSelected);
+ internal static VCarveNativeGeometryCertificate ProveFreeJoinCheapFirst(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance)
+  =>ProveCore(move,source,first,last,allowance,null,false,true,true);
+ internal static VCarveNativeGeometryCertificate ProveFreeJoinOriginalOrder(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance)
+  =>ProveCore(move,source,first,last,allowance,null,false,true,false);
+ internal static VCarveNativeGeometryCertificate CorrespondenceForOracle(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,double[] parameters,bool literal)
+  =>CertifyCorrespondence(move,source,first,last,allowance,parameters,!literal);
+ internal static (bool Certified,double Bound,int Remaining) BoundForOracle(Point3D[] difference,double allowance,int depth,int remaining,bool literal)
  {
+  if(difference.Length!=4)throw new ArgumentException("A cubic difference has four controls.",nameof(difference));
+  double bound;bool certified=literal?Bound(difference,allowance,depth,ref remaining,out bound)
+   :Bound(new CubicQuad(difference[0],difference[1],difference[2],difference[3]),allowance,depth,ref remaining,out bound);
+  return(certified,bound,remaining);
+ }
+ private static VCarveNativeGeometryCertificate ProveCore(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,IReadOnlyList<VCarveNativeInteriorPose>? interiorPoses,bool exactEndpoints,bool valueQuads,bool cheapFirst,OwnedMinimaxSource? ownership=null)
+ {
+  var work=CapturedWork.Value?.Counter;if(work is not null){work.Proofs++;if(cheapFirst)work.CheapFirstProofs++;}
   VCarveNativeGeometryCertificate Failed(string reason)=>new(false,double.PositiveInfinity,reason,[]);
   if(last<=first||exactEndpoints&&(move.Start!=source[first]||move.End!=source[last]))return Failed("geometry-endpoint-ownership");
   if(move.Kind is not (ToolMoveKind.Line or ToolMoveKind.CubicBezier))return Failed("geometry-kind-unsupported");
@@ -38,7 +129,8 @@ internal static class VCarveNativeGeometricProof
   {
    if(alternativeComputed[strategy])return alternativeResults[strategy];
    alternativeComputed[strategy]=true;
-   var witness=strategy==0?ClosestOrderedParameters(move,source,first,last,allowance):MinimaxOrderedParameters(move,source,first,last,allowance);
+   var witness=strategy==0?ClosestOrderedParameters(move,source,first,last,allowance)
+    :valueQuads?MinimaxOrderedParameters(move,source,first,last,allowance,ownership):MinimaxOrderedParametersEager(move,source,first,last,allowance);
    if(witness is null)return null;
    var anchors=new List<(int Ordinal,double Parameter)>{(first,0)};
    anchors.AddRange(interiorPoses.Select(p=>(p.SourceOrdinal,p.Parameter)));anchors.Add((last,1));
@@ -47,21 +139,52 @@ internal static class VCarveNativeGeometricProof
     var left=anchors[k-1];var right=anchors[k];witness[left.Ordinal-first]=left.Parameter;witness[right.Ordinal-first]=right.Parameter;
     for(int i=left.Ordinal+1;i<right.Ordinal;i++)witness[i-first]=Math.Clamp(witness[i-first],left.Parameter,right.Parameter);
    }
-   return alternativeResults[strategy]=CertifyCorrespondence(move,source,first,last,allowance,witness);
+   return alternativeResults[strategy]=CertifyCorrespondence(move,source,first,last,allowance,witness,valueQuads);
+  }
+  VCarveNativeGeometryCertificate CompleteProjection(VCarveNativeGeometryCertificate projected,bool eligible)
+  {
+   if(!eligible||projected.Certified)return projected;
+   foreach(int strategy in new[]{0,1})
+   {
+    var optimized=Alternative(strategy);if(optimized is null)continue;
+    if(optimized.Certified)return optimized;
+    if(optimized.ErrorBound<projected.ErrorBound)projected=optimized;
+   }
+   return projected;
   }
   // Alternative monotone projection WITNESSES, never different acceptance
   // tolerances or source substitutions. A curve may turn in Z while progressing
   // in XY; the full continuous correspondence still proves its geometry/order.
+  var deferred=cheapFirst?new (VCarveNativeGeometryCertificate Proof,bool Eligible)[4]:null;int deferredCount=0,priorAlternativeHooks=0;
   foreach(var direction in new[]{chord,new Point3D(1,0,0),new Point3D(0,1,0),new Point3D(0,0,1)})
   {
    if(VCarveNativeCurveMath.Dot(chord,direction)==0)continue;
-   var proof=TryProjection(move,source,first,last,allowance,direction,interiorPoses,exactEndpoints,Alternative);if(proof.Certified)return proof;
+   if(work is not null)work.ProjectionAttempts++;
+   var proof=TryProjection(move,source,first,last,allowance,direction,interiorPoses,exactEndpoints,valueQuads,out bool eligible);
+   if(cheapFirst)
+   {
+    if(proof.Certified)
+    {if(work is not null){work.CheapProjectionWins++;if(priorAlternativeHooks>0)work.CheapWinsBeforePriorAlternatives++;}return proof;}
+    deferred![deferredCount++]=(proof,eligible);if(eligible)priorAlternativeHooks++;
+    continue;
+   }
+   if(proof.Certified){if(work is not null)work.CheapProjectionWins++;return proof;}
+   proof=CompleteProjection(proof,eligible);if(proof.Certified)return proof;
+   if(failure is null||proof.ErrorBound<failure.ErrorBound)failure=proof;
+  }
+  // All cheap witnesses failed. Reconstruct the ORIGINAL projection/alternate
+  // failure selection order, including strict ties, from the completed proofs.
+  // Alternatives remain eligible only where the original projection called them.
+  for(int i=0;i<deferredCount;i++)
+  {
+   var attempt=deferred![i];var proof=CompleteProjection(attempt.Proof,attempt.Eligible);if(proof.Certified)return proof;
    if(failure is null||proof.ErrorBound<failure.ErrorBound)failure=proof;
   }
   return failure??Failed("curve-progress-not-certified");
  }
- private static VCarveNativeGeometryCertificate TryProjection(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,Point3D direction,IReadOnlyList<VCarveNativeInteriorPose> interiorPoses,bool exactEndpoints,Func<int,VCarveNativeGeometryCertificate?> alternative)
+ private static VCarveNativeGeometryCertificate TryProjection(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,Point3D direction,IReadOnlyList<VCarveNativeInteriorPose> interiorPoses,bool exactEndpoints,bool valueQuads,out bool alternativesEligible)
  {
+  alternativesEligible=false;
   VCarveNativeGeometryCertificate Failed(string reason,double bound=double.PositiveInfinity)=>new(false,bound,reason,[]);
   if(last<=first||exactEndpoints&&(move.Start!=source[first]||move.End!=source[last]))return Failed("geometry-endpoint-ownership");
   if(move.Kind is not (ToolMoveKind.Line or ToolMoveKind.CubicBezier))return Failed("geometry-kind-unsupported");
@@ -115,41 +238,139 @@ internal static class VCarveNativeGeometricProof
    var left=anchors[k-1];var right=anchors[k];parameters[left.Ordinal-first]=left.Parameter;parameters[right.Ordinal-first]=right.Parameter;
    for(int i=left.Ordinal+1;i<right.Ordinal;i++)parameters[i-first]=Math.Clamp(parameters[i-first],left.Parameter,right.Parameter);
   }
-  var projected=CertifyCorrespondence(move,source,first,last,allowance,parameters);
+  var projected=CertifyCorrespondence(move,source,first,last,allowance,parameters,valueQuads);
   if(projected.Certified)return projected;
   // Projection is one sufficient witness, not an extra source timing law.
   // Nominate a second monotone correspondence, then use the IDENTICAL complete
   // Bernstein difference proof. Vertex proximity alone grants no certificate.
-  foreach(int strategy in new[]{0,1})
-  {
-   var optimized=alternative(strategy);
-   if(optimized is null)continue;
-   if(optimized.Certified)return optimized;
-   if(optimized.ErrorBound<projected.ErrorBound)projected=optimized;
-  }
+  alternativesEligible=true;
   return projected;
  }
  // Greedy closest-point correspondence can consume progress needed by a later
  // small source reversal. Minimax dynamic programming nominates an ordered
  // witness jointly. Search samples are proof parameters, never output moves;
  // only the unchanged complete Bernstein enclosure authorizes a certificate.
- private static double[]? MinimaxOrderedParameters(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance)
+ internal const int MinimaxParentRowsPerSlab=16;
+ internal static double[]? MinimaxOrderedParameters(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,OwnedMinimaxSource? ownership=null)
  {
-  const int divisions=256;int count=last-first+1;
+  const int divisions=256,width=divisions+1;int count=last-first+1;
+  // Preserve the literal exceptional path for unsupported matrix dimensions.
+  if(EagerMinimaxParentsOverride.Value==true||count<=0||count>int.MaxValue/width)
+   return MinimaxOrderedParametersEager(move,source,first,last,allowance);
+  var work=CapturedWork.Value?.Counter;
+  if(work is not null)
+  {
+   work.MinimaxCalls++;work.MinimaxRowsRequested+=Math.Max(0,count-1);
+   work.MinimaxEagerParentCellsRequested+=(long)count*width;
+   // A conservative sufficient LOH threshold; each lazy slab is < 9 KiB.
+   if((long)count*width*sizeof(ushort)>=85000)work.MinimaxParentLohAllocationsAvoided++;
+  }
   var positions=Enumerable.Range(0,divisions+1).Select(i=>VCarveNativeCurveMath.At(move,i/(double)divisions)).ToArray();
   var previous=Enumerable.Repeat(double.PositiveInfinity,divisions+1).ToArray();
   previous[0]=VCarveNativeCurveMath.Distance(move.Start,source[first]);
-  var parents=new int[count,divisions+1];
+  List<ushort[]>? parents=null;
+  Span<ushort> pending=stackalloc ushort[width];
+  var current=new double[divisions+1];
+  double squaredUpper=double.NaN;
+  bool elide=MinimaxDistanceElisionOverride.Value!=false&&ownership?.Matches(source)==true
+   &&TryMinimaxSquaredThreshold(allowance,out squaredUpper)
+   &&BoundedFinite(move.Start)&&BoundedFinite(move.End)
+   &&(move.Kind!=ToolMoveKind.CubicBezier||BoundedFinite(move.Control1)&&BoundedFinite(move.Control2))
+   &&positions.All(BoundedFinite);
+  long distanceRows=0,elidedRoots=0;
+  try
+  {
   for(int ordinal=1;ordinal<count;ordinal++)
   {
-   var current=new double[divisions+1];double best=double.PositiveInfinity;int predecessor=0;
+   distanceRows++;
+   if(work is not null)work.MinimaxRowsVisited++;
+   int rowInSlab=(ordinal-1)%MinimaxParentRowsPerSlab;
+   // The first row of a new slab stays on the stack until it passes. A
+   // refused row never creates a slab, nor any storage for future source rows.
+   Span<ushort> parentRow=rowInSlab==0?pending:parents![^1].AsSpan(rowInSlab*width,width);
+   double best=double.PositiveInfinity,rowMinimum=double.PositiveInfinity;int predecessor=0;
+   var point=source[first+ordinal];
    for(int j=0;j<=divisions;j++)
    {
     if(previous[j]<best){best=previous[j];predecessor=j;}
-    current[j]=Math.Max(best,VCarveNativeCurveMath.Distance(positions[j],source[first+ordinal]));
-    parents[ordinal,j]=predecessor;
+    double distance;
+    if(elide)
+    {
+     var delta=VCarveNativeCurveMath.Sub(positions[j],point);
+     double square=VCarveNativeCurveMath.Dot(delta,delta);
+     // Correct rounding of sqrt(x) to a value <=s implies x<(next(s))^2.
+     // The outward product threshold is a necessary condition only. Values
+     // definitely above it cannot occur on a successful <=allowance DP path.
+     // Retain the exact original sqrt for every other cell, including ties;
+     // use this SAME Sub/Dot result rather than recomputing its arithmetic.
+     if(square>squaredUpper){distance=double.PositiveInfinity;elidedRoots++;}
+     else distance=Math.Sqrt(square);
+    }
+    else distance=VCarveNativeCurveMath.Distance(positions[j],point);
+    current[j]=Math.Max(best,distance);
+    parentRow[j]=(ushort)predecessor;
+    rowMinimum=Math.Min(rowMinimum,current[j]);
    }
-   previous=current;
+   if(rowMinimum>allowance)return null;
+   if(rowInSlab==0)
+   {
+    int rows=Math.Min(MinimaxParentRowsPerSlab,count-ordinal);
+    var slab=new ushort[rows*width];pending.CopyTo(slab);
+    (parents??=new()).Add(slab);
+    if(work is not null){work.MinimaxParentSlabs++;work.MinimaxParentCells+=slab.Length;}
+   }
+   if(work is not null)work.MinimaxParentRowsRetained++;
+   (previous,current)=(current,previous);
+  }
+  if(previous[divisions]>allowance)return null;
+  var result=new double[count];int cursor=divisions;
+  for(int ordinal=count-1;ordinal>0;ordinal--)
+  {
+   result[ordinal]=cursor/(double)divisions;
+   int row=ordinal-1;cursor=parents![row/MinimaxParentRowsPerSlab][row%MinimaxParentRowsPerSlab*width+cursor];
+  }
+  return result;
+  }
+  finally
+  {
+   // Per-cell work touches only local scalars; optional thread-owned counters
+   // publish once, including early-refused rows. No query/stock state changes.
+   if(work is not null){work.MinimaxDistanceCells+=distanceRows*width;work.MinimaxDistanceSquareRootsElided+=elidedRoots;
+    if(elide)work.MinimaxDistanceElisionCalls++;}
+  }
+ }
+ // Literal eager ushort[,] implementation, retained independently for exact
+ // recurrence/tie/NaN/parameter-bit controls and diagnostic A/B runs.
+ internal static double[]? MinimaxOrderedParametersEager(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance)
+ {
+  const int divisions=256;int count=last-first+1;
+  var work=CapturedWork.Value?.Counter;
+  if(work is not null){work.MinimaxCalls++;work.MinimaxRowsRequested+=Math.Max(0,count-1);work.MinimaxParentCells+=(long)count*(divisions+1);work.MinimaxEagerParentCellsRequested+=(long)count*(divisions+1);}
+  var positions=Enumerable.Range(0,divisions+1).Select(i=>VCarveNativeCurveMath.At(move,i/(double)divisions)).ToArray();
+  var previous=Enumerable.Repeat(double.PositiveInfinity,divisions+1).ToArray();
+  previous[0]=VCarveNativeCurveMath.Distance(move.Start,source[first]);
+  // Every predecessor is in 0..256. Two reusable scalar rows and compact
+  // predecessor storage retain the exact recurrence/tie order without a new
+  // 257-double array for every original source vertex.
+  var parents=new ushort[count,divisions+1];
+  var current=new double[divisions+1];
+  for(int ordinal=1;ordinal<count;ordinal++)
+  {
+   if(work is not null)work.MinimaxRowsVisited++;
+   double best=double.PositiveInfinity,rowMinimum=double.PositiveInfinity;int predecessor=0;
+   var point=source[first+ordinal];
+   for(int j=0;j<=divisions;j++)
+   {
+    if(previous[j]<best){best=previous[j];predecessor=j;}
+    current[j]=Math.Max(best,VCarveNativeCurveMath.Distance(positions[j],point));
+    parents[ordinal,j]=(ushort)predecessor;
+    rowMinimum=Math.Min(rowMinimum,current[j]);
+   }
+   // A minimax path can never reduce its maximum error on a later row. This
+   // only rejects a witness that the original final-row check also rejects;
+   // every successful witness keeps all original arithmetic and tie choices.
+   if(rowMinimum>allowance)return null;
+   (previous,current)=(current,previous);
   }
   if(previous[divisions]>allowance)return null;
   var result=new double[count];int cursor=divisions;
@@ -158,6 +379,7 @@ internal static class VCarveNativeGeometricProof
  }
  private static double[]? ClosestOrderedParameters(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance)
  {
+  var work=CapturedWork.Value?.Counter;if(work is not null)work.ClosestCalls++;
   var parameters=new double[last-first+1];parameters[^1]=1;double prior=0;
   for(int i=1;i<parameters.Length-1;i++)
   {
@@ -177,7 +399,29 @@ internal static class VCarveNativeGeometricProof
   }
   return parameters;
  }
- private static VCarveNativeGeometryCertificate CertifyCorrespondence(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,double[] parameters)
+ private static VCarveNativeGeometryCertificate CertifyCorrespondence(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,double[] parameters,bool valueQuads)
+ {
+  if(!valueQuads||move.Kind==ToolMoveKind.Line)return CertifyCorrespondenceLiteral(move,source,first,last,allowance,parameters);
+  var controls=new CubicQuad(move.Start,move.Control1,move.Control2,move.End);double maximum=0;int remaining=MaximumSubdivisions;
+  for(int i=0;i<parameters.Length-1;i++)
+  {
+   var a=source[first+i];var b=source[first+i+1];var delta=VCarveNativeCurveMath.Sub(b,a);double length2=VCarveNativeCurveMath.Dot(delta,delta);
+   CubicQuad c=parameters[i]==parameters[i+1]?CubicQuad.Repeat(VCarveNativeCurveMath.At(move,parameters[i])):Restrict(controls,parameters[i],parameters[i+1]);
+   double l1=length2==0?1d/3:Math.Clamp(VCarveNativeCurveMath.Dot(VCarveNativeCurveMath.Sub(c.B,a),delta)/length2,0,1);
+   double l2=length2==0?2d/3:Math.Max(l1,Math.Clamp(VCarveNativeCurveMath.Dot(VCarveNativeCurveMath.Sub(c.C,a),delta)/length2,0,1));
+   // Keep all four original expressions, including multiply by 0/1. Removing
+   // them would change exceptional/nonfinite arithmetic and its proof result.
+   var difference=new CubicQuad(
+    VCarveNativeCurveMath.Sub(c.A,VCarveNativeCurveMath.Add(a,VCarveNativeCurveMath.Mul(delta,0))),
+    VCarveNativeCurveMath.Sub(c.B,VCarveNativeCurveMath.Add(a,VCarveNativeCurveMath.Mul(delta,l1))),
+    VCarveNativeCurveMath.Sub(c.C,VCarveNativeCurveMath.Add(a,VCarveNativeCurveMath.Mul(delta,l2))),
+    VCarveNativeCurveMath.Sub(c.D,VCarveNativeCurveMath.Add(a,VCarveNativeCurveMath.Mul(delta,1))));
+   if(!Bound(difference,allowance,0,ref remaining,out double bound))return new(false,Math.Max(maximum,bound),remaining<0?"continuous-order-proof-budget":"continuous-order-fit-unresolved",parameters);
+   maximum=Math.Max(maximum,bound);
+  }
+  return new(true,maximum,"continuous-ordered-cubic",parameters);
+ }
+ private static VCarveNativeGeometryCertificate CertifyCorrespondenceLiteral(ToolMove move,IReadOnlyList<Point3D> source,int first,int last,double allowance,double[] parameters)
  {
   if(move.Kind==ToolMoveKind.Line)
   {
@@ -214,6 +458,45 @@ internal static class VCarveNativeGeometricProof
    return Cover([c[0],a,middle],depth+1)&&Cover([middle,b,c[2]],depth+1);
   }
   return Cover(d,0);
+ }
+ private readonly struct CubicQuad
+ {
+  internal readonly Point3D A,B,C,D;
+  internal CubicQuad(Point3D a,Point3D b,Point3D c,Point3D d){A=a;B=b;C=c;D=d;}
+  internal static CubicQuad Repeat(Point3D point)=>new(point,point,point,point);
+ }
+ private static double MaximumNorm(in CubicQuad values)
+ {
+  // Enumerable.Max(selector) retains its first non-NaN maximum and ignores
+  // later NaNs. If every value is NaN it returns the final selected NaN.
+  // Preserve that behavior rather than replacing it with Math.Max's NaN rule.
+  double result=VCarveNativeCurveMath.Norm(values.A),next=VCarveNativeCurveMath.Norm(values.B);
+  if(double.IsNaN(result)||next>result)result=next;
+  next=VCarveNativeCurveMath.Norm(values.C);if(double.IsNaN(result)||next>result)result=next;
+  next=VCarveNativeCurveMath.Norm(values.D);if(double.IsNaN(result)||next>result)result=next;
+  return result;
+ }
+ private static bool Bound(in CubicQuad difference,double allowance,int depth,ref int remaining,out double bound)
+ {
+  bound=MaximumNorm(difference)+ArithmeticReserve;if(bound<=allowance)return true;
+  if(depth>=MaximumDepth||--remaining<0)return false;
+  Split(difference,.5,out var leftHalf,out var rightHalf);
+  if(VCarveNativeCurveMath.Norm(leftHalf.D)+ArithmeticReserve>allowance)return false;
+  bool left=Bound(leftHalf,allowance,depth+1,ref remaining,out double a);if(!left){bound=a;return false;}
+  bool right=Bound(rightHalf,allowance,depth+1,ref remaining,out double b);bound=Math.Max(a,b);return right;
+ }
+ private static CubicQuad Restrict(in CubicQuad controls,double a,double b)
+ {
+  var c=controls;
+  if(b<1){Split(c,b,out var left,out _);c=left;}
+  if(a>0){Split(c,a/b,out _,out var right);c=right;}
+  return c;
+ }
+ private static void Split(in CubicQuad c,double t,out CubicQuad left,out CubicQuad right)
+ {
+  var a=VCarveNativeCurveMath.Lerp(c.A,c.B,t);var b=VCarveNativeCurveMath.Lerp(c.B,c.C,t);var d=VCarveNativeCurveMath.Lerp(c.C,c.D,t);
+  var e=VCarveNativeCurveMath.Lerp(a,b,t);var f=VCarveNativeCurveMath.Lerp(b,d,t);var g=VCarveNativeCurveMath.Lerp(e,f,t);
+  left=new(c.A,a,e,g);right=new(g,f,d,c.D);
  }
  private static bool Bound(Point3D[] difference,double allowance,int depth,ref int remaining,out double bound)
  {

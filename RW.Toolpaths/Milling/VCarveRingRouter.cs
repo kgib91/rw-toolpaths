@@ -11,15 +11,53 @@ internal static class VCarveRingRouter
     // connection that its former local row hid. False retains a control.
     internal static readonly AsyncLocal<bool?> IndependentEntryContinuationOverride=new();
     internal static readonly AsyncLocal<bool?> BodyCostCacheOverride=new();
+    internal static readonly AsyncLocal<bool?> CostPrecheckOverride=new();
+    internal static readonly AsyncLocal<bool?> IndependentEntryMemoOverride=new();
     internal static readonly AsyncLocal<bool?> SpatialMixedSourcesOverride=new();
     private readonly record struct Proposal(TaggedToolpath Actual,TaggedToolpath Entered,Point3D Target,
         double Score,double Saving,bool SurfaceStep,bool Raised);
+
+    // Shared by every normal return family for ONE actual ready visit. Check
+    // before MoveNext: advancing the lazy ancestor iterator can itself perform
+    // expensive physical proofs even before it yields another departure.
+    internal sealed class ReturnNominationBudget
+    {
+        private readonly int maximum;
+        private readonly CancellationToken token;
+        internal int Used {get;private set;}
+        internal bool Refused {get;private set;}
+        internal ReturnNominationBudget(int maximum,CancellationToken token)
+        {
+            if(maximum<0)throw new ArgumentOutOfRangeException(nameof(maximum));
+            this.maximum=maximum;this.token=token;
+        }
+        internal bool CanSearch()
+        {
+            token.ThrowIfCancellationRequested();
+            if(Used<maximum)return true;
+            Refused=true;return false;
+        }
+        internal IEnumerable<T> Take<T>(IEnumerable<T> source)
+        {
+            if(!CanSearch())yield break;
+            using var iterator=source.GetEnumerator();
+            while(CanSearch())
+            {
+                if(!iterator.MoveNext())yield break;
+                Used++;yield return iterator.Current;
+            }
+        }
+    }
     internal static List<TaggedToolpath> Route(IReadOnlyList<TaggedToolpath> source,ToolGeometry tool,
         DepthSchedule depth,VCarveOptions options,Point3D? start,Func<Point3D,Point3D,bool> guard,
         Func<Point3D,double>? entryHeight,CancellationToken token,Action<string>? log,
         Func<IReadOnlyList<TaggedToolpath>,Point3D?,List<TaggedToolpath>> finishOtherSources)
     {
         long started=Stopwatch.GetTimestamp();
+        if(options.MaximumContourSeamCandidates is <1 or >48)
+            throw new ArgumentOutOfRangeException(nameof(options),"Contour seam candidate budget must be between 1 and 48.");
+        if(options.MaximumContourReturnCandidates<0)
+            throw new ArgumentOutOfRangeException(nameof(options),"Contour return candidate budget must be nonnegative.");
         var rings=source.Where(p=>p.ConcentricSource is not null).ToArray();
         var remaining=source.Where(p=>p.ConcentricSource is null).ToArray();
         var profile=VCarvePhysicalSweep.ProfileFor(tool,depth.Depth);
@@ -56,7 +94,8 @@ internal static class VCarveRingRouter
         var ramp=options.Ramp with{Strategy=RampStrategy.Linear,
             AngleRadians=Math.Min(options.Ramp.AngleRadians>0?options.Ramp.AngleRadians:double.PositiveInfinity,
                 options.SmoothRampAngleDegrees*Math.PI/180)};
-        var cost=options.Motion is null?null:new ToolpathMotionCost(options.Motion,depth.SurfaceZ);
+        var cost=options.Motion is null?null:new ToolpathMotionCost(options.Motion,depth.SurfaceZ,chordGeometryCacheLimit:131072);
+        var enteredVisits=cost is null||IndependentEntryMemoOverride.Value==false?null:new ToolpathEnteredVisitMemo(cost);
         var result=new List<TaggedToolpath>(source.Count);Point3D? cursor=start;
         bool hasOwnNonfastCostContext=false;
         var mixed=VCarveRingSpatialDispatch.Create(remaining,source,depth,options,
@@ -68,6 +107,8 @@ internal static class VCarveRingRouter
             independentWinnerCostRefusals=0,independentWinnerNoProposal=0,independentWinnerBudgetRefusals=0;
         double independentWinnerSaving=0;
         int returned=0,returnCandidates=0,surfaceSteps=0,raisedSteps=0,provedParentReturns=0;long returnedChords=0;
+        long returnNominations=0,returnNominationBudgetRefusals=0;
+        int maximumReturnNominationsObserved=0;
         double returnedSeconds=0;TaggedToolpath? lastSource=null;
         bool hasCarrier=options.UpperContourCarrier is not null;
         var returns=new VCarveRingReturns(token,hasCarrier||options.OptimizeContourConnections,
@@ -81,6 +122,10 @@ internal static class VCarveRingRouter
         bool optimize=options.OptimizeContourConnections;
         var independentCosts=new Dictionary<IReadOnlyList<Point3D>,(TaggedToolpath Path,double Complete,double Body)>(ReferenceEqualityComparer.Instance);
         long independentCostHits=0,independentCostMisses=0;
+        long returnBudgetEntryLookups=0,returnBudgetPriceHits=0;
+        long costPrecheckGuardSkips=0,additionalPureCosts=0,costPrecheckComparisons=0,
+            costPrecheckCacheMisses=0,costPrecheckTransferFallbacks=0;
+        bool useCostPrecheck=CostPrecheckOverride.Value!=false;
         // The complete immutable value includes spans and depth/source tags;
         // point-list identity alone cannot distinguish Cut from fast travel.
         var originalBodies=new HashSet<TaggedToolpath>(rings);
@@ -101,7 +146,8 @@ internal static class VCarveRingRouter
         void ResetDepartureCosts(){
             independentCosts.Clear();derivedBodyCosts.Clear();derivedBodyChords=0;
         }
-        const int landingLimit=48;
+        int landingLimit=options.MaximumContourSeamCandidates;
+        long landingTrials=0;int maximumLandingTrialsObserved=0;
         int[] activeCandidates=[];
         int seamAlternatives=0,independentAlternatives=0;
         Point3D Command(Point3D p)=>new(ToolpathCommandRounding.Round((float)p.X),
@@ -192,7 +238,34 @@ internal static class VCarveRingRouter
                 landAtSourceVertex:true,preserveClosedExit:false,preserveOpenExit:false);
             return path with{Points=entered.Points,Moves=new LineToolMoves(entered.Points),Spans=entered.Spans};
         }
-        Proposal? Propose(TaggedToolpath original,TaggedToolpath path,Point3D origin,IReadOnlyList<Point3D> trace,TaggedToolpath departedFrom)
+        (TaggedToolpath Path,TaggedToolpath Entered,ToolpathEnteredVisitMemo.Entry? Cached) IndependentEntry(int owner,int index)
+        {
+            token.ThrowIfCancellationRequested();var original=rings[owner];
+            if(enteredVisits is null){var path=VCarveContinuationAdapter.Rebase(original,index);return(path,Enter(path),null);}
+            // Match Rebase's literal first pose without rebuilding the body.
+            // Every opaque height query still runs before the memo lookup.
+            int first=index;
+            if(index==0||original.Spans.Any(s=>s.Kind!=ToolpathSpanKind.Cut))first=0;
+            else if(original.Points[0]==original.Points[^1])first%=original.Points.Count-1;
+            var point=original.Points[first];
+            double top=entryHeight is null?depth.SurfaceZ:Math.Max(point.Z,entryHeight(point));
+            token.ThrowIfCancellationRequested();
+            if(enteredVisits.TryGet(owner,index,top,out var cached))return(cached!.Source,cached.Entered,cached);
+            var rebased=VCarveContinuationAdapter.Rebase(original,index);var entered=Enter(rebased,top);
+            cached=enteredVisits.Store(owner,index,top,rebased,entered);return(cached.Source,cached.Entered,cached);
+        }
+        double IndependentPrice(Point3D origin,(TaggedToolpath Path,TaggedToolpath Entered,ToolpathEnteredVisitMemo.Entry? Cached) entry)
+            =>entry.Cached is { } cached?enteredVisits!.CompleteVisitSeconds(origin,cached)
+                :cost?.CompleteVisitSeconds(origin,entry.Entered)??double.PositiveInfinity;
+        double ReturnEntryBudget(int owner,Point3D origin)
+        {
+            var entry=IndependentEntry(owner,ToolpathVisitOrder.EntryIndex(rings[owner],origin,token));
+            returnBudgetEntryLookups++;long hits=enteredVisits?.PricedHits??0;
+            double complete=IndependentPrice(origin,entry);
+            returnBudgetPriceHits+=(enteredVisits?.PricedHits??0)-hits;
+            return complete-BodySeconds(entry.Path)+.01;
+        }
+        Proposal? Propose(int owner,TaggedToolpath original,TaggedToolpath path,Point3D origin,IReadOnlyList<Point3D> trace,TaggedToolpath departedFrom)
         {
             var departure=trace[^1];
             // The offset constructor selected the next row. Its finishing
@@ -222,9 +295,9 @@ internal static class VCarveRingRouter
             (TaggedToolpath Path,double Complete,double Body) Independent()
             {
                 if(independentCosts.TryGetValue(original.Points,out var cached)){independentCostHits++;return cached;}
-                var path=VCarveContinuationAdapter.Rebase(original,ToolpathVisitOrder.EntryIndex(original,origin,token));
-                var entered=Enter(path);
-                var value=(path,cost?.CompleteVisitSeconds(origin,entered)??double.PositiveInfinity,BodySeconds(path));
+                var entry=IndependentEntry(owner,ToolpathVisitOrder.EntryIndex(original,origin,token));
+                var path=entry.Path;
+                var value=(path,IndependentPrice(origin,entry),BodySeconds(path));
                 independentCosts.Add(original.Points,value);independentCostMisses++;return value;
             }
             double Length(TaggedToolpath p)=>Enumerable.Range(1,p.Points.Count-1).Sum(i=>ToolpathContinuationPlanner.Distance(p.Points[i-1],p.Points[i]));
@@ -242,11 +315,43 @@ internal static class VCarveRingRouter
                 trials++;
                 if(!EntryGrade(departure,target)||!SurfaceCorridor(departure,target)&&!ToolpathEngagementLimits.Allows(departure,target,radial,step,grade,Command))
                 {engagementRefused++;continue;}
+                (TaggedToolpath Path,double Complete,double Body)? precheckedIndependent=null;
+                TaggedToolpath? precheckedEntered=null,precheckedCandidate=null;
+                double? precheckedAfter=null;
+                if(useCostPrecheck&&!continuous&&cost is not null)
+                {
+                    token.ThrowIfCancellationRequested();
+                    // An independent cache miss can query the actual stock's
+                    // entry height; retain its original guard-first ordering.
+                    // A cached comparison already belongs to this departure.
+                    if(independentCosts.TryGetValue(original.Points,out var knownIndependent))
+                    {
+                        var earlyEntered=Enter(path,target.Z);
+                        var earlyCandidate=SurfaceTravel(ToolpathContinuationPlanner.Prepend(earlyEntered,trace.Append(target).ToArray()));
+                        // CompleteVisitSeconds has no transfer at this literal
+                        // origin. VisitSeconds is pure motion pricing and cannot
+                        // call a prior-stock travel guard. Other contexts retain
+                        // the original full transfer-price/guard sequence.
+                        if(MillingTransitionPlanner.IsContinuous(origin,earlyCandidate.Points[0]))
+                        {
+                            double earlyAfter=cost.VisitSeconds(earlyCandidate);
+                            costPrecheckComparisons++;
+                            if(!(earlyAfter<=knownIndependent.Complete+1e-9))
+                            {costRefused++;costPrecheckGuardSkips++;continue;}
+                            precheckedIndependent=knownIndependent;precheckedEntered=earlyEntered;
+                            precheckedCandidate=earlyCandidate;precheckedAfter=earlyAfter;
+                        }
+                        else costPrecheckTransferFallbacks++;
+                    }
+                    else costPrecheckCacheMisses++;
+                }
                 if(!guard(departure with{Z=departure.Z-depth.SurfaceZ},target with{Z=target.Z-depth.SurfaceZ}))
-                {corridorRefused++;continue;}
-                var independent=Independent();var entered=Enter(path,target.Z);
-                var candidate=SurfaceTravel(ToolpathContinuationPlanner.Prepend(entered,trace.Append(target).ToArray()));
-                double before=independent.Complete,after=cost?.CompleteVisitSeconds(origin,candidate)??0;
+                {if(precheckedAfter.HasValue)additionalPureCosts++;corridorRefused++;continue;}
+                var independent=precheckedIndependent??Independent();
+                if(precheckedIndependent.HasValue)independentCostHits++;
+                var entered=precheckedEntered??Enter(path,target.Z);
+                var candidate=precheckedCandidate??SurfaceTravel(ToolpathContinuationPlanner.Prepend(entered,trace.Append(target).ToArray()));
+                double before=independent.Complete,after=precheckedAfter??cost?.CompleteVisitSeconds(origin,candidate)??0;
                 bool cheaper=after<=before+1e-9;
                 if(!continuous&&!cheaper)
                 {costRefused++;continue;}
@@ -262,16 +367,17 @@ internal static class VCarveRingRouter
             int attempted=0;
             (int Owner,Proposal Plan)? best=null;
             double reach=hasCarrier&&AboveMaterial(trace[^1],trace[^1])?double.PositiveInfinity:maximumRadial;
-            foreach(var landing in seams.Nearest(trace[^1],activeCandidates,reach))
+            foreach(var landing in seams.Nearest(trace[^1],activeCandidates,reach,landingLimit+1))
             {
                 // Only the current constructed row participates. Choose its
                 // closest legal seam without changing the offset progression.
                 if(++attempted>landingLimit){landingWorkRefusals++;break;}
                 if(reserveLanding is not null&&!reserveLanding()){independentWinnerBudgetRefusals++;break;}
+                landingTrials++;maximumLandingTrialsObserved=Math.Max(maximumLandingTrialsObserved,attempted);
                 var path=seams.Rebase(landing,(a,b)=>guard(a with{Z=a.Z-depth.SurfaceZ},b with{Z=b.Z-depth.SurfaceZ}));
                 if(path is not {} prepared)continue;
                 if(rememberIndependent&&closestIndependent is null)closestIndependent=(landing.Owner,prepared);
-                if(Propose(rings[landing.Owner],prepared,origin,trace,departedFrom) is not {} plan)continue;
+                if(Propose(landing.Owner,rings[landing.Owner],prepared,origin,trace,departedFrom) is not {} plan)continue;
                 if(!optimize)return(landing.Owner,plan);
                 seamAlternatives++;
                 if(best is null||plan.Score<best.Value.Plan.Score-1e-9)best=(landing.Owner,plan);
@@ -306,14 +412,11 @@ internal static class VCarveRingRouter
             // is unavailable, rather than re-exploring every ancestor per row.
             if(selectedPath is null&&(result.Count>0||carrierReady)&&exitAnchored&&cursor is {} actual&&cost is not null)
             {
+            var returnBudget=new ReturnNominationBudget(options.MaximumContourReturnCandidates,token);
             var triedReturns=new HashSet<(VCarveRingReturns.Node,int,double)>();
-            double localBudget=candidates.Max(owner=>
-            {
-                var path=VCarveContinuationAdapter.Rebase(rings[owner],ToolpathVisitOrder.EntryIndex(rings[owner],actual,token));
-                return cost.CompleteVisitSeconds(actual,Enter(path))-BodySeconds(path)+.01;
-            });
+            double localBudget=candidates.Max(owner=>ReturnEntryBudget(owner,actual));
             if(continuous)localBudget=double.PositiveInfinity;
-            foreach(var departure in returns.LocalDepartures(cost,localBudget))
+            foreach(var departure in returnBudget.Take(returns.LocalDepartures(cost,localBudget)))
             {
                 triedReturns.Add((departure.Anchor,departure.Portal,departure.PortalFraction));returnCandidates++;
                 if(Nearest(departure.Points,actual,departure.Anchor.Source) is not {} localPlan)continue;
@@ -324,12 +427,12 @@ internal static class VCarveRingRouter
             }
             foreach(int owner in candidates)
             {
+                if(!returnBudget.CanSearch())break;
                 var original=rings[owner];
-                var oriented=VCarveContinuationAdapter.Rebase(original,ToolpathVisitOrder.EntryIndex(original,actual,token));
-                double budget=cost.CompleteVisitSeconds(actual,Enter(oriented))-BodySeconds(oriented)+.01;
+                double budget=ReturnEntryBudget(owner,actual);
                 if(continuous)budget=double.PositiveInfinity;
-                foreach(var departure in returns.Departures(original,cost,budget,maximumRadial,
-                    hasCarrier||optimize?ParentStep:null))
+                foreach(var departure in returnBudget.Take(returns.Departures(original,cost,budget,maximumRadial,
+                    hasCarrier||optimize?ParentStep:null)))
                 {
                     if(!triedReturns.Add((departure.Anchor,departure.Portal,departure.PortalFraction)))continue;
                     returnCandidates++;
@@ -341,6 +444,9 @@ internal static class VCarveRingRouter
                     selectedRaised=proposal.Raised;
                 }
             }
+            returnNominations+=returnBudget.Used;
+            maximumReturnNominationsObserved=Math.Max(maximumReturnNominationsObserved,returnBudget.Used);
+            if(returnBudget.Refused)returnNominationBudgetRefusals++;
             }
             bool connectedThisVisit=selectedPath is not null;
             if(selectedPath is not {} routed)
@@ -359,15 +465,15 @@ internal static class VCarveRingRouter
                             :cursor is {} site?new[]{ToolpathVisitOrder.EntryIndex(original,site,token)}:new[]{0};
                         foreach(int index in indices){
                             token.ThrowIfCancellationRequested();independentAlternatives++;
-                            var candidate=VCarveContinuationAdapter.Rebase(original,index);var entered=Enter(candidate);
-                            var from=cursor??entered.Points[0] with{Z=options.Motion!.SafeZ};
-                            double score=cost.CompleteVisitSeconds(from,entered)-BodySeconds(original);
-                            if(score<best-1e-9){best=score;closestIndependent=(owner,candidate);}
+                            var entry=IndependentEntry(owner,index);
+                            var from=cursor??entry.Entered.Points[0] with{Z=options.Motion!.SafeZ};
+                            double score=IndependentPrice(from,entry)-BodySeconds(original);
+                            if(score<best-1e-9){best=score;closestIndependent=(owner,entry.Path);}
                         }
                     }
                 }
                 else if(cursor is {} independentFrom)
-                foreach(var landing in seams.Nearest(independentFrom,order.IndependentCandidates(),double.PositiveInfinity).Take(48))
+                foreach(var landing in seams.Nearest(independentFrom,order.IndependentCandidates(),double.PositiveInfinity,landingLimit))
                     if(seams.Rebase(landing,(a,b)=>guard(a with{Z=a.Z-depth.SurfaceZ},b with{Z=b.Z-depth.SurfaceZ})) is {} independentPath)
                     {closestIndependent=(landing.Owner,independentPath);break;}
                 TaggedToolpath path;
@@ -479,7 +585,10 @@ internal static class VCarveRingRouter
             +$"corridorRefused={corridorRefused} costRefused={costRefused} exitCustodyRefusals={exitCustodyRefusals} transferDistance={transfer:R} selectedSavingSec={saved:R} "
             +$"returnCandidates={returnCandidates} returnedVisits={returned} returnedChords={returnedChords} "
             +$"returnedMotionSec={returnedSeconds:R} surfaceSteps={surfaceSteps} raisedSteps={raisedSteps} "
-            +$"returnWorkRefusals={returns.BoundedSearches} "
+            +$"returnWorkRefusals={returns.BoundedSearches+returnNominationBudgetRefusals} "
+            +$"returnNominationBudgetRefusals={returnNominationBudgetRefusals} returnNominations={returnNominations} "
+            +$"maximumReturnNominationsPerVisit={options.MaximumContourReturnCandidates} maximumReturnNominationsObserved={maximumReturnNominationsObserved} "
+            +"returnBudgetScope=total-normal-local-and-ancestor-families iteratorAdvanceAfterBudget=False independentWinnerBudgetUnchanged=True "
             +$"partialAxisReturnRefusals={returns.PartialAxisRefusals} postedEquivalentReturnSteps={returns.PostedEquivalentSteps} "
             +$"provedParentReturnSteps={provedParentReturns} "
             +$"parentProjectionTrials={returns.ParentProjectionTrials} parentProjectionRefusals={returns.ParentProjectionRefusals} fractionalDepartures={returns.FractionalDepartures} "
@@ -491,9 +600,17 @@ internal static class VCarveRingRouter
             +$"sourceWalls={order.WallCount} wallLevelBatches={order.WallLevelBatches} wallOrder={(order.WallCount>0?"complete-feature-offset-level":"legacy-parent-pieces")} "
             +$"offsetPieceQueries={order.ParentQueries} offsetPieceBoundsRefusals={order.ParentBoundsRefusals} "
             +$"splitLandingCandidates={seams.SplitLandings} splitLandingRefusals={seams.SplitRefusals} "
+            +$"seamBoundedQueries={seams.BoundedQueries} seamCandidateChordsExamined={seams.CandidateChordsExamined} seamCandidateNominations={seams.CandidateNominations} "
+            +$"seamCandidatesRetainedForSort={seams.CandidatesRetainedForSort} seamCandidatesDiscardedBeforeSort={seams.CandidatesDiscardedBeforeSort} seamOrder=literal-stable-prefix "
+            +seams.IndexDiagnostics+" "
             +$"nearestRowReentries={nearestReentries} "
             +$"landingWorkRefusals={landingWorkRefusals} maximumLandingTrialsPerDeparture={landingLimit} "
+            +$"seamLandingTrials={landingTrials} maximumLandingTrialsObserved={maximumLandingTrialsObserved} "
             +$"independentCostCacheHits={independentCostHits} independentCostCacheMisses={independentCostMisses} cacheScope=one-actual-departure "
+            +$"returnBudgetEntryLookups={returnBudgetEntryLookups} returnBudgetPriceHits={returnBudgetPriceHits} "
+            +$"costPrecheckEnabled={useCostPrecheck} costPrecheckComparisons={costPrecheckComparisons} costPrecheckGuardSkips={costPrecheckGuardSkips} "
+            +$"additionalPureCosts={additionalPureCosts} costPrecheckCacheMisses={costPrecheckCacheMisses} costPrecheckTransferFallbacks={costPrecheckTransferFallbacks} "
+            +"costPrecheckOrdering=cached-independent-zero-transfer-price-before-full-physical-guard acceptedCandidatesRequireFullGuard=True "
             +$"bodyCostCacheHits={bodyCostHits} bodyCostCacheMisses={bodyCostMisses} bodyCostUncached={bodyCostUncached} bodyCostCacheBoundRefusals={bodyCostBoundRefusals} "
             +"bodyCostCacheScope=route-originals-and-one-departure-derived-complete-path-values maximumDerivedBodyCacheEntries=128 maximumDerivedBodyCacheChords=262144 "
             +$"independentWinnerContinuation={IndependentEntryContinuationOverride.Value!=false} independentWinnerAttempts={independentWinnerAttempts} "
@@ -546,6 +663,7 @@ internal static class VCarveRingRouter
                 +"distanceScope=actual-return-optimized-source-trace finalEmitterRetractDistancesNotIncluded=True chainTourSuppressed=True");
         }
         cost?.Report(log,"smooth-ring-router");
+        enteredVisits?.Report(log);
         return result;
     }
 }

@@ -14,10 +14,33 @@ internal enum VCarveNativeAxialFreedom { None=0,Start=1,End=2,Both=Start|End }
 
 internal static class VCarveNativeStockContactFit
 {
+    internal sealed record SearchAudit(int Candidates,int DepthRejected,int GeometryExcluded,int GeometryProofs,string Outcome);
+    internal static readonly AsyncLocal<Action<SearchAudit>?> AuditObserver=new();
+    private sealed class SearchCounters
+    {
+        internal int Candidates,DepthRejected,GeometryExcluded,GeometryProofs;
+    }
     internal static Point3D Planar(Point3D p)=>VCarveNativeCurveMath.Unit(new(p.X,p.Y,0));
     internal static VCarveNativeFit? Find(Point3D[] p,Point3D startDirection,Point3D endDirection,
         VCarveNativeContainment guard,VCarveCutterProfile profile,VCarveNativeFitSettings settings,
-        CancellationToken token,out string outcome,VCarveNativeAxialFreedom freedom=VCarveNativeAxialFreedom.Both)
+        CancellationToken token,out string outcome,VCarveNativeAxialFreedom freedom=VCarveNativeAxialFreedom.Both,bool useGeometryRejection=true)
+    {
+        var watch=System.Diagnostics.Stopwatch.StartNew();var counters=new SearchCounters();
+        outcome="stock-contact-branch-unresolved";
+        try{return FindCore(p,startDirection,endDirection,guard,profile,settings,token,out outcome,freedom,useGeometryRejection,counters);}
+        finally
+        {
+            AuditObserver.Value?.Invoke(new(counters.Candidates,counters.DepthRejected,counters.GeometryExcluded,counters.GeometryProofs,outcome));
+            if(watch.ElapsedMilliseconds>=250)
+                Console.WriteLine($"[VCarve.NativeStockContactCost] elapsedMs={watch.Elapsed.TotalMilliseconds:F1} sourcePoints={p.Length} "
+                    +$"freedom={freedom} candidates={counters.Candidates} depthRejected={counters.DepthRejected} geometryExcluded={counters.GeometryExcluded} "
+                    +$"geometryProofs={counters.GeometryProofs} geometryRejectionEnabled={useGeometryRejection} outcome={outcome} canceled={token.IsCancellationRequested}");
+        }
+    }
+
+    private static VCarveNativeFit? FindCore(Point3D[] p,Point3D startDirection,Point3D endDirection,
+        VCarveNativeContainment guard,VCarveCutterProfile profile,VCarveNativeFitSettings settings,
+        CancellationToken token,out string outcome,VCarveNativeAxialFreedom freedom,bool useGeometryRejection,SearchCounters counters)
     {
         outcome="stock-contact-branch-unresolved";
         if(!guard.StockAware)throw new InvalidOperationException("STOCK_CONTACT_DIRECTION_REQUIRES_ACTUAL_STOCK");
@@ -44,7 +67,7 @@ internal static class VCarveNativeStockContactFit
         if(alpha<=0||beta<=0)return null;
         double z1=(zr1*bb-zr2*ab)/zdet,z2=(zr2*aa-zr1*ab)/zdet;
         double low=p.Min(q=>q.Z),high=p.Max(q=>q.Z);
-        var planarProgress=VCarveNativePlanarProgress.Create(p,0,last);
+        var planarProgress=VCarveNativePlanarProgress.CreateAdmission(p,0,last);
         // Dimensionless candidate inventory, not extra fit/depth allowances.
         bool freeStart=(freedom&VCarveNativeAxialFreedom.Start)!=0,freeEnd=(freedom&VCarveNativeAxialFreedom.End)!=0;
         double[] lifts=[0,1d/30,.1,.2,1d/3,2d/3,1];
@@ -52,12 +75,21 @@ internal static class VCarveNativeStockContactFit
         foreach(double za in freeStart?lifts:new[]{0d})foreach(double zb in freeEnd?lifts:new[]{0d})
         {
             token.ThrowIfCancellationRequested();
+            counters.Candidates++;
             double handleA=alpha*sa,handleB=beta*sb;
             if(!planarProgress.TrySelectHandles(p[0],p[last],u,v,ref handleA,ref handleB))continue;
             var a=VCarveNativeCurveMath.Add(p[0],VCarveNativeCurveMath.Mul(u,handleA)) with{Z=freeStart?z1+za*settings.FitErrorMm:p[0].Z+handleA*startDirection.Z/Math.Sqrt(startDirection.X*startDirection.X+startDirection.Y*startDirection.Y)};
             var b=VCarveNativeCurveMath.Sub(p[last],VCarveNativeCurveMath.Mul(v,handleB)) with{Z=freeEnd?z2+zb*settings.FitErrorMm:p[last].Z-handleB*endDirection.Z/Math.Sqrt(endDirection.X*endDirection.X+endDirection.Y*endDirection.Y)};
             var move=ToolMove.CubicBezier(p[0],a,b,p[last],0);var range=VCarveNativeCurveMath.ZRange(move);
-            if(range.Min<low-1e-9||range.Max>high+1e-9)continue;
+            if(!planarProgress.Preserved(move,out _))continue;
+            if(range.Min<low-1e-9||range.Max>high+1e-9){counters.DepthRejected++;continue;}
+            // Reuse the ordinary edge fitter's outward-padded convex-hull
+            // exclusion. A source vertex outside every curve enclosure cannot
+            // have the required continuous correspondence. Passing this filter
+            // grants nothing; the unchanged full geometry/stock proofs follow.
+            if(useGeometryRejection&&VCarveNativeGeometryRejection.Excluded(move,p,0,last,settings.FitErrorMm))
+            {counters.GeometryExcluded++;continue;}
+            counters.GeometryProofs++;
             var geometry=VCarveNativeGeometricProof.Prove(move,p,0,last,settings.FitErrorMm);
             if(!geometry.Certified)continue;
             // Samples reject only. The final full-curve stock proof is mandatory.

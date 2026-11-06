@@ -103,9 +103,18 @@ public static partial class PolygonOps
             internal double EmptyAtRadius = double.PositiveInfinity;
         }
 
-        internal BoundarySegmentIndex(Paths64 boundaries)
+        internal BoundarySegmentIndex(Paths64 boundaries) : this(boundaries,false)
         {
-            var segments = new List<BoundarySegment>();
+        }
+
+        internal BoundarySegmentIndex(Paths64 boundaries, bool useLiteralListConstruction)
+        {
+            List<BoundarySegment>? reference = useLiteralListConstruction ? new List<BoundarySegment>() : null;
+            int segmentCount = 0;
+            if (reference is null)
+                foreach (Path64 boundary in boundaries) segmentCount = checked(segmentCount + boundary.Count);
+            var segments = reference is null && segmentCount > 0 ? new BoundarySegment[segmentCount] : Array.Empty<BoundarySegment>();
+            int ordinal = 0;
             foreach (Path64 boundary in boundaries)
             {
                 for (int endIndex = 0, startIndex = boundary.Count - 1;
@@ -114,18 +123,20 @@ public static partial class PolygonOps
                 {
                     Point64 start = boundary[startIndex];
                     Point64 end = boundary[endIndex];
-                    segments.Add(new BoundarySegment(
+                    var segment = new BoundarySegment(
                         start,
                         end,
                         Math.Min(start.X, end.X),
                         Math.Min(start.Y, end.Y),
                         Math.Max(start.X, end.X),
                         Math.Max(start.Y, end.Y),
-                        segments.Count));
+                        ordinal++);
+                    if (reference is null) segments[segment.Ordinal] = segment;
+                    else reference.Add(segment);
                 }
             }
 
-            _segments = segments.ToArray();
+            _segments = reference is null ? segments : reference.ToArray();
             _root = _segments.Length == 0 ? null : BuildNode(0, _segments.Length);
             _legacyWitnessIndex = new Lazy<BoundarySegmentIndex>(BuildLegacyWitnessIndex,
                 LazyThreadSafetyMode.ExecutionAndPublication);
@@ -541,8 +552,21 @@ public static partial class PolygonOps
         internal IReadOnlyList<(double Start, double End)> ContactIntervals(
             Point64 start, Point64 end, double radius, CancellationToken token,
             out ContactIntervalQueryStatistics statistics)
+            =>ContactIntervalsCore(start,end,radius,token,false,out statistics,out _);
+
+        // An owned contour can prefer the existing filled-interior positive
+        // branch over the nearest-boundary nomination. Generic callers keep
+        // their literal distance-first query and statistics.
+        internal IReadOnlyList<(double Start,double End)> ContactIntervalsInteriorFirst(
+            Point64 start,Point64 end,double radius,CancellationToken token,
+            out ContactIntervalQueryStatistics statistics,out bool interiorShortcut)
+            =>ContactIntervalsCore(start,end,radius,token,true,out statistics,out interiorShortcut);
+
+        private IReadOnlyList<(double Start,double End)> ContactIntervalsCore(
+            Point64 start,Point64 end,double radius,CancellationToken token,bool interiorFirst,
+            out ContactIntervalQueryStatistics statistics,out bool interiorShortcut)
         {
-            statistics = default;
+            statistics = default;interiorShortcut=false;
             token.ThrowIfCancellationRequested();
             if (_root is null) return Array.Empty<(double, double)>();
             long dx = end.X - start.X, dy = end.Y - start.Y;
@@ -552,12 +576,21 @@ public static partial class PolygonOps
                     + (double)(start.Y - midpoint.Y) * (start.Y - midpoint.Y)),
                 Math.Sqrt((double)(end.X - midpoint.X) * (end.X - midpoint.X)
                     + (double)(end.Y - midpoint.Y) * (end.Y - midpoint.Y)));
+            // This is exactly the positive branch below with inside=true:
+            // distance=0, hence extent+1<=radius proves FullContact. The same
+            // integer midpoint/winding/extent and original one-grid reserve
+            // are used. No signed distance, radius or contact interval changes.
+            bool interiorTested=interiorFirst&&double.IsFinite(radius)&&radius>=0
+                &&double.IsFinite(extent)&&extent+1<=radius;
+            bool interior=interiorTested&&IsInside(midpoint);
+            if(interior)
+            {interiorShortcut=true;statistics=new(true,0);return FullContact;}
             double boundaryDistance = Math.Sqrt(DistanceSquared(midpoint));
             // A boundary capsule suffices regardless of which signed region
             // contains the midpoint; avoid a winding query in this common case.
             if (boundaryDistance + extent + 1 <= radius)
             { statistics = new(true, 0, true); return FullContact; }
-            bool inside = IsInside(midpoint);
+            bool inside = interiorTested?interior:IsInside(midpoint);
             double distance = inside ? 0 : boundaryDistance;
             // Distance to the filled region is 1-Lipschitz. One additional grid
             // unit bounds arithmetic; the caller separately reserves quantization.
@@ -2258,6 +2291,82 @@ public static partial class PolygonOps
 
     // --- Offsetting -----------------------------------------------------------
 
+    private static AsyncLocal<PocketGuideCaptureScope?>? _pocketGuideCapture;
+    internal sealed record PocketGuideSnapshot(PointD[][] Input,PointD[][] Expanded,double Radius,
+        double ArcTolerance,bool ConservativeConstruction,bool CompleteTargetCovered,string Outcome);
+    internal static IDisposable BeginPocketGuideCapture(Action<object> observer)
+    {
+        ArgumentNullException.ThrowIfNull(observer);
+        var owner=Volatile.Read(ref _pocketGuideCapture);
+        if(owner is null){var candidate=new AsyncLocal<PocketGuideCaptureScope?>();owner=Interlocked.CompareExchange(ref _pocketGuideCapture,candidate,null)??candidate;}
+        var scope=new PocketGuideCaptureScope(observer,owner.Value);owner.Value=scope;return scope;
+    }
+    private sealed class PocketGuideCaptureScope(Action<object> observer,PocketGuideCaptureScope? previous):IDisposable
+    {
+        private int captures,disposed;private long points;
+        internal void Capture(IReadOnlyList<IReadOnlyList<PointD>> input,IReadOnlyList<List<PointD>> expanded,
+            double radius,double arc,bool conservative,bool covered,string outcome)
+        {
+            if(Volatile.Read(ref disposed)!=0||Interlocked.Increment(ref captures)>4)return;
+            long count=input.Sum(p=>(long)p.Count)+expanded.Sum(p=>(long)p.Count);
+            if(Interlocked.Add(ref points,count)>1_000_000)return;
+            var snapshot=new PocketGuideSnapshot(input.Select(p=>p.ToArray()).ToArray(),expanded.Select(p=>p.ToArray()).ToArray(),
+                radius,arc,conservative,covered,outcome);
+            try{observer(snapshot);}catch(Exception error){Console.WriteLine($"[Milling.OutsideEdges.PocketGuideCapture] observerFailed={error.GetType().Name} geometryAuthority=False");}
+        }
+        public void Dispose(){if(Interlocked.Exchange(ref disposed,1)==0)_pocketGuideCapture!.Value=previous;}
+    }
+
+    /// <summary>Scoped guide construction only. Starts with the established
+    /// fallback and retains every original-source validation/repair. Complete
+    /// source coverage is additionally required before this nomination escapes.</summary>
+    internal static List<List<PointD>> OffsetPocketGuide(IReadOnlyList<IReadOnlyList<PointD>> source,
+        double radius,double arcTolerance,CancellationToken token,bool useConservativeConstruction=true)
+    {
+        token.ThrowIfCancellationRequested();long started=Stopwatch.GetTimestamp();
+        bool covered=false,used=false;string outcome="original-reference";
+        List<List<PointD>> Original()=>Offset(source,radius,arcTolerance,0,pruneCollapsedHoles:true);
+        List<List<PointD>> Finish(List<List<PointD>> output)
+        {
+            token.ThrowIfCancellationRequested();
+            Volatile.Read(ref _pocketGuideCapture)?.Value?.Capture(source,output,radius,arcTolerance,used,covered,outcome);
+            Console.WriteLine($"[Milling.OutsideEdges.PocketGuideConstruction] conservativeFirst={used} rawCandidateNominationAvoided={used} "
+                +$"completeTargetCovered={covered} outcome={outcome} inputContours={source.Count} inputPoints={source.Sum(p=>(long)p.Count)} "
+                +$"outputContours={output.Count} outputPoints={output.Sum(p=>(long)p.Count)} radius={radius:R} arcTolerance={arcTolerance:R} "
+                +$"elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F3} originalSourceValidationAndRepair=True finalAccessGuardsUnchanged=True");
+            return output;
+        }
+        if(!useConservativeConstruction)return Finish(Original());
+        if(!double.IsFinite(radius)||radius*PathUtils.Scale<=4||!double.IsFinite(arcTolerance)||arcTolerance<=0)
+        {outcome="unsupported-original-fallback";return Finish(Original());}
+        try
+        {
+            var original=ToPaths64(source);double delta=radius*PathUtils.Scale;
+            if(original.Count==0){covered=true;outcome="empty";return Finish(new());}
+            used=true;
+            var solution=BuildConservativeOffset(original,delta,arcTolerance);
+            var candidate=new Paths64(solution);var boundary=new BoundarySegmentIndex(original);
+            RemoveOffsetInversions(boundary,solution,delta,arcTolerance,
+                out bool significant,out _,out double deficit);
+            if(significant)solution=RepairConservativeOffset(new BoundarySegmentIndex(original),Clipper.Union(original,FillRule.NonZero),
+                candidate,delta,arcTolerance,deficit);
+            token.ThrowIfCancellationRequested();
+            covered=Clipper.Difference(original,solution,FillRule.NonZero).Count==0;
+            token.ThrowIfCancellationRequested();
+            if(covered)
+            {
+                var output=FromPaths64(solution);NormalizeOrder(output);outcome="conservative-complete-target";return Finish(output);
+            }
+            outcome="incomplete-target-original-fallback";
+        }
+        catch(InvalidOperationException error)
+        {
+            outcome="uncertain-original-fallback";
+            Console.WriteLine($"[Milling.OutsideEdges.PocketGuideConstruction] event=proposal-refused reason={error.GetType().Name} detail='{error.Message}' originalFallback=True");
+        }
+        used=false;return Finish(Original());
+    }
+
     /// <summary>
     /// Cutter-center erosion with a complete-chord proof against the original
     /// source. Its reserve covers integer geometry, float command coordinates,
@@ -2409,7 +2518,20 @@ public static partial class PolygonOps
         double simplifyTolerance = PolygonSimplify.DefaultTolerance,
         JoinType joinType = JoinType.Round,
         bool pruneCollapsedHoles = false)
+        => OffsetWithBoundaryIndexControl(polygons,delta,arcTolerance,simplifyTolerance,joinType,
+            pruneCollapsedHoles,true,out _);
+
+    internal readonly record struct OffsetBoundaryIndexWork(int SourceSegments,int Requests,int Builds,
+        int Reuses,long FinalArraySlots,double BuildMilliseconds);
+
+    // Diagnostic control retains the literal former independent index owners.
+    // It cannot alter input geometry, validation queries, repair order or flags.
+    internal static List<List<PointD>> OffsetWithBoundaryIndexControl(
+        IEnumerable<IReadOnlyList<PointD>> polygons,double delta,double arcTolerance,double simplifyTolerance,
+        JoinType joinType,bool pruneCollapsedHoles,bool reuseOriginalBoundaryIndex,
+        out OffsetBoundaryIndexWork boundaryWork)
     {
+        boundaryWork=default;
         var group = ToPaths64(polygons);
         if (group.Count == 0)
             return new List<List<PointD>>();
@@ -2487,8 +2609,22 @@ public static partial class PolygonOps
 
         int rawCount = solution.Count;
         long validationStart = PerfLog.Start();
+        BoundarySegmentIndex? originalIndex=null;
+        int indexRequests=0,indexBuilds=0,sourceSegments=0;
+        long indexBuildTicks=0;
+        BoundarySegmentIndex OriginalBoundaryIndex()
+        {
+            indexRequests++;
+            if(reuseOriginalBoundaryIndex&&originalIndex is not null)return originalIndex;
+            long started=Stopwatch.GetTimestamp();
+            var created=new BoundarySegmentIndex(originalGroup);
+            indexBuildTicks+=Stopwatch.GetTimestamp()-started;
+            indexBuilds++;sourceSegments=created.SegmentCount;
+            if(reuseOriginalBoundaryIndex)originalIndex=created;
+            return created;
+        }
         int rejected = RemoveOffsetInversions(
-            new BoundarySegmentIndex(originalGroup), solution, scaledDelta, arcTolerance,
+            OriginalBoundaryIndex(), solution, scaledDelta, arcTolerance,
             out bool rejectedSignificantContour, out string details);
         int fallbackCount = 0;
         int fallbackRejected = 0;
@@ -2498,7 +2634,7 @@ public static partial class PolygonOps
             fallbackCount = solution.Count;
             var rawCandidate = new Paths64(solution);
             fallbackRejected = RemoveOffsetInversions(
-                new BoundarySegmentIndex(originalGroup),
+                OriginalBoundaryIndex(),
                 solution,
                 scaledDelta,
                 arcTolerance,
@@ -2508,9 +2644,16 @@ public static partial class PolygonOps
             if (fallbackRejected > 0)
                 details += $";fallbackRejected={fallbackRejected}:{fallbackDetails}";
             if (fallbackSignificant)
-                solution = RepairConservativeOffset(new BoundarySegmentIndex(originalGroup),
+                solution = RepairConservativeOffset(OriginalBoundaryIndex(),
                     Clipper.Union(originalGroup, FillRule.NonZero), rawCandidate, scaledDelta, arcTolerance, significantDeficit);
         }
+
+        boundaryWork=new(sourceSegments,indexRequests,indexBuilds,indexRequests-indexBuilds,
+            (long)sourceSegments*indexBuilds,1000d*indexBuildTicks/Stopwatch.Frequency);
+        if(indexRequests>1)
+            Console.WriteLine($"[PolygonOps.OffsetBoundaryIndex] requests={indexRequests} builds={indexBuilds} reuses={indexRequests-indexBuilds} "
+                +$"sourceSegments={sourceSegments} finalArraySlots={(long)sourceSegments*indexBuilds} buildMs={boundaryWork.BuildMilliseconds:F3} "
+                +$"storage=direct-final-array legacyWitnessStorageSeparate=True source=exact-original-group sameQueryOrder=True reuseEnabled={reuseOriginalBoundaryIndex}");
 
         if (rejected > 0)
         {

@@ -108,6 +108,23 @@ internal static class FilledFrontEvidenceCache
             }
         }
 
+        /// <summary>Transfers one complete value to a sole mutable consumer.</summary>
+        internal T? Take(Key? key,CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();if(key is null)return null;
+            lock(_sync)
+            {
+                token.ThrowIfCancellationRequested();
+                for(var node=_entries.First;node is not null;node=node.Next)
+                {
+                    if(!node.Value.Key.Same(key))continue;
+                    _entries.Remove(node);_bytes-=node.Value.Bytes;_hits++;
+                    return node.Value.Value;
+                }
+                _misses++;return null;
+            }
+        }
+
         internal void Publish(Key? key, T value, long valueBytes, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();

@@ -9,6 +9,77 @@ namespace RW.Toolpaths.Milling;
 /// sites; their endpoints do not define additional cones in that surface.</summary>
 internal static class VCarveRampSurface
 {
+    internal sealed record InitialOutline(IReadOnlyList<IReadOnlyList<PointD>> Boundary,
+        ConcentricBandSchedule.RampBand Band,MillingRegion[] Regions,double GeometricReach,
+        double FillLimit,bool RestFill,double Reach,double Intervals,RingOffsetOptions? Construction,double Depth)
+    {internal int PlateauConstantOffsetLeafVertices {get;init;}=SmoothRoughingPlateau.DefaultConstantOffsetLeafVertices;}
+    internal static IReadOnlyList<IReadOnlyList<PointD>> OutlineBoundary(IReadOnlyList<IReadOnlyList<PointD>> boundary,VCarveOptions options)
+        =>options.RampOutsideEdges&&options.AccessTarget is {} access?PolygonOps.Intersect(boundary,access.Target):boundary;
+    internal static InitialOutline PrepareInitialOutline(IReadOnlyList<IReadOnlyList<PointD>> boundary,
+        VCarveOptions options,VCarveCutterProfile profile,double depth,CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        boundary=boundary.Select(r=>(IReadOnlyList<PointD>)r.ToArray()).ToArray();
+        var band=ConcentricBandSchedule.Ramp(profile,depth,options);
+        var regions=PolygonOps.DifferenceToComponents(boundary,Array.Empty<IReadOnlyList<PointD>>())
+            .Select(c=>new MillingRegion(c.Outer,c.Holes)).ToArray();
+        double geometricReach=regions.Select(r=>Math.Min(r.Outer.Max(p=>p.x)-r.Outer.Min(p=>p.x),
+            r.Outer.Max(p=>p.y)-r.Outer.Min(p=>p.y))/2).DefaultIfEmpty(0).Max();
+        double fillLimit=options.IncludeInteriorFill?double.PositiveInfinity:options.EdgeFillWidth;
+        bool restFill=options.ExcludeDiscSweep&&(options.IncludeInteriorFill||fillLimit>0);
+        double reach=Math.Min(geometricReach,restFill?band.Reach:options.IncludeInteriorFill?geometricReach:band.Reach+fillLimit);
+        double intervals=reach<band.First?0:Math.Floor((reach-band.First)/band.Pitch+1e-10);
+        RingOffsetOptions? construction=reach>=band.First&&double.IsFinite(intervals)&&band.Pitch>0&&intervals<RingOffsetEngine.AbsoluteRingLimit
+            ?new RingOffsetOptions(band.First,band.Pitch){MaximumInset=intervals*band.Pitch,RingLimit=(int)intervals+1,
+                MinimumRingArea=0,Tolerances=GeometryTolerances.Default with{ArcTolerance=.001,SimplifyTolerance=0}}:null;
+        return new(boundary,band,regions,geometricReach,fillLimit,restFill,reach,intervals,construction,depth)
+            {PlateauConstantOffsetLeafVertices=SmoothRoughingPlateau.CaptureConstantOffsetLeafVertices(options)};
+    }
+    internal static List<OffsetRing> BuildInitialOutline(InitialOutline request,CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        return request.Construction is null?new():MedialAxisGeometry.BuildConcentricFill(request.Regions,
+            request.Construction,sweepRadius:0,preserveTerminalPaths:false,cancellationToken:token);
+    }
+    internal sealed record RestFillRequest(IReadOnlyList<IReadOnlyList<PointD>> Boundary,
+        IReadOnlyList<TaggedToolpath> Crests,IReadOnlyList<IReadOnlyList<PointD>>? Target,
+        double Depth,double Grade,double DiscRadius)
+    {internal int PlateauConstantOffsetLeafVertices {get;init;}=SmoothRoughingPlateau.DefaultConstantOffsetLeafVertices;}
+    internal sealed record RestFillPreparation(IReadOnlyList<IReadOnlyList<PointD>> MaterialFloor,
+        VCarveDiscSweepExclusion Disc,double PlateauMilliseconds,double DiscMilliseconds)
+    {
+        internal long EstimatedBytes=>256L+64L*(MaterialFloor.Count+Disc.SweptRegion.Count)
+            +32L*(MaterialFloor.Sum(r=>(long)r.Count)+Disc.SweptRegion.Sum(r=>(long)r.Count));
+    }
+    internal static RestFillRequest CaptureRestFillRequest(IReadOnlyList<IReadOnlyList<PointD>> boundary,
+        VCarveOptions options,double depth,double grade,CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        IReadOnlyList<IReadOnlyList<PointD>> Snapshot(IReadOnlyList<IReadOnlyList<PointD>> rings)
+            =>rings.Select(r=>{token.ThrowIfCancellationRequested();return(IReadOnlyList<PointD>)r.ToArray();}).ToArray();
+        var captured=Snapshot(boundary);
+        var crests=Sources(captured,options,token).Select(path=>path with{Points=path.Points.ToArray()}).ToArray();
+        var target=options.AccessTarget is {} access?Snapshot(access.Target):null;
+        token.ThrowIfCancellationRequested();return new(captured,crests,target,depth,grade,options.DiscRadius)
+            {PlateauConstantOffsetLeafVertices=SmoothRoughingPlateau.CaptureConstantOffsetLeafVertices(options)};
+    }
+    internal static RestFillPreparation BuildRestFillPreparation(RestFillRequest request,CancellationToken token,
+        Action<string>? diagnostic)
+    {
+        token.ThrowIfCancellationRequested();long started=Stopwatch.GetTimestamp();
+        var protectedSlope=request.Crests.Count==0?new List<IReadOnlyList<PointD>>()
+            :SmoothRoughingPlateau.Build(request.Crests,request.Boundary,request.Depth,request.Grade,token,target:request.Target,
+                maximumConstantOffsetInputVertices:request.PlateauConstantOffsetLeafVertices);
+        var materialFloor=PolygonOps.Difference(request.Boundary,protectedSlope);
+        token.ThrowIfCancellationRequested();double plateauMs=Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        started=Stopwatch.GetTimestamp();
+        var disc=new VCarveDiscSweepExclusion(materialFloor,request.DiscRadius,token,diagnostic,"shared-material-plateau");
+        token.ThrowIfCancellationRequested();
+        return new(materialFloor,disc,plateauMs,Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+    }
+    internal static bool HasRestFillFront(IReadOnlyList<OffsetRing> rings,InitialOutline request)
+        =>request.RestFill&&rings.Any(r=>r.IsClosed&&Math.Abs(
+            r.OffsetDistance.GetValueOrDefault(request.Band.First+r.Level*request.Band.Pitch)-request.Band.Reach)<=1/PathUtils.Scale);
     // The complete slope is additive. Fill Limit selects only the subsequent
     // floor cleanup; it never truncates a ramp. These remain nominations: the
     // existing floor/wall/posted-chord guards own Z and the full cutter envelope.
@@ -17,52 +88,55 @@ internal static class VCarveRampSurface
         CancellationToken token, Action<string>? diagnostic)
     {
         token.ThrowIfCancellationRequested();
-        long started = Stopwatch.GetTimestamp();
+        long started = Stopwatch.GetTimestamp(),stamp=started;
+        string phase="request";bool completed=false;
+        double requestMs=0,outlineMs=0,restPreparationMs=0,stockMs=0,bandMs=0,restFillMs=0,ownerMapMs=0,
+            selectionIndexMs=0,nestingMs=0,traversalMs=0,selectionMs=0,targetTrimMs=0;
+        try
+        {
         // The physical domain already removes approved outside walls. Offsetting
         // its intersection with Target would put those walls back into every
         // concentric front. Keep the physical wall fronts and clip their visits
         // to demand only after offsetting. Explicit outside ramps opt back in.
-        if (options.RampOutsideEdges && options.AccessTarget is { } access)
-            boundary = PolygonOps.Intersect(boundary, access.Target);
+        boundary=OutlineBoundary(boundary,options);
         if (MillingGeometryTrace.Observer.Value is not null)
             MillingGeometryTrace.Capture("outline-source", regionIndex, boundary.Select(r =>
                 new TaggedToolpath(r.Select(p => new Point3D(p.x,p.y,0)).ToArray(),
                     Array.Empty<ToolpathSpan>(),regionIndex,"outline-source",null,detectCurves:false)).ToArray());
         string contourSource = options.AccessTarget != null && !options.RampOutsideEdges
             ? "retained-physical-walls" : "cutting-outline";
-        var rampBand=ConcentricBandSchedule.Ramp(profile,depth,options);
+        var initial=PrepareInitialOutline(boundary,options,profile,depth,token);
+        requestMs=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;
+        var rampBand=initial.Band;
         double grade=rampBand.Grade,diameter=2*profile.PhysicalRadiusAtDepth(depth);
         double surfacePitch=rampBand.SurfacePitch,pitch=rampBand.Pitch,first=rampBand.First;
-        var regions = PolygonOps.DifferenceToComponents(boundary, Array.Empty<IReadOnlyList<PointD>>())
-            .Select(c => new MillingRegion(c.Outer, c.Holes)).ToArray();
+        var regions=initial.Regions;
         // No inset survives beyond half the smaller source box span. Bound
         // shallow-angle work by geometry before checking the ring inventory.
-        double geometricReach = regions.Select(r => Math.Min(r.Outer.Max(p => p.x) - r.Outer.Min(p => p.x),
-            r.Outer.Max(p => p.y) - r.Outer.Min(p => p.y)) / 2).DefaultIfEmpty(0).Max();
+        double geometricReach=initial.GeometricReach;
         double requiredReach = rampBand.Reach;
         // Interior clearing starts at the completed slope's last offset front,
         // exactly where the blue cleanup rows continue the red slope rows. Do
         // not restart distance measurement at the theoretical surface lip
         // outside that front: its cutter-support collar is already slope work.
         double floorInset = requiredReach;
-        double fillLimit = options.IncludeInteriorFill ? double.PositiveInfinity : options.EdgeFillWidth;
+        double fillLimit=initial.FillLimit;
         // Fill Limit is a centre-to-nearest-floor-edge DISTANCE. Eroding the
         // source by rampReach + L is the same as eroding the completed slope
         // front by L. The shared offset lattice therefore selects this band
         // directly, including complete narrow pockets, without a disc-opening
         // mask that would discard their inner rings. Never halve this distance.
-        bool restFill=options.ExcludeDiscSweep&&(options.IncludeInteriorFill||fillLimit>0);
-        double reach = Math.Min(geometricReach, restFill ? requiredReach : options.IncludeInteriorFill ? geometricReach
-            : requiredReach + fillLimit);
+        bool restFill=initial.RestFill;
+        double reach=initial.Reach;
         if (reach < first)
         {
             diagnostic?.Invoke($"stage=outline-ramps event=empty region={regionIndex} reason=no-commandable-closed-inset "
                 + $"firstInset={first:R} geometricReach={geometricReach:R} medialDetailRetained=True");
-            return new();
+            completed=true;return new();
         }
         // Fit to the authored band once, independent of a component's size.
         // Smaller components consume a prefix of that same offset lattice.
-        double intervals = Math.Floor((reach - first) / pitch + 1e-10);
+        double intervals=initial.Intervals;
         if (!double.IsFinite(intervals) || pitch <= 0 || intervals >= RingOffsetEngine.AbsoluteRingLimit)
         {
             diagnostic?.Invoke($"stage=outline-ramps event=failed reason=ring-budget reach={reach:R} pitch={pitch:R} intervals={intervals:R}");
@@ -74,12 +148,11 @@ internal static class VCarveRampSurface
             + $"firstInset={first:R} reach={reach:R} lastInset={first+scheduledInset:R} pitch={pitch:R} surfacePitch={surfacePitch:R} grade={grade:R} "
             + $"authoredFillLimit={options.EdgeFillWidth:R} floorInset={floorInset:R} requiredRampReach={requiredReach:R} "
             + "rampTruncated=False fillLimitAppliesTo=post-slope-nearest-edge-distance fillLimitMeasure=distance-not-diameter medialGraphReplaced=False");
-        var rings = MedialAxisGeometry.BuildConcentricFill(regions,
-            new RingOffsetOptions(first, pitch) {
-                MaximumInset = scheduledInset, RingLimit = (int)intervals + 1,
-                MinimumRingArea = 0,
-                Tolerances = GeometryTolerances.Default with { ArcTolerance = .001, SimplifyTolerance = 0 },
-            }, sweepRadius: 0, preserveTerminalPaths: false, cancellationToken: token);
+        VCarvePreparation.RestFillPrefetch? restFillPrefetch=null;
+        phase="raw-outline";stamp=Stopwatch.GetTimestamp();
+        var rings=options.Preparation is {} prepared
+            ?prepared.InitialOutlineRings(initial,token,diagnostic,out restFillPrefetch):BuildInitialOutline(initial,token);
+        outlineMs=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;
         double ringsMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         // Keep the slope inventory literal. For rest filling, subtract AREAS
         // first and offset their boundaries, including the actual rougher hole.
@@ -91,26 +164,39 @@ internal static class VCarveRampSurface
             .Select(r => r.IsHole ? (IReadOnlyList<PointD>)r.Points.AsEnumerable().Reverse().ToArray() : r.Points).ToArray();
         if (restFill&&floor.Length>0)
         {
+            phase="rest-helper";stamp=Stopwatch.GetTimestamp();
             // Fill Limit is measured on the finisher's supported centre front,
             // but a roughing disc fits the MATERIAL floor. Testing it inside the
             // smaller centre front compensates for the finishing cutter again
             // and can reject a disc that the real rougher has already swept.
             // Use the same continuous material plateau as Pocket analysis; its
             // physical reserves and outside-edge policy stay in that owner.
-            var protectedSlope = Plateau(boundary,options,depth,grade,token);
-            var materialFloor = PolygonOps.Difference(boundary,protectedSlope);
-            disc = new(materialFloor,options.DiscRadius,token,diagnostic,"shared-material-plateau");
+            var restRequest=CaptureRestFillRequest(boundary,options,depth,grade,token);
+            if(restFillPrefetch is null)diagnostic?.Invoke("stage=rest-fill-prefetch event=miss reason=not-in-consumed-outline-batch "
+                +"stockRead=False actualOriginalHelperRequired=True");
+            var restPreparation=restFillPrefetch?.Take(restRequest,token,diagnostic)
+                ??BuildRestFillPreparation(restRequest,token,diagnostic);
+            var materialFloor=restPreparation.MaterialFloor;
+            disc=restPreparation.Disc;
+            restPreparationMs=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;
             diagnostic?.Invoke($"stage=disc-sweep event=domain region={regionIndex} "
                 + $"centreFrontArea={Math.Abs(floor.Sum(PolygonOps.SignedArea)):R} "
                 + $"materialFloorArea={Math.Abs(materialFloor.Sum(PolygonOps.SignedArea)):R} "
                 + "domainOwner=VCarveRampSurface.Plateau sharedWith=Pocket.AnalyzeSourcePlateaus "
                 + "finisherCompensationAppliedToDisc=False fillLimitReference=completed-slope-front");
+            phase="posted-stock";stamp=Stopwatch.GetTimestamp();
             var stock=options.RestFillStock??new VCarvePostedFloorSweep(
                 options.RoughingRestChords.Concat(options.ClearedStock?.Chords??Array.Empty<VCarveRoughingChord>()));
             var cleared=stock.AtDepth(depth,token,diagnostic);
+            stockMs=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;
+            phase="floor-band";stamp=Stopwatch.GetTimestamp();
             IReadOnlyList<IReadOnlyList<PointD>> band=double.IsPositiveInfinity(fillLimit) ? floor
                 : PolygonOps.Difference(floor,PolygonOps.Offset(floor,-fillLimit,.001,0));
+            bandMs=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;
+            phase="rest-fill";stamp=Stopwatch.GetTimestamp();
             var cleanup=disc.Fill(band,cleared,pitch,fillLimit,token,diagnostic);
+            restFillMs=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;
+            phase="rest-owner-map";stamp=Stopwatch.GetTimestamp();
             int firstLevel=rings.Max(r=>r.Level)+1;
             var owners=regions.Select(r=>new PolygonOps.BoundarySegmentIndex(PathUtils.ToClipper(
                 new[]{r.Outer}.Concat(r.Holes)))).ToArray();
@@ -123,6 +209,7 @@ internal static class VCarveRampSurface
                 var appended=new OffsetRing(ring.Points,firstLevel+ring.Level,owner,ring.IsHole,true,ring.OffsetDistance);
                 rings.Add(appended);restRings.Add(appended);
             }
+            ownerMapMs=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;
         }
         if (MillingGeometryTrace.Observer.Value is not null)
         {
@@ -133,14 +220,21 @@ internal static class VCarveRampSurface
                     Array.Empty<ToolpathSpan>(),regionIndex,"post-slope-front",null,detectCurves:false)).ToArray());
         }
         long selectionStarted = Stopwatch.GetTimestamp();
+        phase="selection-index";stamp=Stopwatch.GetTimestamp();
         var result = new List<TaggedToolpath>(rings.Count);
         int rampRings = 0, floorRings = 0, floorSpans = 0;
         double selectedFloorLength = 0, lastFloorDistance = 0;
         var floorIndex=restRings.Count>0 ? new PolygonOps.BoundarySegmentIndex(PathUtils.ToClipper(floor)) : null;
+        selectionIndexMs=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;
+        phase="nesting";stamp=Stopwatch.GetTimestamp();
         RingOffsetEngine.BuildNesting(rings);
+        nestingMs=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;
+        phase="traversal";stamp=Stopwatch.GetTimestamp();
         var traversal=RingOffsetEngine.BuildTraversal(rings,options.ProfileDirection==VCarveProfileDirection.BottomUp);
         var ringPlan=new VCarveRingOrder.Plan(rings.Select(r=>r.Parent).ToArray(),traversal.Order,
             options.ProfileDirection==VCarveProfileDirection.BottomUp,rings.Select(r=>r.Level).ToArray(),rings.Select(r=>r.RegionIndex).ToArray(),walls:boundary);
+        traversalMs=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;
+        phase="selection-and-distance-audit";stamp=Stopwatch.GetTimestamp();
         foreach (int ringIndex in traversal.Order)
         {
             token.ThrowIfCancellationRequested();
@@ -174,8 +268,11 @@ internal static class VCarveRampSurface
                     throw new InvalidOperationException("Post-slope cleanup exceeded its nearest-edge Fill Limit.");
             }
         }
+        selectionMs=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;
+        phase="target-trim";stamp=Stopwatch.GetTimestamp();
         if (options.AccessTarget is { } target)
-            result = target.Trim(result, profile.PhysicalRadiusAtDepth, token);
+            result = target.TrimOwnedContours(result,profile,token,diagnostic);
+        targetTrimMs=Stopwatch.GetElapsedTime(stamp).TotalMilliseconds;phase="publication";stamp=Stopwatch.GetTimestamp();
         MillingGeometryTrace.Capture("outline-selected",regionIndex,result);
         diagnostic?.Invoke($"stage=outline-ramps event=nominated region={regionIndex} paths={result.Count} "
             + $"points={result.Sum(p => (long)p.Points.Count)} direction={options.ProfileDirection} "
@@ -190,7 +287,18 @@ internal static class VCarveRampSurface
             + $"ringsMs={ringsMs:R} selectionAndTargetTrimMs={Stopwatch.GetElapsedTime(selectionStarted).TotalMilliseconds:R} "
             + "residualBoundary=complete-last-slope-front theoreticalFloorLipNotUsed=True "
             + "limitOwner=shared-concentric-schedule slopeAdditive=True physicalProtectionRequired=True");
-        return result;
+        token.ThrowIfCancellationRequested();completed=true;return result;
+        }
+        finally
+        {
+            void Report()=>diagnostic?.Invoke($"stage=outline-ramps-phases event=complete region={regionIndex} completed={completed} activeStage={phase} "
+                +$"requestMs={requestMs:F3} rawOutlineMs={outlineMs:F3} restPreparationMs={restPreparationMs:F3} postedStockMs={stockMs:F3} "
+                +$"floorBandMs={bandMs:F3} restFillMs={restFillMs:F3} restOwnerMapMs={ownerMapMs:F3} selectionIndexMs={selectionIndexMs:F3} "
+                +$"nestingMs={nestingMs:F3} traversalMs={traversalMs:F3} selectionAndDistanceAuditMs={selectionMs:F3} targetTrimMs={targetTrimMs:F3} "
+                +$"elapsedMs={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F3} unfinishedStageMs={(completed?0:Stopwatch.GetElapsedTime(stamp).TotalMilliseconds):F3} "
+                +"timing=owned-disjoint-wall-stages originalGeometryAndProfile=True physicalDepthFittingOccursLater=True");
+            if(completed)Report();else try{Report();}catch{/* Preserve the original geometry/cancellation failure. */}
+        }
     }
 
     private static double OpenLength(IReadOnlyList<PointD> points)
@@ -258,6 +366,7 @@ internal static class VCarveRampSurface
         // This mask bounds MATERIAL, before the rougher's one compensation.
         // Finishing cutter support belongs to FloorField, not to this mask.
         return crests.Count == 0 ? new List<IReadOnlyList<PointD>>() : SmoothRoughingPlateau.Build(crests, boundary,
-            floor, grade, token, target: options.AccessTarget?.Target);
+            floor, grade, token, target: options.AccessTarget?.Target,
+            maximumConstantOffsetInputVertices:SmoothRoughingPlateau.CaptureConstantOffsetLeafVertices(options));
     }
 }

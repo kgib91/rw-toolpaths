@@ -1,4 +1,22 @@
+using System.Diagnostics;
+
 namespace RW.Toolpaths.Milling;
+
+/// <summary>Optional nomination effort, never stock or cutter authority.</summary>
+internal sealed class ToolpathContinuationSearchLimits
+{
+    internal const int DefaultNearbyGoals=48,DefaultVisibilityProofs=100_000;
+    internal int NearbyGoalsPerTarget{get;}
+    internal int OperationVisibilityProofs{get;}
+    internal ToolpathContinuationSearchLimits(int nearbyGoalsPerTarget,int operationVisibilityProofs)
+    {
+        if(nearbyGoalsPerTarget<0||nearbyGoalsPerTarget>DefaultNearbyGoals)
+            throw new ArgumentOutOfRangeException(nameof(nearbyGoalsPerTarget));
+        if(operationVisibilityProofs<0||operationVisibilityProofs>DefaultVisibilityProofs)
+            throw new ArgumentOutOfRangeException(nameof(operationVisibilityProofs));
+        NearbyGoalsPerTarget=nearbyGoalsPerTarget;OperationVisibilityProofs=operationVisibilityProofs;
+    }
+}
 
 /// <summary>
 /// The common execution policy: continue directly, retrace executed motion, then
@@ -31,15 +49,24 @@ internal sealed class ToolpathContinuationPlanner
     private long direct, retraces, entries, examined, recordRefusals, boundedSearches, visibilityTests, priorAirEdges;
     private readonly Dictionary<string, long> reasons = new();
     private long shortVisibilityProofs, shortVisibilityAccepted, indexedPortals;
+    private long costFirstQueries, costFirstDirectProofSkips, costFirstGoalProofSkips, costFirstTravelBypasses;
+    private long noNewChordQueries,noNewChordDirectSkips,noNewChordGoalPassSkips,noNewChordVisibilityPassSkips;
+    private readonly int nearbyGoalLimit,visibilityProofLimit;
+    private readonly bool boundedDiscovery;
+    private long nearbyGoalLimitExcluded,nearbyGoalPassesSkipped,visibilityLimitStoppedPasses;
+    private long directQueryTicks,goalQueryTicks,aStarQueryTicks;
     private readonly List<(double Distance, string Reason, Point3D From, Point3D Target)> longReentries = new();
     internal string LastFailure {get;private set;}="no-certified-route";
 
     internal ToolpathContinuationPlanner(string owner, double neighbourhood,
-        CancellationToken token, Action<string>? diagnostic = null)
+        CancellationToken token, Action<string>? diagnostic = null,ToolpathContinuationSearchLimits? searchLimits=null)
     {
         if (!double.IsFinite(neighbourhood) || neighbourhood<=0) throw new ArgumentOutOfRangeException(nameof(neighbourhood));
         this.owner = owner; this.neighbourhood = Math.Max(.01, neighbourhood);
         this.token = token; this.diagnostic = diagnostic;
+        nearbyGoalLimit=searchLimits?.NearbyGoalsPerTarget??ToolpathContinuationSearchLimits.DefaultNearbyGoals;
+        visibilityProofLimit=searchLimits?.OperationVisibilityProofs??ToolpathContinuationSearchLimits.DefaultVisibilityProofs;
+        boundedDiscovery=searchLimits is not null;
     }
 
     /// <summary>Only literal executed endpoints and chords enter the graph.
@@ -115,39 +142,66 @@ internal sealed class ToolpathContinuationPlanner
         Func<Point3D, Point3D, bool> allowsNewChord,
         Func<Point3D,Point3D,bool>? positiveTravelClearance = null,double clearedTravelCostRatio=1,
         IReadOnlyList<double>? targetCosts=null,IReadOnlyList<Point3D>? preferredEntryPortals=null,
-        double maximumCost=double.PositiveInfinity, ToolpathMotionCost? motionCost=null)
+        double maximumCost=double.PositiveInfinity, ToolpathMotionCost? motionCost=null,
+        bool costBeforeNewChord=false,bool newChordAuthorityAvailable=true)
     {
         token.ThrowIfCancellationRequested();
         LastFailure="no-certified-route";
         if(!Finite(from) || targets.Count==0 || targets.Any(p=>!Finite(p)))
         {LastFailure="unsupported-command-domain";return null;}
+        long directStarted=Stopwatch.GetTimestamp();
+        if(!newChordAuthorityAvailable)noNewChordQueries++;
         double ratio=positiveTravelClearance is null ? 1 : Math.Clamp(clearedTravelCostRatio,.001,1);
+        // Flat-pocket target prices are immutable scalar retained-visit costs.
+        // With no travel callback, chord prices and the existing A* distance
+        // lower bound are pure. Reject only nominations that cannot beat the
+        // already available complete source entry; every survivor still needs
+        // the original cutter/posted-stock proof. Opaque travel callbacks keep
+        // their original guard-first traversal, including cache warming.
+        bool priceFirst=costBeforeNewChord&&motionCost is not null&&positiveTravelClearance is null;
+        if(priceFirst)costFirstQueries++;
+        else if(costBeforeNewChord&&positiveTravelClearance is not null)costFirstTravelBypasses++;
         var travelProofs=new Dictionary<(Point3D,Point3D),bool>();
         Connection? directFallback=null;double directCost=double.PositiveInfinity;
         for (int i = 0; i < targets.Count; i++)
         {
             if (from == targets[i] && TargetCost(i)<=maximumCost)
-            { direct++; return Finish(new[] {from},i,"coincident"); }
+            { direct++;directQueryTicks+=Stopwatch.GetTimestamp()-directStarted;return Finish(new[] {from},i,"coincident"); }
+            // Only an explicitly absent adapter supplies this capability.
+            // Opaque delegates, including always-false ones, retain the old
+            // query traversal; exact native graph edges/goals remain available.
+            if(!newChordAuthorityAvailable){noNewChordDirectSkips++;continue;}
+            double? pricedDirect=null;
+            if(priceFirst)
+            {
+                pricedDirect=Cost(from,targets[i])+TargetCost(i);
+                if(pricedDirect>maximumCost){costFirstDirectProofSkips++;continue;}
+            }
             if (allowsNewChord(from, targets[i]))
             {
                 var candidate=Finish(new[] {from,targets[i]},i,"certified-direct");
-                double cost=Cost(from,targets[i])+TargetCost(i);
+                double cost=pricedDirect??Cost(from,targets[i])+TargetCost(i);
                 if(cost>maximumCost)continue;
                 // All legal entry poses compete with their complete retained entry cost.
                 if(cost<directCost){directCost=cost;directFallback=candidate;}
             }
         }
+        directQueryTicks+=Stopwatch.GetTimestamp()-directStarted;
+        long goalStarted=Stopwatch.GetTimestamp();
         if (!ordinals.TryGetValue(from, out int start))
-        {LastFailure=recordRefusals>0 ? "execution-graph-work-limit" : "exit-not-in-proved-network";return Fallback();}
+        {goalQueryTicks+=Stopwatch.GetTimestamp()-goalStarted;LastFailure=recordRefusals>0 ? "execution-graph-work-limit" : "exit-not-in-proved-network";return Fallback();}
         var goals = new Dictionary<int, (int Target, double Extra)>();
         for (int target = 0; target < targets.Count; target++)
         {
             var point = targets[target];
             if (ordinals.TryGetValue(point, out int exact)) AddGoal(exact, target, 0);
+            if(!newChordAuthorityAvailable){noNewChordGoalPassSkips++;continue;}
             if(preferredEntryPortals is not null)
             foreach(var portal in preferredEntryPortals)
-                if(ordinals.TryGetValue(portal,out int node) && allowsNewChord(portal,point))
-                    AddGoal(node,target,Cost(portal,point));
+                if(ordinals.TryGetValue(portal,out int node))TryGoal(node,target,point);
+            // A zero nomination limit also avoids gathering/sorting portals;
+            // exact native goals and explicitly preferred portals above survive.
+            if(nearbyGoalLimit==0){nearbyGoalPassesSkipped++;continue;}
             var cell = Cell(point);
             var nearby = new List<(int Node, double Distance)>();
             for (long x = cell.X - 1; x <= cell.X + 1; x++)
@@ -161,15 +215,17 @@ internal sealed class ToolpathContinuationPlanner
                 }
             }
             // Bounds affect search only. Missing proof keeps the original entry.
-            foreach (var proposal in nearby.OrderBy(p => p.Distance).ThenBy(p => p.Node).Take(48))
+            nearbyGoalLimitExcluded+=Math.Max(0,Math.Min(ToolpathContinuationSearchLimits.DefaultNearbyGoals,nearby.Count)-nearbyGoalLimit);
+            foreach (var proposal in nearby.OrderBy(p => p.Distance).ThenBy(p => p.Node).Take(nearbyGoalLimit))
             {
                 token.ThrowIfCancellationRequested();
-                if (proposal.Distance > 0 && allowsNewChord(nodes[proposal.Node].Point, point))
-                    AddGoal(proposal.Node,target,Cost(nodes[proposal.Node].Point,point));
+                if (proposal.Distance > 0)TryGoal(proposal.Node,target,point);
             }
         }
+        goalQueryTicks+=Stopwatch.GetTimestamp()-goalStarted;
         if (goals.Count == 0 || examined >= MaximumTotalSearch)
         {LastFailure=examined>=MaximumTotalSearch ? "search-work-limit" : "no-proved-entry-connection";return Fallback();}
+        long aStarStarted=Stopwatch.GetTimestamp();
         var costs = new Dictionary<int, double> { [start] = 0 };
         var parents = new Dictionary<int, int>();
         var visibility = new Dictionary<(int,int),bool>();
@@ -194,7 +250,8 @@ internal sealed class ToolpathContinuationPlanner
             // A blocked straight line need not force a long walk around an old
             // contour. Discover short certified visibility edges between native
             // graph portals. Search trials never become cleared-stock witnesses.
-            if (visibilityTests < 100_000)
+            if(!newChordAuthorityAvailable)noNewChordVisibilityPassSkips++;
+            else if (visibilityTests < visibilityProofLimit)
             {
                 var cell = Cell(nodes[node].Point);
                 var proposals = new List<(int Node,double Estimate)>();
@@ -211,8 +268,16 @@ internal sealed class ToolpathContinuationPlanner
                         proposals.Add((next,length+Heuristic(next)));
                     }
                 }
-                foreach (var proposal in proposals.OrderBy(p=>p.Estimate).ThenBy(p=>p.Node).Take(8))
+                using var nominations=proposals.OrderBy(p=>p.Estimate).ThenBy(p=>p.Node).Take(8).GetEnumerator();
+                while(true)
                 {
+                    // Check before advancing a nomination: exhausted optional
+                    // work must not spend a geometry/proof callback. Null
+                    // settings retain the original generic batch traversal.
+                    if(boundedDiscovery&&visibilityTests>=visibilityProofLimit)
+                    {visibilityLimitStoppedPasses++;break;}
+                    if(!nominations.MoveNext())break;
+                    var proposal=nominations.Current;
                     var key=(Math.Min(node,proposal.Node),Math.Max(node,proposal.Node));
                     if (!visibility.TryGetValue(key,out bool allowed))
                     {
@@ -228,6 +293,7 @@ internal sealed class ToolpathContinuationPlanner
                     if (allowed) Relax(proposal.Node);
                 }
             }
+            else if(boundedDiscovery)visibilityLimitStoppedPasses++;
             void Relax(int next)
             {
                 double value=cost+Cost(nodes[node].Point,nodes[next].Point);
@@ -236,6 +302,7 @@ internal sealed class ToolpathContinuationPlanner
                 queue.Enqueue(next,(value+Heuristic(next),next));
             }
         }
+        aStarQueryTicks+=Stopwatch.GetTimestamp()-aStarStarted;
         if (bestNode < 0)
         {if(LastFailure!="search-work-limit")LastFailure=double.IsFinite(maximumCost)
             ? "no-proved-route-within-replaced-entry-cost" : "captured-network-disconnected";return Fallback();}
@@ -278,8 +345,41 @@ internal sealed class ToolpathContinuationPlanner
             if (!goals.TryGetValue(node, out var old) || total < old.Extra)
                 goals[node] = (target, total);
         }
+        void TryGoal(int node,int target,Point3D point)
+        {
+            var portal=nodes[node].Point;
+            double? terminalCost=null;
+            if(priceFirst)
+            {
+                terminalCost=Cost(portal,point);
+                // Same admissible motion-rate bound used by the A* heuristic.
+                // Actual graph travel can only cost more than this straight
+                // distance; an omitted goal therefore cannot improve either
+                // the complete independent visit or an already proved direct.
+                // ChordSeconds measures float-cast endpoints, so a native
+                // double distance can be larger than the actual priced path.
+                // Round each positive bound operation down; retain the native
+                // A* heuristic separately without extending its contract here.
+                double prefix=Down(FloatMotionDistanceLowerBound(from,portal)
+                    *Down(motionCost!.MinimumSecondsPerMm));
+                double lower=Down(Down(prefix+terminalCost.Value)+TargetCost(target));
+                if(lower>Math.Min(maximumCost,directCost)+1e-9)
+                {costFirstGoalProofSkips++;return;}
+            }
+            if(allowsNewChord(portal,point))AddGoal(node,target,terminalCost??Cost(portal,point));
+        }
         double TargetCost(int target)=>targetCosts is null ? 0 : targetCosts[target];
         double Heuristic(int node) => targets.Select((p,i)=>(motionCost?.MinimumSecondsPerMm ?? ratio)*Distance(nodes[node].Point,p)+TargetCost(i)).Min();
+    }
+
+    private static double Down(double value)=>value>0?Math.BitDecrement(value):value;
+    private static double FloatMotionDistanceLowerBound(Point3D a,Point3D b)
+    {
+        double x=(double)(float)a.X-(float)b.X,y=(double)(float)a.Y-(float)b.Y,
+            z=(double)(float)a.Z-(float)b.Z;
+        if(!double.IsFinite(x)||!double.IsFinite(y)||!double.IsFinite(z))return 0;
+        x=Down(Math.Abs(x));y=Down(Math.Abs(y));z=Down(Math.Abs(z));
+        return Down(Math.Sqrt(Down(Down(Down(x*x)+Down(y*y))+Down(z*z))));
     }
 
     internal void Reentry(string reason, Point3D? from, Point3D target)
@@ -308,6 +408,13 @@ internal sealed class ToolpathContinuationPlanner
         + $"searchNodes={examined} searchBudgetRefusals={boundedSearches} recordBudgetRefusals={recordRefusals} "
         + $"visibilityProofs={visibilityTests} priorProvedAirEdges={priorAirEdges} "
         + $"shortVisibilityProofs={shortVisibilityProofs} shortVisibilityAccepted={shortVisibilityAccepted} shortVisibilityThresholdMm=0.25 indexedPortals={indexedPortals} portalSampling=per-continuous-executed-trace "
+        + $"costFirstQueries={costFirstQueries} costFirstDirectProofSkips={costFirstDirectProofSkips} costFirstGoalProofSkips={costFirstGoalProofSkips} costFirstTravelBypasses={costFirstTravelBypasses} "
+        + $"noNewChordQueries={noNewChordQueries} noNewChordDirectProofCallsSkipped={noNewChordDirectSkips} noNewChordGoalNominationPassesSkipped={noNewChordGoalPassSkips} noNewChordVisibilityNominationPassesSkipped={noNewChordVisibilityPassSkips} "
+        + "noNewChordPolicy=explicit-absent-adapter-only exactNativeGoalsAndGraphRetraceRetained=True opaqueDelegatesUnchanged=True "
+        + $"boundedDiscovery={boundedDiscovery} nearbyGoalsPerTarget={nearbyGoalLimit} operationVisibilityProofLimit={visibilityProofLimit} searchNodesPerQuery={MaximumSearch} "
+        + $"nearbyGoalLimitExcluded={nearbyGoalLimitExcluded} nearbyGoalNominationPassesSkipped={nearbyGoalPassesSkipped} visibilityLimitStoppedPasses={visibilityLimitStoppedPasses} optionalSearchLimitGrantsNoClearance=True "
+        + $"connectDirectMs={directQueryTicks*1000.0/Stopwatch.Frequency:F3} connectGoalMs={goalQueryTicks*1000.0/Stopwatch.Frequency:F3} connectAStarMs={aStarQueryTicks*1000.0/Stopwatch.Frequency:F3} connectStageTiming=owned-wall-includes-proof-callbacks "
+        + "costFirstPolicy=opt-in-pure-price-and-existing-AStar-lower-bound acceptedChordsRequireFullProof=True sourceEntryFallbackUnchanged=True "
         + $"reasons={string.Join(',', reasons.OrderBy(p => p.Key).Select(p => p.Key + ':' + p.Value))} "
         + "policy=direct-then-executed-retrace-then-reasoned-entry futureStockCredit=False nativeXYZIdentity=True");
     }
@@ -321,11 +428,18 @@ internal sealed class ToolpathContinuationPlanner
         bool removeSubsumedEntries = false, Action<string>? diagnostic = null,
         Action<TaggedToolpath>? recordExecuted = null,
         Func<Point3D, Point3D, bool>? validateConnection = null,
-        MillingMotionSettings? motion=null,double surface=0)
+        MillingMotionSettings? motion=null,double surface=0,bool costBeforeNewChord=false,
+        ToolpathContinuationSearchLimits? searchLimits=null)
     {
-        diagnostic ??= Console.WriteLine;
+        long reconnectStarted=Stopwatch.GetTimestamp();
+        diagnostic ??= message => {
+            if(message.StartsWith("[",StringComparison.Ordinal))Console.WriteLine(message);
+            else Console.WriteLine($"[Toolpath.Continuation] {message}");
+        };
+        long detoursStarted=Stopwatch.GetTimestamp();
         source=ToolpathSourceTraversal.EnteredDetours(source,token,diagnostic,validateConnection,motion,surface);
-        var planner = new ToolpathContinuationPlanner(owner, neighbourhood, token, diagnostic);
+        double enteredDetoursMs=Stopwatch.GetElapsedTime(detoursStarted).TotalMilliseconds,connectMs=0,recordMs=0;
+        var planner = new ToolpathContinuationPlanner(owner, neighbourhood, token, diagnostic,searchLimits);
         var result = new List<TaggedToolpath>(source.Count);
         var motionCost=motion is null?null:new ToolpathMotionCost(motion,surface);
         int costRefusals=0;double savedSeconds=0;
@@ -337,6 +451,7 @@ internal sealed class ToolpathContinuationPlanner
             var path = original;
             if (previous is { } from && from != path.Points[0] && previousRegion == path.RegionIndex && previousAnchored)
             {
+                long connectStarted=Stopwatch.GetTimestamp();
                 var targets = new List<Point3D>();
                 int cut = removeSubsumedEntries ? SubsumedEntryEnd(path) : 0;
                 if (cut > 0) targets.Add(path.Points[cut]);
@@ -346,7 +461,8 @@ internal sealed class ToolpathContinuationPlanner
                 var connection = planner.Connect(from, targets,
                     (a, b) => allowsNewChord?.Invoke(path, a, b) == true,
                     targetCosts:costs,maximumCost:motionCost?.CompleteVisitSeconds(from,path)??double.PositiveInfinity,
-                    motionCost:motionCost);
+                    motionCost:motionCost,costBeforeNewChord:costBeforeNewChord,
+                    newChordAuthorityAvailable:allowsNewChord is not null);
                 bool rejectedConnection = false;
                 if (connection is not null && validateConnection is not null)
                 for (int i=1;i<connection.Points.Count;i++)
@@ -368,14 +484,20 @@ internal sealed class ToolpathContinuationPlanner
                     }
                 }
                 else planner.Reentry(rejectedConnection ? "connection-guard-refused" : planner.LastFailure, from, path.Points[0]);
+                connectMs+=Stopwatch.GetElapsedTime(connectStarted).TotalMilliseconds;
             }
             else if (previous is null || previous != path.Points[0])
                 planner.Reentry(previous is null ? "first-entry" : "source-component-change", previous, path.Points[0]);
-            result.Add(path); previousAnchored=planner.Record(path); recordExecuted?.Invoke(path);
+            result.Add(path);long recordStarted=Stopwatch.GetTimestamp();
+            previousAnchored=planner.Record(path);recordExecuted?.Invoke(path);
+            recordMs+=Stopwatch.GetElapsedTime(recordStarted).TotalMilliseconds;
             previous = path.Points[^1]; previousRegion = path.RegionIndex;
         }
         planner.Report();
         diagnostic($"[Toolpath.EntryCost] owner={owner} event=complete machineContext={motionCost is not null} costRefusals={costRefusals} selectedSavingSec={savedSeconds:R} completeBridgeEntryAndCut=True policyOwner=RW.Toolpaths");
+        diagnostic($"[Toolpath.Continuation.Perf] owner={owner} totalMs={Stopwatch.GetElapsedTime(reconnectStarted).TotalMilliseconds:F3} "
+            +$"enteredDetoursMs={enteredDetoursMs:F3} connectMs={connectMs:F3} recordMs={recordMs:F3} inputPaths={source.Count} outputPaths={result.Count} "
+            +$"newChordAuthorityAvailable={allowsNewChord is not null} timing=owned-wall-children-included exactNativeGraphRetained=True");
         return result;
     }
 
@@ -406,7 +528,8 @@ internal sealed class ToolpathContinuationPlanner
                 spans.Add(new(first - sourceStart + offset, span.EndIndex - sourceStart + offset, span.Kind));
         }
         return new(points, spans, path.RegionIndex, path.Category, path.DepthPassIndex,
-            path.VisitIdentity, path.DetectCurves) {ContinuationComponentIndex=path.ContinuationComponentIndex,
+            path.VisitIdentity, path.DetectCurves) {PreserveSourceTraversal=path.PreserveSourceTraversal,
+                ContinuationComponentIndex=path.ContinuationComponentIndex,
                 ContinuationPlan=path.ContinuationPlan,ContinuationSourceOrdinal=path.ContinuationSourceOrdinal,
                 ConcentricSource=path.ConcentricSource};
     }

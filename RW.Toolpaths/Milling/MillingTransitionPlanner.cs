@@ -30,6 +30,7 @@ public static class MillingTransitionPlanner
         MillingLocalTravel? localTravel = null,Point3D? postedFrom = null)
     {
         if(localTravel is not null&&surface is {} materialSurface&&localTravel.MatchesSurface(materialSurface)&&postedFrom is {} cursor){
+            if(localTravel.PreferAboveStockTransfers&&localTravel.ConnectAboveStockFirst(from,to,cursor,safeZ,clearedTravelGuard) is {} preferred)return preferred;
             if(localTravel.Connect(from,to,cursor,safeZ) is {} local)return local;
             if(localTravel.ConnectAboveStock(from,to,cursor,safeZ,clearedTravelGuard) is {} air)return air;
         }

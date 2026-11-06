@@ -9,6 +9,16 @@ public sealed record PocketOptions
     /// <summary>Common machine rates, transfer plane and optional earlier-stock proof.
     /// Null retains geometric routing when machine context is unavailable.</summary>
     public MillingMotionSettings? Motion { get; init; }
+    /// <summary>Optional refusal-only extra capsule witness sites for flat
+    /// scanline continuation. Default 29; supports 0..125. Unresolved capsules
+    /// retain the unchanged complete stock proof, with no clearance allowance.</summary>
+    public int FlatContinuationAdditionalWitnessSites { get; init; } = 29;
+    /// <summary>Optional nearby graph goals per flat scanline target. 0..48;
+    /// exact native goals and full direct-cutter proofs remain available.</summary>
+    public int FlatContinuationNearbyGoals { get; init; } = 48;
+    /// <summary>Optional new visibility proofs across one flat scanline route.
+    /// 0..100000; exhaustion retains actual graph edges or the original entry.</summary>
+    public int FlatContinuationVisibilityProofs { get; init; } = 100_000;
     public MillingBoundaryAccess? BoundaryAccess { get; init; }
     internal IReadOnlyList<IReadOnlyList<PointD>>? KnownEmptyBoundary { get; init; }
     internal double KnownEmptyFloor { get; init; } = double.PositiveInfinity;
@@ -150,6 +160,22 @@ public sealed record ToolpathDiagnostics
     public int AvoidedRetracts { get; init; }
 }
 
+/// <summary>One thread-confined native query authority over an immutable
+/// stock/target/cutter domain. Both callbacks use the originating plan's
+/// workspace coordinates and retain their complete physical proofs.</summary>
+public sealed record VCarveNativeQueryWorker(Func<Point3D,Point3D,bool> Chord,Func<ToolMove,bool> Curve)
+{
+    public long ImportedPositiveSweepProofs {get;init;}
+    public long ImportedPositivePoseProofs {get;init;}
+    public long ImportedPositiveLayerPoses {get;init;}
+    public long ImportedStockCellFacts {get;init;}
+    public long EstimatedImportedStockCellBytes {get;init;}
+    public long EstimatedImportedProofBytes {get;init;}
+    public double StartupMilliseconds {get;init;}
+    public string ImmutableDomainProvenance {get;init;}="opaque-callbacks";
+    internal Func<string>? DiagnosticCounters {get;init;}
+}
+
 /// <summary>Everything one strategy produced for one operation.</summary>
 public sealed class ToolpathPlan
 {
@@ -198,6 +224,11 @@ public sealed class ToolpathPlan
     /// and target used by construction; excludes controller quantization.</summary>
     public Func<Point3D,Point3D,bool>? NativeReplacementChordGuard { get; internal init; }
     public Func<ToolMove,bool>? NativeReplacementCurveGuard { get; internal init; }
+    /// <summary>Optional explicit private-query authority for native fitting.
+    /// Create workers sequentially while the original owner is quiescent, use
+    /// each returned pair on one worker, and join all workers before querying
+    /// the original owner again. Opaque callbacks never imply this capability.</summary>
+    public Func<VCarveNativeQueryWorker>? NativeReplacementQueryWorkerFactory {get;internal init;}
 
 
     /// <summary>Optional positive full-cutter clearance authority against immutable
@@ -240,7 +271,7 @@ public static class PocketToolpaths
     public static VCarveRoughingAnalysis AnalyzeSmoothRoughing(
         IReadOnlyList<MillingRegion> regions, ToolGeometry tool, DepthSchedule depth,
         PocketOptions options, IMedialAxisProvider provider,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, VCarveGenerationPolicy? generationPolicy = null)
     {
         ArgumentNullException.ThrowIfNull(regions);
         ArgumentNullException.ThrowIfNull(tool);
@@ -260,8 +291,9 @@ public static class PocketToolpaths
             + $"regions={regions.Count} physicalToolRadius={tool.Radius:R} ownFloor={depth.Depth:R} "
             + $"ownRampAngleDegrees={options.SmoothRampAngleDegrees:R} ownEdgeOffset={options.StockToLeave:R} "
             + $"futureOperationsRead=False retainedRoughingStrategyUnchanged=True");
+        generationPolicy??=VCarveGenerationPolicy.Capture();
         var preparation = VCarveToolpaths.Prepare(regions, tool, depth,
-            new VCarveOptions
+            generationPolicy.ApplyPlateauPolicy(new VCarveOptions
             {
                 SmoothVCarving = true, SmoothRampAngleDegrees = options.SmoothRampAngleDegrees,
                 RampOutsideEdges = options.RampOutsideEdges,
@@ -271,7 +303,7 @@ public static class PocketToolpaths
                 DetectCurves = false, CalculateSweptArea = false,
                 DiagnosticContext = "own-pocket-smooth-roughing",
                 PreparationContactRadius = tool.VCarveProfile?.TipRadius ?? 0,
-            }, provider, cancellationToken);
+            }), provider, cancellationToken);
         var analysis = preparation.AnalyzePocketPlateau(depth.Depth, options.SmoothRampAngleDegrees,
             options.StockToLeave, cancellationToken, retainBasinDiagnostics: true);
         cancellationToken.ThrowIfCancellationRequested();
@@ -376,6 +408,7 @@ public static class PocketToolpaths
                 KnownEmptyBoundary=options.KnownEmptyBoundary,
                 BoundOriginalSourceMedial = options.BoundOriginalSourceMedial,
                 PreserveSourceNativeGrid = options.ProtectedBoundary is { Count: > 0 },
+                ParallelSourceRegions = true,
                 SelectedCleanupProposals = options.AdaptiveCompactionProposals,
                 TrialFilledSweepProposals = options.TrialFilledSweepProposals,
                 TrialFilledSweepModeCaptured = true,

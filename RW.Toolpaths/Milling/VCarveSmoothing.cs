@@ -92,7 +92,8 @@ internal static class VCarveSmoothing
         Action<double, string, bool>? progress = null,
         VCarvePreparation.PreparedRegion? preparation = null, int? correctionWorkers = null,
         Action<Func<Point3D, Point3D, bool>>? captureContinuationGuard = null,
-        Action<Func<IReadOnlyList<TaggedToolpath>,List<TaggedToolpath>>>? captureClippedPathProtection=null, int sourceRegionIndex=0)
+        Action<Func<IReadOnlyList<TaggedToolpath>,List<TaggedToolpath>>>? captureClippedPathProtection=null, int sourceRegionIndex=0,
+        Action<Func<ContinuationProofWorker?>>? captureContinuationWorkerFactory=null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ValidateCorrectionArcTolerance(options.CorrectionArcTolerance);
@@ -116,7 +117,7 @@ internal static class VCarveSmoothing
             try
             {
                 result = ApplyCore(source, boundary, tool, schedule, options, cancellationToken,
-                    diagnostic, progress, preparation, correctionWorkers, useGpuFronts, gpuIntegrationControl, policy, captureContinuationGuard, captureClippedPathProtection, sourceRegionIndex);
+                    diagnostic, progress, preparation, correctionWorkers, useGpuFronts, gpuIntegrationControl, policy, captureContinuationGuard, captureClippedPathProtection, sourceRegionIndex,captureContinuationWorkerFactory);
             }
             catch (InvalidOperationException error) when (useGpuFronts
                 && error.Data.Contains("SmoothVCarvingGeometry")
@@ -131,7 +132,7 @@ internal static class VCarveSmoothing
                 // explicit false prevents recursion/re-entry into nominations.
                 result = ApplyCore(source, boundary, tool, schedule, options, cancellationToken,
                     diagnostic, progress, preparation, correctionWorkers, useGpuFronts: false, gpuIntegrationControl: gpuIntegrationControl,
-                    policy: policy, captureContinuationGuard: captureContinuationGuard, captureClippedPathProtection:captureClippedPathProtection, sourceRegionIndex:sourceRegionIndex);
+                    policy: policy, captureContinuationGuard: captureContinuationGuard, captureClippedPathProtection:captureClippedPathProtection, sourceRegionIndex:sourceRegionIndex,captureContinuationWorkerFactory:captureContinuationWorkerFactory);
             }
         }
         catch (InvalidOperationException error) when ((requested > ReferenceCorrectionArcTolerance
@@ -149,7 +150,7 @@ internal static class VCarveSmoothing
                 options with { CorrectionArcTolerance = ReferenceCorrectionArcTolerance,
                     UseOrdinaryCorrectionCandidates = false }, cancellationToken,
                 diagnostic, progress, preparation, correctionWorkers, useGpuFronts: false, gpuIntegrationControl: gpuIntegrationControl,
-                policy: policy, captureContinuationGuard: captureContinuationGuard, captureClippedPathProtection:captureClippedPathProtection, sourceRegionIndex:sourceRegionIndex);
+                policy: policy, captureContinuationGuard: captureContinuationGuard, captureClippedPathProtection:captureClippedPathProtection, sourceRegionIndex:sourceRegionIndex,captureContinuationWorkerFactory:captureContinuationWorkerFactory);
         }
         cancellationToken.ThrowIfCancellationRequested();
         diagnostic?.Invoke($"stage=correction-arc event=complete requestedArc={requested:R} "
@@ -179,11 +180,65 @@ internal static class VCarveSmoothing
         };
     }
 
+    // Explicit capability for pure source simplification. The caller creates
+    // every worker while the original query owners are idle and joins all
+    // workers before Complete merges private exact-XY answers or counters.
+    internal static ContinuationProofWorker? CreateContinuationQueryWorker(FloorField? field,
+        CommandClearance wall,double surfaceZ,double grade,CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();var privateWall=wall.CreateQueryWorker();
+        return privateWall is null?null:new(field,privateWall,surfaceZ,grade,token);
+    }
+    internal sealed class ContinuationProofWorker
+    {
+        private readonly FloorField? parentFloor,privateFloor;
+        private readonly ActualF3CompactionFloorProof? floorProof;
+        private readonly CommandClearance wall;
+        private readonly double surface,grade;
+        private readonly CancellationToken token;
+        private long queries,gradeRefusals,floorRefusals,wallRefusals,floorTicks,wallTicks;
+        private bool completed;
+        internal ContinuationProofWorker(FloorField? parent,CommandClearance privateWall,double surface,double grade,CancellationToken token)
+        {
+            parentFloor=parent;privateFloor=parent?.CreateQueryWorker();wall=privateWall;
+            this.surface=surface;this.grade=grade;this.token=token;
+            floorProof=privateFloor is null?null:new ActualF3CompactionFloorProof(privateFloor,grade,token);
+        }
+        internal bool Prove(Point3D a,Point3D b)
+        {
+            token.ThrowIfCancellationRequested();queries++;
+            var ca=CommandPoint(a,surface);var cb=CommandPoint(b,surface);
+            if(Math.Abs(a.Z-b.Z)>grade*Distance(a,b)||Math.Abs(ca.Z-cb.Z)>grade*Distance(ca,cb))
+            {gradeRefusals++;return false;}
+            if(floorProof is not null)
+            {
+                long started=Stopwatch.GetTimestamp();bool accepted=floorProof.Prove(a,b)&&floorProof.Prove(ca,cb);
+                floorTicks+=Stopwatch.GetTimestamp()-started;
+                if(!accepted){floorRefusals++;return false;}
+            }
+            long wallStarted=Stopwatch.GetTimestamp();bool legal=wall.IsLegalCommandedChord(a,b);
+            wallTicks+=Stopwatch.GetTimestamp()-wallStarted;
+            if(!legal)wallRefusals++;token.ThrowIfCancellationRequested();return legal;
+        }
+        internal void Complete(Action<string>? diagnostic=null,string context="surface-simplification")
+        {
+            if(completed)return;token.ThrowIfCancellationRequested();completed=true;
+            if(privateFloor is not null)parentFloor!.MergeQueryWorker(privateFloor,diagnostic,context);
+            wall.MergeIntoParent();
+            diagnostic?.Invoke($"stage={context} event=proof-worker queries={queries} gradeRefusals={gradeRefusals} floorRefusals={floorRefusals} wallRefusals={wallRefusals} "
+                +$"floorMs={1000d*floorTicks/Stopwatch.Frequency:F3} wallMs={1000d*wallTicks/Stopwatch.Frequency:F3} wallLiteralQueries={wall.LiteralChordQueries} wallCacheHits={wall.ChordCacheHits} "
+                +$"wallDomains={wall.QueryDomainCount} preparedIndicesShared=True channelUnionRebuilt=False booleanPointCharges=0 "
+                +"allWorkersJoinedRequired=True nativeAndPostedFloorWallGrade=True opaqueStockContact=False");
+            if(floorProof is not null)diagnostic?.Invoke(floorProof.Diagnostics());
+            token.ThrowIfCancellationRequested();
+        }
+    }
+
     private static List<TaggedToolpath> ApplyCore(IReadOnlyList<TaggedToolpath> source,
         IReadOnlyList<IReadOnlyList<PointD>> boundary, ToolGeometry tool, DepthSchedule schedule,
         VCarveOptions options, CancellationToken cancellationToken, Action<string>? diagnostic,
         Action<double, string, bool>? progress,
-        VCarvePreparation.PreparedRegion? preparation, int? correctionWorkers, bool useGpuFronts, GpuFrontIntegrationControl? gpuIntegrationControl, VCarveGenerationPolicy policy, Action<Func<Point3D, Point3D, bool>>? captureContinuationGuard, Action<Func<IReadOnlyList<TaggedToolpath>,List<TaggedToolpath>>>? captureClippedPathProtection, int sourceRegionIndex)
+        VCarvePreparation.PreparedRegion? preparation, int? correctionWorkers, bool useGpuFronts, GpuFrontIntegrationControl? gpuIntegrationControl, VCarveGenerationPolicy policy, Action<Func<Point3D, Point3D, bool>>? captureContinuationGuard, Action<Func<IReadOnlyList<TaggedToolpath>,List<TaggedToolpath>>>? captureClippedPathProtection, int sourceRegionIndex,Action<Func<ContinuationProofWorker?>>? captureContinuationWorkerFactory)
     {
         if(!double.IsFinite(options.PathToleranceMm)||options.PathToleranceMm<=1e-8)throw new ArgumentOutOfRangeException(nameof(options.PathToleranceMm));
         double CompletionTolerance=2*options.CompletionGapRadiusMm;
@@ -223,16 +278,22 @@ internal static class VCarveSmoothing
         if(stockContact is not null) source=VCarveStockContactPaths.Project(source,stockContact,options.PathToleranceMm,cancellationToken);
         long sourcePointCount = source.Sum(path => (long)path.Points.Count);
         long pointBudget = Math.Max(MaximumPoints, checked(8 * sourcePointCount));
-        var medial = preparation?.OriginalMedialPaths.ToList()
+        // Bounded fill returns after its original crest/floor/artwork/channel
+        // guards. The analytical medial depth arrays are not consumed there.
+        // Every other path retains the complete original preparation.
+        bool deferredMedial=preparation is {HasDeferredDepths:true,HasCompletedDepths:false}
+            &&!options.IncludeInteriorFill&&floorSources.Count>0&&stockContact is null;
+        var medial = deferredMedial?new List<TaggedToolpath>():preparation?.Complete(cancellationToken).OriginalMedialPaths.ToList()
             ?? source.Where(path => path.Category == "final-carve" && path.Points.Count >= 2).ToList();
-        if (medial.Count == 0 && floorSources.Count == 0 && !useInitialStockCohort)
+        int medialCount=deferredMedial?preparation!.OriginalMedialGraph.Count:medial.Count;
+        if (medialCount == 0 && floorSources.Count == 0 && !useInitialStockCohort)
         {
             source = VCarveInitialReachSelection.NormalizeMarkers(source, cancellationToken);
             bool normalizeMarker = source.Any(path => path.Category == AdaptiveInitialReachContourNominator.MarkerCategory);
             diagnostic?.Invoke($"stage=smoothing event=complete reason=no-medial-profile surfaceEntriesRequired=True nominationMarkerNormalized={normalizeMarker}");
             return normalizeMarker ? AdaptiveInitialReachContourNominator.NormalizeMarkers(source, cancellationToken) : source.ToList();
         }
-        if (medial.Count == 0)
+        if (medialCount == 0)
             diagnostic?.Invoke($"stage=smoothing event=no-medial-initial-physical-guards originalArtworkWallAndNominalGradeRequired=True originalFloorAvailable={floorSources.Count > 0} noConstructionOrStockCredit=True");
         // New outline ramp rows must not masquerade as an original clearing
         // band and suppress the retained medial channel's coverage recovery.
@@ -243,7 +304,7 @@ internal static class VCarveSmoothing
                 + "originalReferenceTargetRequired=True originalFloorArtworkAndGradeRetained=True");
         }
         diagnostic?.Invoke($"stage=smoothing event=start angleDegrees={options.SmoothRampAngleDegrees:R} " +
-            $"maximumGrade={grade:R} sourcePaths={source.Count} medialPaths={medial.Count} " +
+            $"maximumGrade={grade:R} sourcePaths={source.Count} medialPaths={medialCount} medialDepthsDeferred={deferredMedial} " +
             $"coverageTolerance={CoverageTolerance:R} floorDepthReserve={DepthReserve:R} " +
             $"sourcePoints={sourcePointCount} pointBudget={pointBudget} budgetRule=max-one-million-or-eight-times-source " +
             "commandF3Rounding=exact-binary32-nearest-even finiteFastPathMagnitude=1000000 literalOutsideDomain=True");
@@ -291,19 +352,23 @@ internal static class VCarveSmoothing
             +field.SupportDominanceDiagnostics+" "+field.QueryScratchDiagnostics);
         var wallGuard = new CommandClearance(boundary, profile, schedule.SurfaceZ, cancellationToken, diagnostic,
             maximumPoints: pointBudget, stockContact: stockContact);
-        if (captureContinuationGuard is not null)
+        if (captureContinuationGuard is not null||captureContinuationWorkerFactory is not null)
         {
             // Reuse the ORIGINAL floor and whole posted artwork chord authorities.
             // This adapter authorizes new shallow cutting links; executed retraces
             // need no new floor allowance or source-shell ancestry.
             var continuationFloor = field is null ? null : new ActualF3CompactionFloorProof(field, grade, cancellationToken);
-            captureContinuationGuard((a, b) => {
+            captureContinuationGuard?.Invoke((a, b) => {
                 var ca = CommandPoint(a, schedule.SurfaceZ); var cb = CommandPoint(b, schedule.SurfaceZ);
                 if (Math.Abs(a.Z-b.Z) > grade * Distance(a,b)
                     || Math.Abs(ca.Z-cb.Z) > grade * Distance(ca,cb)) return false;
                 if (continuationFloor is not null && (!continuationFloor.Prove(a,b) || !continuationFloor.Prove(ca,cb))) return false;
                 return wallGuard.IsLegalCommandedChord(a,b);
             });
+            // Resolve wallGuard only when the completed Apply owner is idle:
+            // later source protection replaces it with the FINAL channel owner.
+            captureContinuationWorkerFactory?.Invoke(()=>CreateContinuationQueryWorker(field,wallGuard,
+                schedule.SurfaceZ,grade,cancellationToken));
         }
 
         if (source.Any(path => path.Category == VCarveInitialReachSelection.HalfCoreMarkerCategory
@@ -2513,19 +2578,26 @@ internal static class VCarveSmoothing
             !posting ? "actual-F3-endpoints" : !floor ? "original-whole-actual-floor" : !artwork ? "original-artwork-chord"
             : !channel ? "original-channel-chord" : !authoredGrade ? "authored-grade" : "all-original-owners-pass");
     }
-    private sealed class ActualF3CompactionFloorProof
+    internal sealed class ActualF3CompactionFloorProof
     {
         private readonly FloorField originalFloor;
         private readonly double grade;
         private readonly CancellationToken token;
-        internal ActualF3CompactionFloorProof(FloorField originalFloor, double grade, CancellationToken token)
-        { this.originalFloor = originalFloor; this.grade = grade; this.token = token; }
+        private readonly bool reuseEndpointValues;
+        private readonly record struct EndpointValue(double FloorLower,double DepthUpper,double DepthLower);
+        internal ActualF3CompactionFloorProof(FloorField originalFloor, double grade, CancellationToken token,
+            bool reuseEndpointValues=true)
+        { this.originalFloor = originalFloor; this.grade = grade; this.token = token;this.reuseEndpointValues=reuseEndpointValues; }
         private const int MaximumDepth = 28;
         private const long MaximumPiecesPerChord = 100_000;
         private long _queries, _pieces, _endpointRefusals, _unresolvedRefusals, _arithmeticRefusals, _enclosureOperations, _originalQueryBudgetRefusals;
+        private long _computedEndpointValues,_reusedEndpointValues;
+        internal long ComputedEndpointValues=>_computedEndpointValues;
+        internal long ReusedEndpointValues=>_reusedEndpointValues;
+        internal long Pieces=>_pieces;
         private string? _firstOriginalQueryBudgetRefusal;
         private double _milliseconds;
-        internal string Diagnostics() => $"stage=actual-F3-compaction event=original-actual-floor queries={_queries} pieces={_pieces} endpointRefusals={_endpointRefusals} unresolvedRefusals={_unresolvedRefusals} arithmeticRefusals={_arithmeticRefusals} originalQueryBudgetRefusals={_originalQueryBudgetRefusals} firstOriginalQueryBudgetRefusal='{_firstOriginalQueryBudgetRefusal}' enclosureOperations={_enclosureOperations} totalMs={_milliseconds:R} maxDepth={MaximumDepth} maxPiecesPerChord={MaximumPiecesPerChord} originalFieldAndCurvatureBound=True nominalCapReserveTransferred=False";
+        internal string Diagnostics() => $"stage=actual-F3-compaction event=original-actual-floor queries={_queries} pieces={_pieces} endpointRefusals={_endpointRefusals} unresolvedRefusals={_unresolvedRefusals} arithmeticRefusals={_arithmeticRefusals} originalQueryBudgetRefusals={_originalQueryBudgetRefusals} firstOriginalQueryBudgetRefusal='{_firstOriginalQueryBudgetRefusal}' enclosureOperations={_enclosureOperations} computedEndpointValues={_computedEndpointValues} reusedEndpointValues={_reusedEndpointValues} endpointValueReuse={reuseEndpointValues} totalMs={_milliseconds:R} maxDepth={MaximumDepth} maxPiecesPerChord={MaximumPiecesPerChord} originalFieldAndCurvatureBound=True nominalCapReserveTransferred=False";
         internal bool Prove(Point3D originalA, Point3D originalB)
         {
             if (originalFloor.ProveCrestChord(originalA, originalB)) return true;
@@ -2535,12 +2607,13 @@ internal static class VCarveSmoothing
                 if (!double.IsFinite(grade) || grade < 0 || !double.IsFinite(originalA.X + originalA.Y + originalA.Z
                     + originalB.X + originalB.Y + originalB.Z)) { _arithmeticRefusals++; return false; }
                 double wholeLengthUpper = Up(Up(Math.Abs(originalB.X - originalA.X)) + Up(Math.Abs(originalB.Y - originalA.Y)));
-                return Span(0, 1, 0);
-                bool Span(double lo, double hi, int depth)
+                return Span(0, 1, 0,null,null,out _);
+                bool Span(double lo, double hi, int depth,EndpointValue? knownA,EndpointValue? knownB,out EndpointValue endpoint)
                 {
+                    endpoint=default;
                     token.ThrowIfCancellationRequested();_pieces++;
                     if (++visits > MaximumPiecesPerChord) { _unresolvedRefusals++; return false; }
-                    var a = At(lo);var b = At(hi);
+                    var a = ValueAt(lo,knownA);var b = ValueAt(hi,knownB);endpoint=b;
                     if (!double.IsFinite(a.FloorLower) || !double.IsFinite(a.DepthUpper) || !double.IsFinite(a.DepthLower)
                         || !double.IsFinite(b.FloorLower) || !double.IsFinite(b.DepthUpper) || !double.IsFinite(b.DepthLower))
                     { _arithmeticRefusals++; return false; }
@@ -2558,15 +2631,26 @@ internal static class VCarveSmoothing
                     // Exact dyadic parameters on ORIGINAL a/b; these rounded
                     // nominees never become an emitted or authoritative midpoint.
                     double mid = (lo + hi) / 2;
-                    return Span(lo, mid, depth + 1) && Span(mid, hi, depth + 1);
+                    // The left child computes the new midpoint at the original
+                    // point in the traversal, AFTER its cancellation/visit check.
+                    // Only this owned immutable field's endpoint enclosures are
+                    // forwarded. No generic proof callback or earlier refusal is
+                    // memoized, and a refused left child still skips the right.
+                    return Span(lo, mid, depth + 1,a,null,out var midpoint)
+                        && Span(mid, hi, depth + 1,midpoint,b,out _);
                 }
-                (double FloorLower, double DepthUpper, double DepthLower) At(double t)
+                EndpointValue ValueAt(double t,EndpointValue? known)
+                {
+                    if(reuseEndpointValues&&known is {} value){_reusedEndpointValues++;return value;}
+                    _computedEndpointValues++;return At(t);
+                }
+                EndpointValue At(double t)
                 {
                     var x = Axis(originalA.X, originalB.X, t);var y = Axis(originalA.Y, originalB.Y, t);var z = Axis(originalA.Z, originalB.Z, t);
                     double ex = Up(Math.Max(Math.Abs(x.Center - x.Lo), Math.Abs(x.Hi - x.Center)));
                     double ey = Up(Math.Max(Math.Abs(y.Center - y.Lo), Math.Abs(y.Hi - y.Center)));
                     double error = Up(ex + ey), reserve = Up(grade * error);
-                    return (Down(originalFloor.Depth(x.Center, y.Center) - reserve), Up(-z.Lo), Down(-z.Hi));
+                    return new(Down(originalFloor.Depth(x.Center, y.Center) - reserve), Up(-z.Lo), Down(-z.Hi));
                 }
             }
             catch (InvalidOperationException error) when (IsActualF3FloorProofBudgetRefusal(error))
@@ -2937,6 +3021,9 @@ internal static class VCarveSmoothing
         // by one generation. Keys are directed, already-commanded XYZ bit patterns.
         // No result is shared across profile/domain/surface owners or generations.
         private readonly Dictionary<CommandedChordKey, ChordEvidence> _chordCache = new();
+        private readonly IReadOnlyDictionary<CommandedChordKey,ChordEvidence>? _sharedChordCache;
+        private readonly CommandClearance? _queryParent;
+        private readonly object _queryDomain=new();
         private readonly Queue<CommandedChordKey> _chordCacheOrder = new();
         private readonly int _maximumCachedChords;
         private readonly SectionSnapshot[] _profileSections;
@@ -2949,6 +3036,7 @@ internal static class VCarveSmoothing
         internal long LiteralChordQueries { get; private set; }
         internal long LiteralChordDomainQueries { get; private set; }
         internal int ChordCacheEntries => _chordCache.Count;
+        internal int QueryDomainCount=>_domains.Count;
 
         private readonly record struct CommandedChordKey(long Ax, long Ay, long Az, long Bx, long By, long Bz)
         {
@@ -2972,6 +3060,48 @@ internal static class VCarveSmoothing
                     profile.PhysicalProfile.IsFlatCylinder, profile.PhysicalProfile.IsStraightBall);
         }
         private static long Bits(double value) => BitConverter.DoubleToInt64Bits(value);
+
+        internal CommandClearance? CreateQueryWorker()
+        {
+            _token.ThrowIfCancellationRequested();
+            // Actual stock has its own private-owner contract. Do not infer a
+            // capability from an opaque/mutable source contact guard here.
+            if(_stockContact is not null)return null;
+            if(_reuseThisArtworkChord)throw new InvalidOperationException("Command query workers require an idle complete wall owner.");
+            return new CommandClearance(this);
+        }
+        private CommandClearance(CommandClearance source)
+        {
+            _profile=source._profile;_surface=source._surface;_token=source._token;_diagnostic=null;
+            _maximumPoints=source._maximumPoints;_maximumCachedChords=source._maximumCachedChords;
+            _profileSections=source._profileSections;_profileSnapshot=source._profileSnapshot;
+            _chordCacheDisabledReason=source._chordCacheDisabledReason;
+            _literalArtwork=source._literalArtwork;_parentArtworkProof=source._parentArtworkProof;
+            _domains.AddRange(source._domains);ArtworkIndexReused=true;
+            _sharedChordCache=source._chordCache;_queryParent=source;_queryDomain=source._queryDomain;
+        }
+        internal void MergeIntoParent()
+        {
+            if(_queryParent is not {} parent)return;
+            _token.ThrowIfCancellationRequested();
+            if(!ReferenceEquals(_queryDomain,parent._queryDomain))throw new InvalidOperationException("Command worker query domain mismatch.");
+            foreach(var (key,evidence) in _chordCache)
+            {
+                _token.ThrowIfCancellationRequested();
+                if(parent._chordCache.TryGetValue(key,out var previous))
+                {
+                    if(previous.Violation!=evidence.Violation)throw new InvalidOperationException("Independent command workers disagreed on complete chord legality.");
+                    continue;
+                }
+                if(parent._chordCache.Count==parent._maximumCachedChords)
+                {parent._chordCache.Remove(parent._chordCacheOrder.Dequeue());parent.ChordCacheEvictions++;}
+                parent._chordCache.Add(key,evidence);parent._chordCacheOrder.Enqueue(key);
+            }
+            parent.ChordCacheHits+=ChordCacheHits;parent.ChordCacheMisses+=ChordCacheMisses;
+            parent.ChordCacheRefusals+=ChordCacheRefusals;parent.ChordCacheEvictions+=ChordCacheEvictions;
+            parent.LiteralChordQueries+=LiteralChordQueries;parent.LiteralChordDomainQueries+=LiteralChordDomainQueries;
+            parent.ArtworkLiteralChordQueries+=ArtworkLiteralChordQueries;parent.ChannelLiteralChordQueries+=ChannelLiteralChordQueries;
+        }
 
         internal CommandClearance(IReadOnlyList<IReadOnlyList<PointD>> boundary,
             VCarveCutterProfile profile, double surface, CancellationToken token, Action<string>? diagnostic,
@@ -3096,7 +3226,8 @@ internal static class VCarveSmoothing
             bool finite = double.IsFinite(ca.X) && double.IsFinite(ca.Y) && double.IsFinite(ca.Z)
                 && double.IsFinite(cb.X) && double.IsFinite(cb.Y) && double.IsFinite(cb.Z);
             string? refusal = _chordCacheDisabledReason ?? (finite ? null : "nonfinite-command");
-            if (refusal is null && _chordCache.TryGetValue(key, out var evidence))
+            if (refusal is null && (_chordCache.TryGetValue(key, out var evidence)
+                ||_sharedChordCache is not null&&_sharedChordCache.TryGetValue(key,out evidence)))
             {
                 ChordCacheHits++; witness = evidence.Witness;
                 LogChordCache("hit", ChordCacheHits, key, evidence.Violation, witness, "identical-literal-inputs");
@@ -3599,6 +3730,12 @@ internal static class VCarveSmoothing
             _supportDominanceReason=source._supportDominanceReason;_preparedEndpointSources=source._preparedEndpointSources;
             _representedEndpointSources=source._representedEndpointSources;_sharedCache=source._cache;_sharedContacts=source._contactSources;
         }
+        internal FloorField CreateQueryWorker()
+        {
+            _cancellationToken.ThrowIfCancellationRequested();
+            if(Volatile.Read(ref _queryScratchInUse)!=0)throw new InvalidOperationException("Floor query workers require their sequential owner to be idle.");
+            return new(this);
+        }
 
         internal void PrewarmNomination(IEnumerable<PointD> points,Action<string>? diagnostic)
         {
@@ -3606,7 +3743,7 @@ internal static class VCarveSmoothing
             _nominationPrewarmRemaining-=PrewarmQueries(points,_nominationPrewarmRemaining,diagnostic,"rest-nomination");
         }
 
-        private void MergeQueryWorker(FloorField worker,Action<string>? diagnostic,string scope)
+        internal void MergeQueryWorker(FloorField worker,Action<string>? diagnostic,string scope)
         {
             if(worker._prewarmBudgetRefusals>0)
             {

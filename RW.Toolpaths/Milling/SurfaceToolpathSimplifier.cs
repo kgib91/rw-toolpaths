@@ -31,7 +31,7 @@ public static class SurfaceToolpathSimplifier
         token.ThrowIfCancellationRequested();
         if(!(tolerance>0)||!double.IsFinite(tolerance))throw new ArgumentOutOfRangeException(nameof(tolerance));
         var p=path.Points;int count=p.Count;
-        if(count<4 || path.DetectCurves || path.ContinuationCircuitDefinition is not null)return path;
+        if(count<4 || path.RequiresSourcePreservation || path.ContinuationCircuitDefinition is not null)return path;
         var keep=new bool[count];keep[0]=keep[1]=keep[^1]=true;
         // Keep the first explicit planar word, even when its XY change rounds
         // into the same F3 cell. A preceding vertical-only prefix cannot acquire
@@ -96,7 +96,7 @@ public static class SurfaceToolpathSimplifier
         var spans=semanticSpans.Select(s=>new ToolpathSpan(map[s.StartIndex],map[s.EndIndex],s.Kind)).ToArray();
         return new TaggedToolpath(selected,spans,path.RegionIndex,path.Category,
             path.DepthPassIndex,path.VisitIdentity,detectCurves:false)
-            {ContinuationComponentIndex=path.ContinuationComponentIndex,ContinuationPlan=path.ContinuationPlan,
+            {PreserveSourceTraversal=path.PreserveSourceTraversal,ContinuationComponentIndex=path.ContinuationComponentIndex,ContinuationPlan=path.ContinuationPlan,
                 ContinuationSourceOrdinal=path.ContinuationSourceOrdinal,ContinuationCircuit=path.ContinuationCircuit,
                 ContinuationCircuitDefinition=path.ContinuationCircuitDefinition,ConcentricSource=path.ConcentricSource};
     }

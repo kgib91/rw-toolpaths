@@ -43,6 +43,22 @@ internal sealed class CutterSweepStock
     private readonly bool supported;
     private readonly bool useMedianPartition;
     private readonly bool mergeIncrementally;
+    private readonly bool compactIncrementalStorage;
+    private static long nextStorageOwner;
+    private readonly long storageOwner;
+    private int committedChordCount;
+    private long nextStorageDiagnostic=65536;
+    private readonly bool endpointCandidateDomain;
+    private readonly int radialMemoLimit;
+    private readonly Dictionary<(long Delta,long Depth),double>? radialMemo;
+    private readonly Queue<(long Delta,long Depth)>? radialMemoOrder;
+    internal long RadialMarginCalls {get;private set;}
+    internal long RadialMarginMemoHits {get;private set;}
+    internal long RadialMarginMemoMisses {get;private set;}
+    internal long RadialMarginMemoEvictions {get;private set;}
+    internal int RadialMarginMemoEntries=>radialMemo?.Count??0;
+    internal const double EndpointCoordinateReserve=1e-8,EndpointDepthReserve=1e-9,EndpointRadiusReserve=1e-7;
+    internal readonly record struct EndpointCandidates(bool Possible,bool Bypassed,long VisitedNodes,int RefusedEndpoint);
     internal long PartitionVisits{get;private set;}
     internal long ReindexedChords{get;private set;}
     internal int MergeCount{get;private set;}
@@ -50,7 +66,15 @@ internal sealed class CutterSweepStock
     internal long Queries{get;private set;}
     internal long Accepted{get;private set;}
     internal long UnionAccepted{get;private set;}
-    internal int Chords=>all.Count;
+    internal int Chords=>compactIncrementalStorage?committedChordCount:all.Count;
+    internal long IncrementalAllEntriesAvoided{get;private set;}
+    internal long IncrementalChordCopyRowsAvoided{get;private set;}
+    internal long IncrementalFloorCopyRowsAvoided{get;private set;}
+    internal long IncrementalTemporaryArraysAvoided{get;private set;}
+    internal string IncrementalStorageDiagnostics=>$"owner={storageOwner} compactIncrementalStorage={compactIncrementalStorage} committedChords={Chords} "
+        +$"duplicateAllEntriesAvoided={IncrementalAllEntriesAvoided} chordCopyRowsAvoided={IncrementalChordCopyRowsAvoided} "
+        +$"floorCopyRowsAvoided={IncrementalFloorCopyRowsAvoided} temporaryArraysAvoided={IncrementalTemporaryArraysAvoided} "
+        +"sameOrderedBlockInputs=True sameMergeCancellationCheckpoints=True";
     internal long FloorTargetQueries{get;private set;}
     internal long FloorTargetsCovered{get;private set;}
     internal long FloorTargetIndexHits{get;private set;}
@@ -64,11 +88,17 @@ internal sealed class CutterSweepStock
     internal double StockIndexBuildMilliseconds=>1000d*stockBuildTicks/Stopwatch.Frequency;
 
     internal CutterSweepStock(VCarveCutterProfile profile,Func<Point3D,Point3D> command,double surface,CancellationToken token,
-        bool useMedianPartition=true,bool mergeIncrementally=false)
+        bool useMedianPartition=true,bool mergeIncrementally=false,bool endpointCandidateDiscovery=false,
+        int radialMarginMemoEntries=0,bool literalIncrementalStorage=false)
     {
+        if(radialMarginMemoEntries is <0 or >4096)throw new ArgumentOutOfRangeException(nameof(radialMarginMemoEntries));
+        radialMemoLimit=radialMarginMemoEntries;
+        if(radialMemoLimit>0){radialMemo=new();radialMemoOrder=new();}
         this.profile=profile;this.command=command;this.surface=surface;this.token=token;
         this.useMedianPartition=useMedianPartition;
         this.mergeIncrementally=mergeIncrementally;
+        compactIncrementalStorage=mergeIncrementally&&!literalIncrementalStorage;
+        if(compactIncrementalStorage)storageOwner=Interlocked.Increment(ref nextStorageOwner);
         floorRadius=h=>floorNormal?OffsetRadius(h-floorTolerance,floorTolerance):profile.PhysicalRadiusAtDepth(h);
         floorPredicate=p=>{
             double h=-p.Z-floorWanted;if(h<0)return false;
@@ -85,6 +115,8 @@ internal sealed class CutterSweepStock
                 ||i==0&&section.BottomRadius==0&&section.Height==section.TopRadius;
         }
         joints=depths.ToArray();
+        endpointCandidateDomain=endpointCandidateDiscovery&&supported&&depth<=1000
+            &&profile.Sections.All(s=>s.Height>=1e-6&&s.BottomRadius<=1000&&s.TopRadius<=1000);
     }
 
     internal void AddProtected(IReadOnlyList<TaggedToolpath> paths)
@@ -96,7 +128,7 @@ internal sealed class CutterSweepStock
             for(int i=1;i<path.Points.Count;i++)
             {
                 if((i&1023)==0)token.ThrowIfCancellationRequested();
-                if(all.Count>=2_000_000)return;
+                if(Chords>=2_000_000)return;
                 var a=path.Points[i-1];var b=path.Points[i];
                 float dx=(float)b.X-(float)a.X,dy=(float)(b.Z+surface)-(float)(a.Z+surface),dz=(float)b.Y-(float)a.Y;
                 if(ToolpathCommandRounding.IsVerticalOnly(dx,dy,dz)){known=false;continue;}
@@ -106,7 +138,9 @@ internal sealed class CutterSweepStock
                 // cursor was unknown. Only the following affine chord is known.
                 var chord=new Chord(known?ca:cb,cb);known=true;
                 if(Math.Max(-chord.A.Z,-chord.B.Z)<=0)continue;
-                all.Add(chord);pending.Add(chord);
+                if(compactIncrementalStorage){committedChordCount++;IncrementalAllEntriesAvoided++;}
+                else all.Add(chord);
+                pending.Add(chord);
                 maximumDepth=Math.Max(maximumDepth,Math.Max(-chord.A.Z,-chord.B.Z));
                 AddFloorSite(chord.A);AddFloorSite(chord.B);
             }
@@ -133,8 +167,42 @@ internal sealed class CutterSweepStock
             rows=all.ToArray();floorRows=floorSites.Values.ToArray();
             ReindexedChords+=blocks.Sum(b=>(long)b.Chords.Length);blocks.Clear();MergeCount++;
         }
+        else if(compactIncrementalStorage)
+        {
+            int rowCount=pending.Count,floorCount=pendingFloorSites.Count;
+            long literalChordCopies=rowCount,literalFloorCopies=floorCount;
+            List<Block>? merged=null;
+            // Preserve each original admission check, removal and statistic in
+            // its literal order. Only transient copies of the same immutable
+            // runs are deferred until the complete merge inventory is known.
+            while(blocks.Count>0&&blocks[^1].Chords.Length<=rowCount)
+            {
+                token.ThrowIfCancellationRequested();var previous=blocks[^1];blocks.RemoveAt(blocks.Count-1);
+                ReindexedChords+=previous.Chords.Length;MergeCount++;
+                (merged??=new()).Add(previous);
+                rowCount=checked(rowCount+previous.Chords.Length);
+                floorCount=checked(floorCount+previous.FloorSites.Length);
+                literalChordCopies+=rowCount;literalFloorCopies+=floorCount;
+            }
+            rows=new Chord[rowCount];floorRows=new Point3D[floorCount];
+            int rowAt=0,floorAt=0;
+            if(merged is not null)
+            {
+                // Repeated previous.Concat(current) places the oldest popped
+                // block first. Retain that exact input order before partition.
+                for(int i=merged.Count-1;i>=0;i--)
+                {
+                    var previous=merged[i];previous.Chords.CopyTo(rows,rowAt);rowAt+=previous.Chords.Length;
+                    previous.FloorSites.CopyTo(floorRows,floorAt);floorAt+=previous.FloorSites.Length;
+                }
+                IncrementalTemporaryArraysAvoided+=2L*merged.Count;
+            }
+            pending.CopyTo(rows,rowAt);pendingFloorSites.Values.CopyTo(floorRows,floorAt);
+            IncrementalChordCopyRowsAvoided+=literalChordCopies-rowCount;
+            IncrementalFloorCopyRowsAvoided+=literalFloorCopies-floorCount;
+        }
         else{rows=pending.ToArray();floorRows=pendingFloorSites.Values.ToArray();}
-        if(mergeIncrementally)
+        if(mergeIncrementally&&!compactIncrementalStorage)
         {
             // Size-based immutable runs retain all committed chords. A small
             // new visit must not repeatedly rebuild the entire executed prefix.
@@ -178,14 +246,22 @@ internal sealed class CutterSweepStock
         pendingFloorSites.Clear();floorBuildTicks+=Stopwatch.GetTimestamp()-started;
         blocks.Add(new(rows,root,floorIndex,floorRows));
         MaximumBlocks=Math.Max(MaximumBlocks,blocks.Count);
+        if(compactIncrementalStorage&&Chords>=nextStorageDiagnostic)
+        {
+            Console.WriteLine($"[CutterSweepStock.Storage] {IncrementalStorageDiagnostics}");
+            do{nextStorageDiagnostic*=2;}while(Chords>=nextStorageDiagnostic);
+        }
     }
 
     /// <summary>One actual, fully anchored posted cut in stock-relative axes.</summary>
     internal void RecordExecuted(Point3D a,Point3D b)
     {
         token.ThrowIfCancellationRequested();
-        if(!supported||!Finite(a)||!Finite(b)||all.Count>=2_000_000||Math.Min(a.Z,b.Z)>=0)return;
-        var chord=new Chord(a,b);all.Add(chord);pending.Add(chord);
+        if(!supported||!Finite(a)||!Finite(b)||Chords>=2_000_000||Math.Min(a.Z,b.Z)>=0)return;
+        var chord=new Chord(a,b);
+        if(compactIncrementalStorage){committedChordCount++;IncrementalAllEntriesAvoided++;}
+        else all.Add(chord);
+        pending.Add(chord);
         maximumDepth=Math.Max(maximumDepth,Math.Max(-a.Z,-b.Z));
     }
 
@@ -196,6 +272,53 @@ internal sealed class CutterSweepStock
         // stock. Free air must not license a shortcut across a protected island.
         a=a with{Z=Math.Min(0,a.Z)-clearance};b=b with{Z=Math.Min(0,b.Z)-clearance};
         return Contains(a,b,0,clearance);
+    }
+
+    /// <summary>Refusal-only broad phase for the local emitter. A leaf means
+    /// merely that an endpoint has a possible donor, never that it is covered.
+    /// No stock query budget, previous witness or proof memo is read or changed.</summary>
+    internal EndpointCandidates FindTravelEndpointCandidates(Point3D a,Point3D b,double clearance)
+    {
+        token.ThrowIfCancellationRequested();
+        if(!endpointCandidateDomain||pending.Count!=0||!(clearance>0)||!double.IsFinite(clearance))return new(true,true,0,-1);
+        // Match the original query's exact stock-relative transformation.
+        a=a with{Z=Math.Min(0,a.Z)-clearance};b=b with{Z=Math.Min(0,b.Z)-clearance};
+        if(!Finite(a)||!Finite(b)||a.Z!=b.Z)return new(true,true,0,-1);
+        double depth=-a.Z,queryRadius=profile.PhysicalRadiusAtDepth(depth);
+        if(!(depth>0)||!double.IsFinite(queryRadius))return new(true,true,0,-1);
+        long visited=0;bool uncertain=false;
+        static double Down(double value)=>Math.BitDecrement(value);
+        static double Up(double value)=>Math.BitIncrement(value);
+        bool Candidate(Node node,Point3D point)
+        {
+            if((++visited&255)==0)token.ThrowIfCancellationRequested();
+            // With |XY|<=10000 and |Z|<=100, the clamped donor interpolation
+            // A+t*(B-A) differs from its endpoint box by <1e-11 in XY and
+            // <1e-12 in depth, including the subsequent d+(queryZ-donorZ).
+            // These larger reserves enclose that arithmetic before evaluating
+            // the monotone physical radius. Supported sections have radius
+            // <=1000 and height>=1e-6; 1e-7 additionally encloses radius and
+            // hemisphere-rounding error. All final box operations round out.
+            double donorRadius=Up(Up(profile.PhysicalRadiusAtDepth(Up(node.Depth+EndpointDepthReserve)))+EndpointRadiusReserve);
+            double reach=Up(donorRadius-queryRadius);
+            if(!double.IsFinite(reach)){uncertain=true;return true;}
+            if(reach<0)return false;
+            double left=Down(Down(node.MinX-EndpointCoordinateReserve)-reach),right=Up(Up(node.MaxX+EndpointCoordinateReserve)+reach);
+            double bottom=Down(Down(node.MinY-EndpointCoordinateReserve)-reach),top=Up(Up(node.MaxY+EndpointCoordinateReserve)+reach);
+            if(!double.IsFinite(left+right+bottom+top)){uncertain=true;return true;}
+            if(point.X<left||point.X>right||point.Y<bottom||point.Y>top)return false;
+            if(node.Left is null)return true;
+            return Candidate(node.Left,point)||Candidate(node.Right!,point);
+        }
+        bool Any(Point3D point)
+        {foreach(var block in blocks)if(Candidate(block.Root,point))return true;return false;}
+        // Any accepted Covered interval includes RadialMargin's h=depth test:
+        // margin<=R(depth+delta)-R(depth). The expanded node encloses every
+        // possible donor of an interval touching t=0 or t=1. Their parameter
+        // union cannot cover [0,1] if either endpoint has no possible donor.
+        if(!Any(a))return new(uncertain,uncertain,visited,uncertain?-1:0);
+        if(!Any(b))return new(uncertain,uncertain,visited,uncertain?-1:1);
+        return new(true,uncertain,visited,-1);
     }
 
     internal bool Contains(Point3D a,Point3D b,double tolerance,double radialReserve=0)
@@ -445,6 +568,18 @@ internal sealed class CutterSweepStock
     // Linear/linear pieces attain minima at ends. The one remaining case,
     // linear above a spherical nose, also tests its analytic stationary point.
     internal double RadialMargin(double delta,double depth)
+    {
+        RadialMarginCalls++;
+        if(radialMemo is null||!double.IsFinite(delta)||!double.IsFinite(depth))return RadialMarginLiteral(delta,depth);
+        var key=(BitConverter.DoubleToInt64Bits(delta),BitConverter.DoubleToInt64Bits(depth));
+        if(radialMemo.TryGetValue(key,out double cached)){RadialMarginMemoHits++;return cached;}
+        RadialMarginMemoMisses++;
+        double value=RadialMarginLiteral(delta,depth);
+        if(radialMemo.Count==radialMemoLimit){radialMemo.Remove(radialMemoOrder!.Dequeue());RadialMarginMemoEvictions++;}
+        radialMemo.Add(key,value);radialMemoOrder!.Enqueue(key);return value;
+    }
+
+    private double RadialMarginLiteral(double delta,double depth)
     {
         if(!supported||delta<0||depth<0||depth+delta>joints[^1])return double.NegativeInfinity;
         double answer=double.PositiveInfinity;

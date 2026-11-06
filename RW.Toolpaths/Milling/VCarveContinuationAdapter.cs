@@ -1,11 +1,166 @@
 using System.Globalization;
+using RW.Toolpaths.Geometry;
 
 namespace RW.Toolpaths.Milling;
+
+using System.Diagnostics;
 
 /// <summary>V-carve geometry/stock adapter for the common continuation policy.
 /// Keeps all scheduled Cut traces; only their entry is replanned from proved air.</summary>
 internal sealed class VCarveContinuationAdapter
 {
+    internal static readonly AsyncLocal<bool?> RoughingPreparationEnabled=new();
+
+    /// <summary>One routing request's detached immutable prior-cut inventory.
+    /// The ordinal BVH only omits chords that the literal family-box test would
+    /// reject. It grants no stock/clearance and owns no planner/query history.</summary>
+    internal sealed class RoughingPreparation
+    {
+        internal const long MaximumBytes=64L<<20;
+        internal const int MaximumNominationChords=100_000;
+        private const int LeafSize=16;
+        private readonly IReadOnlyList<VCarveRoughingChord> source;
+        private readonly int sourceCount;
+        private readonly long maximumBytes;
+        private readonly VCarveRoughingChord[]? ownedSnapshot;
+        private VCarveRoughingChord[]? snapshot;
+        private int[]? ordinals;
+        private BoundsNode[]? nodes;
+        private bool indexAttempted;
+        private string refusal="none";
+        private readonly record struct BoundsNode(double MinX,double MinY,double MaxX,double MaxY,
+            int First,int Count,int Left,int Right);
+        internal long SnapshotBuilds{get;private set;}
+        internal long SnapshotReuses{get;private set;}
+        internal long SnapshotCopies{get;private set;}
+        internal long IndexBuilds{get;private set;}
+        internal long Queries{get;private set;}
+        internal long LiteralFallbackQueries{get;private set;}
+        internal long ConsideredChords{get;private set;}
+        internal long BoundsChordTests{get;private set;}
+        internal long BoundsNodeTests{get;private set;}
+        internal long SelectedChords{get;private set;}
+        internal long RetainedBytes{get;private set;}
+        private long preparationTicks,queryTicks;
+        internal RoughingPreparation(IReadOnlyList<VCarveRoughingChord> source,long maximumBytes=MaximumBytes,
+            VCarveRoughingChord[]? ownedSnapshot=null)
+        {
+            ArgumentNullException.ThrowIfNull(source);
+            if(maximumBytes<0||maximumBytes>MaximumBytes)throw new ArgumentOutOfRangeException(nameof(maximumBytes));
+            this.source=source;sourceCount=source.Count;this.maximumBytes=maximumBytes;
+            if(ownedSnapshot is not null&&ownedSnapshot.Length!=sourceCount)throw new ArgumentException("Owned roughing snapshot length changed.",nameof(ownedSnapshot));
+            this.ownedSnapshot=ownedSnapshot;
+        }
+        internal static long EstimateRetainedBytes(int sourceCount)
+        {
+            int count=Math.Min(sourceCount,MaximumNominationChords);
+            long slots=4L*((count+LeafSize-1)/LeafSize);
+            return 512+96L*sourceCount+4L*count+64L*slots;
+        }
+        internal bool TrySnapshot(IReadOnlyList<VCarveRoughingChord> actual,CancellationToken token,
+            out VCarveRoughingChord[]? result)
+        {
+            result=null;
+            if(!ReferenceEquals(source,actual)||sourceCount!=actual.Count)return false;
+            if(snapshot is not null){SnapshotReuses++;result=snapshot;return true;}
+            // Conservative bounds include the complete 72-byte chord values,
+            // array alignment and ordinal/tree storage. No source is truncated
+            // for later full prior-stock queries when the snapshot is admitted.
+            long bytes=EstimateRetainedBytes(sourceCount);
+            if(bytes>maximumBytes){refusal="snapshot-byte-budget";return false;}
+            token.ThrowIfCancellationRequested();long started=Stopwatch.GetTimestamp();
+            var copy=ownedSnapshot??actual.ToArray();
+            token.ThrowIfCancellationRequested();
+            if(copy.Length!=sourceCount||actual.Count!=sourceCount){refusal="source-count-changed";return false;}
+            snapshot=copy;RetainedBytes=bytes;SnapshotBuilds++;result=copy;
+            if(ownedSnapshot is null)SnapshotCopies++;
+            preparationTicks+=Stopwatch.GetTimestamp()-started;
+            return true;
+        }
+        private void PrepareIndex(CancellationToken token)
+        {
+            if(indexAttempted)return;
+            token.ThrowIfCancellationRequested();long started=Stopwatch.GetTimestamp();
+            var cuts=snapshot!;int count=Math.Min(cuts.Length,MaximumNominationChords);
+            for(int i=0;i<count;i++)
+            {
+                if((i&1023)==0)token.ThrowIfCancellationRequested();var c=cuts[i];
+                if(!Coordinate(c.A.X)||!Coordinate(c.A.Y)||!Coordinate(c.B.X)||!Coordinate(c.B.Y))
+                {indexAttempted=true;refusal="literal-coordinate-domain";return;}
+            }
+            var order=Enumerable.Range(0,count).ToArray();
+            var tree=new BoundsNode[4*((count+LeafSize-1)/LeafSize)];int next=0;
+            int Build(int first,int length)
+            {
+                token.ThrowIfCancellationRequested();int at=next++;
+                double minX=double.PositiveInfinity,minY=minX,maxX=double.NegativeInfinity,maxY=maxX;
+                for(int i=first;i<first+length;i++)
+                {
+                    var c=cuts[order[i]];minX=Math.Min(minX,Math.Min(c.A.X,c.B.X));minY=Math.Min(minY,Math.Min(c.A.Y,c.B.Y));
+                    maxX=Math.Max(maxX,Math.Max(c.A.X,c.B.X));maxY=Math.Max(maxY,Math.Max(c.A.Y,c.B.Y));
+                }
+                int left=-1,right=-1;
+                if(length>LeafSize)
+                {
+                    bool x=maxX-minX>=maxY-minY;
+                    int Compare(int a,int b)
+                    {
+                        var c=cuts[a];var d=cuts[b];
+                        int comparison=(x?c.A.X+c.B.X:c.A.Y+c.B.Y).CompareTo(x?d.A.X+d.B.X:d.A.Y+d.B.Y);
+                        return comparison!=0?comparison:a.CompareTo(b);
+                    }
+                    SpatialMedianPartition.Partition(order,first,length,Compare,token);
+                    int half=length/2;left=Build(first,half);right=Build(first+half,length-half);
+                }
+                tree[at]=new(minX,minY,maxX,maxY,first,length,left,right);return at;
+            }
+            if(count>0)Build(0,count);
+            token.ThrowIfCancellationRequested();
+            ordinals=order;nodes=tree;indexAttempted=true;IndexBuilds++;
+            preparationTicks+=Stopwatch.GetTimestamp()-started;
+        }
+        private static bool Coordinate(double value)=>double.IsFinite(value)&&Math.Abs(value)<=1e12;
+        internal IReadOnlyList<int> Select(double minX,double minY,double maxX,double maxY,CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();long started=Stopwatch.GetTimestamp();
+            if(snapshot is null)throw new InvalidOperationException("A roughing candidate index requires its owned snapshot.");
+            int count=Math.Min(snapshot.Length,MaximumNominationChords);Queries++;ConsideredChords+=count;
+            try
+            {
+                PrepareIndex(token);
+                if(nodes is null||!Coordinate(minX)||!Coordinate(minY)||!Coordinate(maxX)||!Coordinate(maxY)
+                    ||minX>maxX||minY>maxY)
+                {LiteralFallbackQueries++;SelectedChords+=count;return Enumerable.Range(0,count).ToArray();}
+                var selected=new List<int>();
+                void Visit(int at)
+                {
+                    if((BoundsNodeTests++&255)==0)token.ThrowIfCancellationRequested();var node=nodes[at];
+                    if(node.MaxX<minX||node.MinX>maxX||node.MaxY<minY||node.MinY>maxY)return;
+                    if(node.Left>=0){Visit(node.Left);Visit(node.Right);return;}
+                    for(int i=node.First;i<node.First+node.Count;i++)
+                    {
+                        BoundsChordTests++;int ordinal=ordinals![i];var chord=snapshot[ordinal];
+                        // Same literal endpoint bounds and strict comparisons;
+                        // touching boundaries are retained in original order.
+                        if(Math.Max(chord.A.X,chord.B.X)<minX||Math.Min(chord.A.X,chord.B.X)>maxX
+                            ||Math.Max(chord.A.Y,chord.B.Y)<minY||Math.Min(chord.A.Y,chord.B.Y)>maxY)continue;
+                        selected.Add(ordinal);
+                    }
+                }
+                if(count>0)Visit(0);
+                selected.Sort();token.ThrowIfCancellationRequested();SelectedChords+=selected.Count;
+                return selected;
+            }
+            finally{queryTicks+=Stopwatch.GetTimestamp()-started;}
+        }
+        internal void Report(Action<string>? log)=>log?.Invoke($"stage=continuation-roughing-preparation sourceChords={sourceCount} "
+            +$"snapshotBuilds={SnapshotBuilds} snapshotCopies={SnapshotCopies} snapshotReuses={SnapshotReuses} indexBuilds={IndexBuilds} queries={Queries} "
+            +$"consideredChords={ConsideredChords} boundsChordTests={BoundsChordTests} boundsNodeTests={BoundsNodeTests} selectedChords={SelectedChords} "
+            +$"literalFallbackQueries={LiteralFallbackQueries} retainedBytes={RetainedBytes} maximumBytes={maximumBytes} refusal={refusal} "
+            +$"preparationMs={1000d*preparationTicks/Stopwatch.Frequency:F3} queryMs={1000d*queryTicks/Stopwatch.Frequency:F3} "
+            +"sourceIdentity=route-reference-and-count snapshot=complete-detached-values nominationCap=first-100000-original-ordinals "
+            +"nominationOrder=original-chord-then-original-air-depth privatePlannerAndQuerySessions=True fullAirProofUnchanged=True");
+    }
     private readonly ToolpathContinuationPlanner planner;
     private readonly ToolpathMotionCost? motionCost;
     private readonly VCarveCutterProfile profile;
@@ -31,13 +186,15 @@ internal sealed class VCarveContinuationAdapter
 
     internal VCarveContinuationAdapter(ToolGeometry tool, DepthSchedule depth, VCarveOptions options,
         Func<Point3D, Point3D, bool>? originalCutGuard, CancellationToken token, Action<string>? log,
-        IReadOnlyList<TaggedToolpath> paths)
+        IReadOnlyList<TaggedToolpath> paths,RoughingPreparation? roughingPreparation=null)
     {
         options = options.WithPriorStock(token);
         motionCost=options.Motion is null?null:new(options.Motion,depth.SurfaceZ);
         this.depth = depth; this.options = options; this.originalCutGuard = originalCutGuard;
         prior = options.PriorStock?.CreateQuerySession(8_000_000);
-        roughing=options.RoughingRestChords.ToArray();
+        if(roughingPreparation is not null&&roughingPreparation.TrySnapshot(options.RoughingRestChords,token,out var preparedRoughing))
+            roughing=preparedRoughing!;
+        else{roughingPreparation=null;roughing=options.RoughingRestChords.ToArray();}
         this.token = token; this.log = log;
         profile = VCarvePhysicalSweep.ProfileFor(tool, depth.Depth);
         distance = Math.Max(.1, 2 * options.StepOver * Math.Max(profile.ClearingDiameter, 2 * profile.PhysicalRadiusAtDepth(Math.Min(depth.Depth, depth.DepthPerPass))));
@@ -64,7 +221,9 @@ internal sealed class VCarveContinuationAdapter
             // its deepest centreline strands wall visits above the bulk-air graph.
             // These levels nominate routes; each complete inflated chord is still
             // independently contained in the real earlier flat-cutter column.
-            foreach(var chord in roughing.Take(100_000))
+            var candidates=roughingPreparation is null?roughing.Take(100_000)
+                :roughingPreparation.Select(minX,minY,maxX,maxY,token).Select(i=>roughing[i]);
+            foreach(var chord in candidates)
             foreach(double level in airDepths)
             {
                 if (Math.Max(chord.A.X,chord.B.X)<minX || Math.Min(chord.A.X,chord.B.X)>maxX

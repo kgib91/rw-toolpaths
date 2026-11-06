@@ -1,7 +1,8 @@
 using Clipper2Lib;
 using RW.Toolpaths.Geometry;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
+using CellFacts=RW.Toolpaths.Milling.VCarveStockCellFacts.Facts;
+using CellKey=RW.Toolpaths.Milling.VCarveStockCellFacts.Key;
 
 namespace RW.Toolpaths.Milling;
 
@@ -29,6 +30,11 @@ internal sealed class VCarveProjectedStock
     private readonly object queryDomain = new();
     private readonly bool memoRefusals=true;
     private readonly bool inheritCellClearance=true;
+    // Actual-job replay showed negligible candidate reduction from the extra
+    // sibling-distance work. Keep literal production ordering; the explicit
+    // diagnostic control remains available for captured-query comparisons.
+    private readonly bool spatialDepthTies;
+    private readonly Action<VCarveNativeStockQuery>? queryObserver;
     internal long InheritedStockCellProofs;
     internal long InheritedRegionDistanceQueriesAvoided;
     internal long ReusedCellIntersectionPredicates;
@@ -43,25 +49,19 @@ internal sealed class VCarveProjectedStock
     // These values describe ACTUAL stock only, independently of the proposed
     // cutter, target permission, depth and posting reserve. Fixed dyadic cells
     // let neighbouring fits reuse the same continuous whole-disk lower bound.
-    private struct CellFacts
-    {
-        internal double PartDistance, TargetDistance, Clearance, PointClearance, SeedClearance;
-    }
     // Every dyadic cell through level 14 has an exact centre on the 1/2048 mm
     // grid. Its two centre coordinates identify BOTH position and level (the
     // lowest set centre bit identifies the cell width), without a tuple hash.
     // UInt64's default hash XORs its two halves. Here those halves are X and Y:
     // a complete N by N dyadic grid can collapse to only O(N) hashes. Mix both
     // coordinates before indexing; equality and FIFO admission remain literal.
-    private readonly record struct CellKey(ulong Packed)
-    {
-        // A value key keeps Dictionary's hash/equality path statically known;
-        // the mixed hash and literal packed equality do not need virtual calls.
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public override int GetHashCode() => System.HashCode.Combine((uint)Packed, (uint)(Packed >> 32));
-    }
-    private readonly Dictionary<CellKey,CellFacts> stockCells = new();
-    private readonly Queue<CellKey> stockCellOrder = new();
+    private readonly VCarveStockCellFacts stockCells;
+    internal const int DefaultStockCellFastEntries=4096;
+    internal static readonly AsyncLocal<int?> StockCellFastEntriesOverride=new();
+    internal string CellFactStoreDiagnostics=>$"cellFactStore=paged-exact-FIFO cellFactFastEntries={stockCells.FastEntries} "
+        +$"cellFactFastHits={stockCells.FastHits} cellFactSafeDictHits={stockCells.SafeDictionaryHits} cellFactMisses={stockCells.Misses} "
+        +$"cellFactEvictions={stockCells.Evictions} cellFactPages={stockCells.AllocatedPages} cellFactAllocatedSlots={stockCells.AllocatedSlots} "
+        +$"cellFactEstimatedManagedBytes={stockCells.EstimatedManagedBytes}";
     private CellFacts uncachedCellFacts;
     private const double StockCellRootWidth = 16;
     private const int StockCellCacheLimit = 1048576;
@@ -69,13 +69,24 @@ internal sealed class VCarveProjectedStock
     internal long StockCellCacheHits, StockCellCacheMisses, StockCellCacheEvictions;
     internal long CellGeometryCacheHits, CellGeometryCacheMisses;
     internal long ProfileCandidatesPruned;
+    private long profileDepthCalls,profileDepthCanImproveRejects,profileDepthUpperBottomCalls;
+    private long profileDepthZeroXYReturns,profileDepthConstantZReturns,profileDepthVariableZCalls,profileDepthVariableZSearches;
+    private long profileDepthAtEvaluations,profileDepthLengthSqrtEvaluations,profileDepthSectionDenominatorSqrtEvaluations;
+    internal string ProfileDepthDiagnostics=>$"profileDepthCalls={profileDepthCalls} profileDepthCanImproveRejects={profileDepthCanImproveRejects} "
+        +$"profileDepthUpperBottomCalls={profileDepthUpperBottomCalls} profileDepthZeroXYReturns={profileDepthZeroXYReturns} "
+        +$"profileDepthConstantZReturns={profileDepthConstantZReturns} profileDepthVariableZCalls={profileDepthVariableZCalls} "
+        +$"profileDepthVariableZSearches={profileDepthVariableZSearches} profileDepthAtEvaluations={profileDepthAtEvaluations} "
+        +$"profileDepthLengthSqrtEvaluations={profileDepthLengthSqrtEvaluations} profileDepthSectionDenominatorSqrtEvaluations={profileDepthSectionDenominatorSqrtEvaluations} "
+        +"profileDepthCounters=owner-local-executed-work noPerCallStopwatch=True";
     internal long ProfileNodesPruned;
+    internal long ColumnNodeVisits,SpatialDepthTieTrials,SpatialDepthTieReorders;
     private int lastProfileWinner=-1;
     internal long PriorPoseSeedTrials,PriorPoseSeedPositive;
     internal long SeededCellProofs,SeededCellTrials;
     private const int CacheLimit = 131072;
     internal const int SweepProofCacheLimit=1048576;
     internal int CachedSweepProofs=>proofs.Count;
+    internal int CachedStockCellFacts=>stockCells.Count;
     internal long SweepProofCacheEvictions;
     internal long ReversedSweepProofHits,StrongerSweepProofHits;
     internal long DepthWitnessQueries,DepthWitnessBounds,DepthWitnessSeedFits;
@@ -94,6 +105,33 @@ internal sealed class VCarveProjectedStock
     // while retaining private adaptive cells, certificates and search hints.
     internal VCarveProjectedStock CreateQueryWorker() => new(this);
 
+    /// <summary>Copies fixed-grid actual-stock facts before native queries start.
+    /// The source is quiescent and belongs to this identical immutable domain;
+    /// each value/FIFO slot is private to the fresh destination.</summary>
+    internal long ImportStockCellFacts(VCarveProjectedStock source,int maximumEntries=StockCellCacheLimit)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        if(maximumEntries<0||maximumEntries>StockCellCacheLimit)throw new ArgumentOutOfRangeException(nameof(maximumEntries));
+        if(!ReferenceEquals(queryDomain,source.queryDomain))
+            throw new ArgumentException("Stock cell facts require the identical immutable query domain.",nameof(source));
+        token.ThrowIfCancellationRequested();
+        if(stockCells.Count!=0)
+            throw new InvalidOperationException("Stock cell facts can only initialize a fresh private native query worker.");
+        int limit=Math.Min(maximumEntries,Math.Min(stockCellCacheLimit,source.stockCells.Count));
+        stockCells.EnsureCapacity(limit);
+        long imported=0;
+        foreach(var (key,facts) in source.stockCells.Entries)
+        {
+            token.ThrowIfCancellationRequested();if(imported>=limit)break;
+            // CellFacts contains only doubles: literal region distances and
+            // actual prior-stock disk/point lower bounds. Preserve every bit,
+            // including NaN=unknown. Query-stack flags/floors and hints are not
+            // members of this value and never enter the copied inventory.
+            stockCells.AddImported(key,facts);imported++;
+        }
+        token.ThrowIfCancellationRequested();return imported;
+    }
+
     internal bool TryPositiveProof(Point3D a,Point3D b,bool postingReserve=true)
     {
         if(proofs.TryGetValue((a,b,false,postingReserve),out bool exact)&&exact
@@ -104,14 +142,16 @@ internal sealed class VCarveProjectedStock
         return false;
     }
 
-    internal long ImportPositiveProofs(VCarveProjectedStock worker)
+    internal long ImportPositiveProofs(VCarveProjectedStock worker,int maximumEntries=int.MaxValue)
     {
+        if(maximumEntries<0)throw new ArgumentOutOfRangeException(nameof(maximumEntries));
         if (!ReferenceEquals(queryDomain, worker.queryDomain))
             throw new ArgumentException("Stock certificates require the identical immutable query domain.", nameof(worker));
-        long imported = 0;
+        token.ThrowIfCancellationRequested();long imported = 0;int examined=0;
         foreach (var (key, result) in worker.proofs)
         {
             token.ThrowIfCancellationRequested();
+            if(examined++>=maximumEntries)break;
             if (!result) continue;
             if (proofs.ContainsKey(key)) { proofs[key] = true; continue; }
             if (proofs.Count >= SweepProofCacheLimit)
@@ -128,8 +168,10 @@ internal sealed class VCarveProjectedStock
         target = source.target.CreateQueryWorker(); part = source.part.CreateQueryWorker(); profile = source.profile;
         maximumDepth = source.maximumDepth; token = source.token;
         stockCellCacheLimit = source.stockCellCacheLimit;
+        stockCells=new(stockCellCacheLimit,source.stockCells.FastEntries);
         memoRefusals = source.memoRefusals;
         inheritCellClearance = source.inheritCellClearance;
+        spatialDepthTies = source.spatialDepthTies;
         ProfileChords = source.ProfileChords;
         diagnostic = null;
 
@@ -139,12 +181,17 @@ internal sealed class VCarveProjectedStock
         IEnumerable<IReadOnlyList<PointD>> target, IReadOnlyList<PointD> part,
         VCarveCutterProfile profile, double maximumDepth, CancellationToken token,
         IReadOnlyList<VCarveClearedSweep>? profileSweeps = null,Action<string>? diagnostic=null,
-        int cellCacheLimit=StockCellCacheLimit,bool memoRefusals=true,bool inheritCellClearance=true,IReadOnlyList<VCarveRemovalGaugePose>? removalGauge=null)
+        int cellCacheLimit=StockCellCacheLimit,bool memoRefusals=true,bool inheritCellClearance=true,IReadOnlyList<VCarveRemovalGaugePose>? removalGauge=null,
+        bool spatialDepthTies=false,int? stockCellFastEntries=null)
     {
         if(cellCacheLimit<1||cellCacheLimit>StockCellCacheLimit)throw new ArgumentOutOfRangeException(nameof(cellCacheLimit));
+        var captureFactory=VCarveNativeStockTrace.QueryObserverFactory.Value;
+        if(captureFactory is not null)target=target.Select(r=>(IReadOnlyList<PointD>)r.ToArray()).ToArray();
         stockCellCacheLimit=cellCacheLimit;
+        stockCells=new(cellCacheLimit,stockCellFastEntries??StockCellFastEntriesOverride.Value??DefaultStockCellFastEntries);
         this.memoRefusals=memoRefusals;
         this.inheritCellClearance=inheritCellClearance;
+        this.spatialDepthTies=spatialDepthTies;
         bool Posted(Point3D p) => double.IsFinite(p.X+p.Y+p.Z) && Math.Abs(p.X)<=10000 && Math.Abs(p.Y)<=10000 && Math.Abs(p.Z)<=100
             && p.X==Math.Round(p.X*1000)/1000d && p.Y==Math.Round(p.Y*1000)/1000d && p.Z==Math.Round(p.Z*1000)/1000d;
         var rows = new List<StockChord>();
@@ -209,6 +256,9 @@ internal sealed class VCarveProjectedStock
         var groups=retained.GroupBy(c=>c.Profile).OrderBy(g=>g.Key is null?0:1).ToArray();
         this.columns = groups.SelectMany(g=>g).ToArray(); this.target = new(target); this.part = new(new[] { part });
         this.profile = profile; this.maximumDepth = maximumDepth; this.token = token;this.diagnostic=diagnostic;
+        if(captureFactory is not null)
+            queryObserver=captureFactory(new(target.ToArray(),columns,profileSweeps??Array.Empty<VCarveClearedSweep>(),
+                part,profile,maximumDepth,spatialDepthTies,removalGauge?.Count>0,this.columns.Length));
         diagnostic?.Invoke($"stage=material-surface-index ignoredZeroVolumeColumns={ignoredEmptyColumns} indexedChords={this.columns.Length} "
             +$"profileChords={ProfileChords} emptyColumnsGrantNoStock=True homogeneousProfileBoundsRetained=True cellMemoHash=full-xy-mix");
         if (this.columns.Length == 0) { nodes = Array.Empty<Node>(); roots=Array.Empty<int>(); return; }
@@ -259,8 +309,9 @@ internal sealed class VCarveProjectedStock
     /// Each accepted depth belongs to one actual pose along a posted chord.</summary>
     internal double ClearedDepth(double x, double y, double diskRadius, bool innerReserve = true)
     {
+        int seedBefore=lastProfileWinner;
         ColumnQueries++;
-        if (nodes.Length == 0) return 0;
+        if (nodes.Length == 0) return CaptureDepth(0);
         double best = 0;
         if(lastProfileWinner>=0)
         {
@@ -278,6 +329,7 @@ internal sealed class VCarveProjectedStock
             while(count>0)
             {
             var n = nodes[pending[--count]];
+            ColumnNodeVisits++;
             if (n.Depth <= best || n.Left > x - diskRadius || n.Right < x + diskRadius
                 || n.Bottom > y - diskRadius || n.Top < y + diskRadius) continue;
             if(n.CommonProfile is { } common)
@@ -295,7 +347,26 @@ internal sealed class VCarveProjectedStock
             if (n.Low >= 0)
             {
                 // Deep columns first make the immutable subtree depth bound useful.
-                if (nodes[n.Low].Depth > nodes[n.High].Depth) { pending[count++] = n.High; pending[count++] = n.Low; }
+                bool lowFirst=nodes[n.Low].Depth > nodes[n.High].Depth;
+                if(spatialDepthTies&&nodes[n.Low].Depth==nodes[n.High].Depth)
+                {
+                    // Equal deepest tips provide no useful ordering on a broad
+                    // constant-depth trace. Visit the nearer ORIGINAL source
+                    // box first to establish a real pose lower bound sooner.
+                    // This is ordering only: every node retains its original
+                    // upper-bound rejection and every admitted chord its full
+                    // physical calculation. No search budget is introduced.
+                    SpatialDepthTieTrials++;
+                    double DistanceSquared(Node child)
+                    {
+                        double dx=Math.Max(0,Math.Max(child.SourceLeft-x,x-child.SourceRight));
+                        double dy=Math.Max(0,Math.Max(child.SourceBottom-y,y-child.SourceTop));
+                        return dx*dx+dy*dy;
+                    }
+                    if(DistanceSquared(nodes[n.Low])<DistanceSquared(nodes[n.High]))
+                    {lowFirst=true;SpatialDepthTieReorders++;}
+                }
+                if (lowFirst) { pending[count++] = n.High; pending[count++] = n.Low; }
                 else { pending[count++] = n.Low; pending[count++] = n.High; }
                 continue;
             }
@@ -335,11 +406,18 @@ internal sealed class VCarveProjectedStock
             }
             }
         }
-        return Math.Min(maximumDepth, best);
+        return CaptureDepth(Math.Min(maximumDepth, best));
+
+        double CaptureDepth(double depth)
+        {
+            queryObserver?.Invoke(new(x,y,diskRadius,innerReserve,depth,seedBefore,lastProfileWinner));
+            return depth;
+        }
     }
 
     private double ProfileDepth(StockChord c,double x,double y,double diskRadius,bool innerReserve,double bestKnown=0)
     {
+        profileDepthCalls++;
         var cutter=c.Profile!;
         double vx=c.B.X-c.A.X,vy=c.B.Y-c.A.Y,l2=vx*vx+vy*vy;
         double projection=l2>0 ? ((x-c.A.X)*vx+(y-c.A.Y)*vy)/l2 : 0;
@@ -347,14 +425,18 @@ internal sealed class VCarveProjectedStock
         double extra=diskRadius+(innerReserve ? PostedSweepInnerRegion.Reserve : 0);
         double nearX=x-c.A.X-vx*closest,nearY=y-c.A.Y-vy*closest;
         if(innerReserve&&!CanImprove(cutter,Math.Max(-c.A.Z,-c.B.Z),bestKnown,nearX*nearX+nearY*nearY,extra))
-        {ProfileCandidatesPruned++;return 0;}
+        {ProfileCandidatesPruned++;profileDepthCanImproveRejects++;return 0;}
+        profileDepthUpperBottomCalls++;
         double upper=Math.Max(-c.A.Z,-c.B.Z)-cutter.PhysicalProfile.Bottom(Math.Sqrt(nearX*nearX+nearY*nearY)+extra);
         if(innerReserve && upper<=bestKnown){ProfileCandidatesPruned++;return 0;}
         // A vertical posted trace's deepest endpoint is an actual pose and
         // dominates every other pose on that same XY trace.
-        if(l2==0||c.A.Z==c.B.Z)return upper;
+        if(l2==0||c.A.Z==c.B.Z)
+        {if(l2==0)profileDepthZeroXYReturns++;else profileDepthConstantZReturns++;return upper;}
+        profileDepthVariableZCalls++;
         double At(double t)
         {
+            profileDepthAtEvaluations++;
             double qx=x-c.A.X-vx*t,qy=y-c.A.Y-vy*t;
             return -(c.A.Z+(c.B.Z-c.A.Z)*t)-cutter.PhysicalProfile.Bottom(Math.Sqrt(qx*qx+qy*qy)+extra);
         }
@@ -364,18 +446,21 @@ internal sealed class VCarveProjectedStock
         {
             return upper;
         }
+        profileDepthVariableZSearches++;
         double best=Math.Max(At(0),At(1));
         if(closest>0&&closest<1)best=Math.Max(best,At(closest));
         if(l2>0 && c.A.Z!=c.B.Z)
         {
             double px=x-c.A.X-vx*projection,py=y-c.A.Y-vy*projection;
             double perpendicular=Math.Sqrt(px*px+py*py),length=Math.Sqrt(l2),dd=c.A.Z-c.B.Z;
+            profileDepthLengthSqrtEvaluations++;
             foreach(var section in cutter.PhysicalProfile.Sections)
             {
                 double offset;
                 if(section.Kind==CarvingCutterSectionKind.Hemisphere)
                 {
                     if(section.TopRadius*section.TopRadius<=perpendicular*perpendicular)continue;
+                    profileDepthSectionDenominatorSqrtEvaluations++;
                     offset=dd*Math.Sqrt(Math.Max(0,section.TopRadius*section.TopRadius-perpendicular*perpendicular))
                         /(length*Math.Sqrt(l2+dd*dd));
                 }
@@ -384,6 +469,7 @@ internal sealed class VCarveProjectedStock
                     if(section.TopRadius==section.BottomRadius)continue;
                     double k=dd*(section.TopRadius-section.BottomRadius)/section.Height;
                     if(l2<=k*k)continue;
+                    profileDepthSectionDenominatorSqrtEvaluations++;
                     offset=k*perpendicular/(length*Math.Sqrt(l2-k*k));
                 }
                 double at=Math.Clamp(projection+offset,0,1);
@@ -410,6 +496,12 @@ internal sealed class VCarveProjectedStock
         if(delta < -1e-12)return false;
         return !(delta>=0 && 4*extraSquared*distanceSquared-delta*delta>1e-12);
     }
+
+    // This is the literal existing tuple lookup, without reading layer geometry
+    // or changing a depth/stock hint. Immutable layer owners can avoid rebuilding
+    // their same original bound before the normal RefineDepth cache-hit return.
+    internal bool TryGetRefinedDepth(double x,double y,bool clearedOnly,out double depth)
+        =>depths.TryGetValue((x,y,clearedOnly),out depth);
 
     internal double RefineDepth(double x, double y, double original, double flatCeiling, bool clearedOnly, PointD? witness)
     {
@@ -577,7 +669,7 @@ internal sealed class VCarveProjectedStock
     {
         if(!double.IsFinite(additionalPlanarMargin)||additionalPlanarMargin<0)return false;
         double depth=Math.Max(-a.Z,-b.Z);
-        if(!double.IsFinite(depth)||depth>profile.Sections.Sum(s=>s.Height))return false;
+        if(!double.IsFinite(depth)||depth>profile.RepresentedHeight)return false;
         // A deepened enclosing chord can exceed the actual operation depth.
         // Extend the QUERY profile so its body is never accidentally truncated;
         // the actual native curve's exact depth is checked separately.
@@ -737,28 +829,21 @@ internal sealed class VCarveProjectedStock
 
     private ref CellFacts GetCellFacts(Cell cell,double x,double y)
     {
-        CellFacts Fresh()=>new(){PartDistance=double.NaN,TargetDistance=double.NaN,
-            Clearance=double.NaN,PointClearance=double.NaN,SeedClearance=double.NaN};
         double gridX=x*2048,gridY=y*2048;
         if(gridX<int.MinValue||gridX>int.MaxValue||gridY<int.MinValue||gridY>int.MaxValue)
         {
             // Do not narrow or alias coordinates outside the packed domain.
             // A fresh literal query retains the same proof without memoization.
             CellGeometryCacheMisses++;
-            uncachedCellFacts=Fresh();return ref uncachedCellFacts;
+            uncachedCellFacts=CellFacts.Unknown();return ref uncachedCellFacts;
         }
         var key=new CellKey(((ulong)(uint)(int)gridX<<32)|(uint)(int)gridY);
-        ref var found=ref CollectionsMarshal.GetValueRefOrNullRef(stockCells,key);
-        if(!Unsafe.IsNullRef(ref found)){CellGeometryCacheHits++;return ref found;}
-        CellGeometryCacheMisses++;
-        if(stockCells.Count==stockCellCacheLimit)
-        {stockCells.Remove(stockCellOrder.Dequeue());StockCellCacheEvictions++;}
-        ref var added=ref CollectionsMarshal.GetValueRefOrAddDefault(stockCells,key,out _);
+        ref var added=ref stockCells.GetOrAdd(key,out var lookup);
+        if(lookup!=VCarveStockCellFacts.Lookup.New){CellGeometryCacheHits++;return ref added;}
+        CellGeometryCacheMisses++;StockCellCacheEvictions=stockCells.Evictions;
         // Both immutable regions belong to this operation. Store literal signed
         // distances, never a permission decision: clearedOnly and the candidate
         // sweep must still apply their own original tests on every visit.
-        added=Fresh();
-        stockCellOrder.Enqueue(key);
         return ref added;
     }
 

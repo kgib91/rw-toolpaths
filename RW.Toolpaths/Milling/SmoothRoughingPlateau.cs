@@ -8,6 +8,26 @@ namespace RW.Toolpaths.Milling;
 /// Existing pocket compensation keeps the complete cutter outside this exclusion.</summary>
 internal static class SmoothRoughingPlateau
 {
+    // Keep legacy identity semantics separate from the measured production
+    // default: changing batching must never alias an older prepared mask.
+    internal const int LegacyConstantOffsetLeafVertices=2048;
+    internal const int DefaultConstantOffsetLeafVertices=512;
+    internal static readonly AsyncLocal<int?> ConstantOffsetLeafVerticesOverride=new();
+    internal static int CaptureConstantOffsetLeafVertices(VCarveOptions? options=null)
+        =>ValidateConstantOffsetLeafVertices(options?.PlateauConstantOffsetLeafVertices
+            ??options?.InitialStrategy?.GenerationPolicy.PlateauConstantOffsetLeafVertices
+            ??ConstantOffsetLeafVerticesOverride.Value??DefaultConstantOffsetLeafVertices);
+    private static int ValidateConstantOffsetLeafVertices(int value)
+        =>value is 512 or 1024 or 2048?value:throw new ArgumentOutOfRangeException(nameof(ConstantOffsetLeafVerticesOverride),
+            "Plateau constant-offset leaves accept 512, 1024 or 2048 input vertices.");
+    internal static int ConstantOffsetLeafEnd(IReadOnlyList<Path64> strokes,int first,int maximumPaths,int maximumVertices)
+    {
+        ValidateConstantOffsetLeafVertices(maximumVertices);
+        int last=first,vertices=0;
+        do{vertices+=strokes[last++].Count;}
+        while(last<strokes.Count&&last-first<maximumPaths&&vertices+strokes[last].Count<=maximumVertices);
+        return last;
+    }
     internal static double CutterSupport(double delta, double grade, VCarveCutterProfile? profile)
         => profile is null ? 0 : Math.Max(0,
             profile.PhysicalProfile.SupportUpTo(grade, delta) / grade - profile.TipRadius);
@@ -20,8 +40,11 @@ internal static class SmoothRoughingPlateau
         CancellationToken token, IReadOnlyList<TaggedToolpath>? smoothed = null,
         VCarveCutterProfile? plateauProfile = null,
         IReadOnlyList<IReadOnlyList<PointD>>? target = null, bool pruneContainedPrimitives = true,
-        bool parallelLeafUnions=true,bool reuseTargetContact=true,bool indexDiscDominance=true)
+        bool parallelLeafUnions=true,bool reuseTargetContact=true,bool indexDiscDominance=true,
+        int? maximumConstantOffsetInputVertices=null)
     {
+        int constantVertexLimit=ValidateConstantOffsetLeafVertices(maximumConstantOffsetInputVertices
+            ??CaptureConstantOffsetLeafVertices());
         long started = Stopwatch.GetTimestamp();
         const double quantum = 1 / PathUtils.Scale;
         double arc = VCarvePreparation.GeometricErrorBound / 4;
@@ -37,6 +60,9 @@ internal static class SmoothRoughingPlateau
         List<bool>? targetContactMemo=pruneContainedPrimitives&&reuseTargetContact&&targetIndex is not null?new():null;
         long targetContactQueries=0,targetContactMemoHits=0;
         long leafBatches = 0, irrelevantChords = 0, identicalPrimitives = 0;
+        long constantLeaves=0,constantInputVertices=0,constantOversizeLeaves=0,carryUnions=0,carryInputContours=0,carryOutputContours=0;
+        int maximumConstantLeafVertices=0,maximumCarryLevel=0;
+        long carryElapsedTicks=0;
         int leafSize = target == null ? 64 : 128;
         long pendingPoints=0;
         using var leafUnions=parallelLeafUnions&&targetPaths is not null&&GeometryParallelism.WorkerLimit>1
@@ -52,12 +78,16 @@ internal static class SmoothRoughingPlateau
         void Carry(Paths64 paths,int level)
         {
             if(level>8) throw new InvalidOperationException("Outside-edge plateau union exceeds its certified hierarchy reserve.");
+            maximumCarryLevel=Math.Max(maximumCarryLevel,level);
             while(unionLevels.Count<=level) unionLevels.Add(new());
             var entries=unionLevels[level]; entries.Add(paths);
             if(entries.Count<8) return;
             token.ThrowIfCancellationRequested();
             var operands=new Paths64(); foreach(var entry in entries) operands.AddRange(entry);
-            var combined=Clipper.Union(operands,FillRule.NonZero); entries.Clear();
+            long carryStarted=Stopwatch.GetTimestamp();
+            var combined=Clipper.Union(operands,FillRule.NonZero);
+            carryElapsedTicks+=Stopwatch.GetTimestamp()-carryStarted; entries.Clear();
+            carryUnions++;carryInputContours+=operands.Count;carryOutputContours+=combined.Count;
             Carry(combined,level+1);
         }
         void KeepBatch(Paths64 paths)
@@ -85,7 +115,7 @@ internal static class SmoothRoughingPlateau
         using var hull = new VCarveOrderedDiscHull();
         long sourceChords = 0, flatChords = 0, taperedChords = 0, containedChords = 0, raisedSpans = 0;
         long identicalDiscRowsAvoided=0;
-        Console.WriteLine($"[Pocket.SmoothRoughing.Plateau] event=start paths={original.Count} floor={floor:R} grade={grade:R}");
+        Console.WriteLine($"[Pocket.SmoothRoughing.Plateau] event=start paths={original.Count} floor={floor:R} grade={grade:R} constantOffsetInputVertexLimit={constantVertexLimit} maximumChunkEdges=256 policyCaptured=True");
 
         // Match the finishing floor owner: ONLY spans actually raised by the
         // grade limiter introduce a ramp floor. Unchanged shallow wall/corner
@@ -309,6 +339,7 @@ internal static class SmoothRoughingPlateau
         {
             token.ThrowIfCancellationRequested();
             long offsetStarted = Stopwatch.GetTimestamp();
+            long groupFirstLeaf=constantLeaves;
             var strokes=group.Value;
             if(strokes.Count>=128&&strokes.All(p=>p.Count==2&&p[0]!=p[1]))
             {
@@ -339,23 +370,35 @@ internal static class SmoothRoughingPlateau
                 && strokes.Sum(p=>(long)p.Count)>=8192
                 ? new VCarveOrderedUnionQueue(token,GeometryParallelism.WorkerLimit,OffsetConstant,
                     maximumPathsPerLeaf:128) : null;
-            var constantSlots = new List<VCarveOrderedUnionQueue.Slot>();
+            var constantSlots = new Queue<VCarveOrderedUnionQueue.Slot>();
+            long constantPublished=0;
             long bufferedPoints = 0;
             void PublishConstant(Paths64 buffered)
             { bufferedPoints += buffered.Sum(p=>(long)p.Count); KeepBatch(buffered); }
             void DrainConstants()
             {
                 if(constantOffsets is null || constantSlots.Count==0)return;
-                constantOffsets.Drain();
-                foreach(var slot in constantSlots)PublishConstant(constantOffsets.ReadDrained(slot));
-                constantSlots.Clear();
+                while(constantSlots.Count>0)PublishNextConstant();
+            }
+            void PublishNextConstant()
+            {
+                // Publish the identical leaf results to Carry in their original
+                // order. Keep at most the original worker-count window while
+                // replacing each completed oldest leaf immediately, rather than
+                // stalling every worker at the end of each fixed wave.
+                var buffered=constantOffsets!.ReadCompleted(constantSlots.Dequeue());
+                // Carry may run a synchronous union while other offset leaves
+                // remain active. It participates in the same geometry budget.
+                using(var producer=constantOffsets.EnterProducerGeometry())PublishConstant(buffered);
+                constantPublished++;
             }
             for (int first = 0; first < strokes.Count;)
             {
                 token.ThrowIfCancellationRequested();
-                int last=first,vertices=0;
-                do{vertices+=strokes[last++].Count;}
-                while(last<strokes.Count&&last-first<leafSize&&vertices+strokes[last].Count<=2048);
+                int last=ConstantOffsetLeafEnd(strokes,first,leafSize,constantVertexLimit),vertices=0;
+                for(int i=first;i<last;i++)vertices+=strokes[i].Count;
+                constantLeaves++;constantInputVertices+=vertices;maximumConstantLeafVertices=Math.Max(maximumConstantLeafVertices,vertices);
+                if(vertices>constantVertexLimit)constantOversizeLeaves++;
                 // Same round primitives, bounded leaf unions: avoid constructing
                 // one arrangement containing thousands of overlapping end caps.
                 // Round joins are inscribed, so pay their sagitta and integer
@@ -364,16 +407,19 @@ internal static class SmoothRoughingPlateau
                 if(constantOffsets is null)PublishConstant(OffsetConstant(input));
                 else
                 {
-                    constantSlots.Add(constantOffsets.Submit(input));
-                    if(constantSlots.Count==constantOffsets.WorkerCount)DrainConstants();
+                    constantSlots.Enqueue(constantOffsets.Submit(input));
+                    if(constantSlots.Count==constantOffsets.WorkerCount)PublishNextConstant();
                 }
                 first=last;
             }
             DrainConstants();constantOffsets?.Complete();
             Console.WriteLine($"[Pocket.SmoothRoughing.Plateau] event=buffer-complete radius={group.Key:R} points={bufferedPoints} leafPaths={leafSize} "
+                +$"constantOffsetInputVertexLimit={constantVertexLimit} actualOffsetLeaves={constantLeaves-groupFirstLeaf} "
                 +$"elapsedMs={Stopwatch.GetElapsedTime(offsetStarted).TotalMilliseconds:F2} offsetWorkers={constantOffsets?.WorkerCount??1} "
                 +$"offsetComputeMs={constantOffsets?.ComputeMilliseconds??0:F1} offsetWaitMs={constantOffsets?.WaitMilliseconds??0:F1} "
-                +$"offsetRetainedInputBytes={constantOffsets?.PeakRetainedInputBytes??0} originalIntegerOperandsAndHierarchy=True");
+                +$"offsetPublication=sliding-original-order offsetWindow={constantOffsets?.WorkerCount??1} offsetPublishedLeaves={constantPublished} "
+                +$"offsetOrderedReadWaitMs={constantOffsets?.CompletedReadWaitMilliseconds??0:F1} offsetGlobalDrainWaves=0 "
+                +$"offsetRetainedInputBytes={constantOffsets?.PeakRetainedInputBytes??0} originalIntegerStrokes=True hierarchyFanoutAndReserveUnchanged=True partitionChangesBooleanGrouping=True");
         }
         if(targetPaths==null) batches.AddRange(pending); else UnionLeaf(pending);
         DrainLeaves();leafUnions?.Complete();
@@ -408,6 +454,10 @@ internal static class SmoothRoughingPlateau
             + $"discDominanceIndexed={dominance is not null} discDominanceBuildMs={discIndexMs:F1} discDominanceQueries={dominance?.Queries??0} "
             + $"discDominanceNodeVisits={dominance?.NodeVisits??0} discDominanceCandidates={dominance?.Candidates??0} "
             + $"identicalDiscRowsAvoided={identicalDiscRowsAvoided} "
+            + $"constantOffsetInputVertexLimit={constantVertexLimit} constantOffsetLeaves={constantLeaves} constantOffsetInputVertices={constantInputVertices} "
+            + $"maximumConstantOffsetLeafVerticesObserved={maximumConstantLeafVertices} oversizedSingleStrokeLeaves={constantOversizeLeaves} "
+            + $"carryUnions={carryUnions} carryElapsedMs={carryElapsedTicks*1000d/Stopwatch.Frequency:F1} carryInputContours={carryInputContours} carryOutputContours={carryOutputContours} maximumCarryLevelObserved={maximumCarryLevel} maximumCarryLevel=8 "
+            + "maximumChunkEdges=256 originalIntegerStrokesAndOffsetRecipe=True partitionChangesBooleanGrouping=True "
             + $"continuousRampEnvelope=True anchorPolicy={(smoothed is null ? "complete-supplied-segments" : "raised-medial-spans")} completeCutterCompensationRequired=True futureOperationsRead=0");
         return result;
     }
